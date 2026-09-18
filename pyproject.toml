@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vine360"
+version = "0.1.0"
+description = "Orchestration and project-management application for 360-degree and conventional 3D Gaussian Splatting capture of vineyards."
+requires-python = ">=3.12"
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+# Milestones beyond M1 (see docs/adr/0001-stdlib-first-cli.md) are expected to
+# add: pydantic, typer, PySide6, SQLModel, opencv-python. Add them here when
+# the target development machine has package-manager access.
+
+[project.scripts]
+vine360 = "vine360.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
