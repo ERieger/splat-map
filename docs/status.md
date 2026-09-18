@@ -2,87 +2,161 @@
 
 ## Completed work
 
-**M0 -- Repository** (exit criteria: CLI starts; tests run; versions are
-reported; no processing yet)
+**M0 -- Repository.** CLI scaffold, dependency probe (ffmpeg/ffprobe/
+colmap/git/nvidia-smi, never raises on a missing tool), `Runner`
+abstraction, pytest harness. Unchanged since the first pass; see the ADRs
+below for what's since layered on top.
 
-- Package scaffold at `src/vine360/` matching the handover doc's expected
-  structure (`cli.py`, `config.py`, `project.py`, `models.py`, `runners/`,
-  `ingest/`, plus placeholder packages for `projection/`, `masking/`,
-  `sfm/`, `training/`, `export/`).
-- `vine360 version` reports vine360 version, Python version, platform, and
-  found/missing status + version for ffmpeg, ffprobe, colmap, git and
-  nvidia-smi (`vine360/runners/probe.py`), without raising on missing
-  tools.
-- `Runner` interface (`vine360/runners/base.py`) with a `LocalRunner`
-  implementation; all subprocess calls go through it.
-- `pytest` test harness (`pyproject.toml` sets `pythonpath = ["src"]`);
-  `tests/conftest.py` provides a `requires_ffmpeg` skip marker.
-- 4 ADRs recorded in `docs/adr/`.
+**M1 -- Ingest.** `vine360 project create/info`, `ingest add-source`
+(ffprobe metadata, checksum, equirectangular confirmation gate),
+`ingest extract-frames` (deterministic ffmpeg extraction + thumbnails +
+source-frame map), `ingest manifest`. The real end-to-end integration
+test now actually runs (previously skipped for lack of ffmpeg) against
+`static-ffmpeg`'s bundled real binaries.
 
-**M1 -- Ingest** (exit criteria: a short X6 clip produces deterministic
-frames and a source map)
+**M2 -- Projection (`vine360/projection/`), fully implemented as library
+code, not yet CLI-wired.**
+- `pose.py`: camera-to-world `Pose`, `compose()` implementing
+  `T_world_face = T_world_panorama . T_panorama_face`, and COLMAP
+  qvec/tvec conversion.
+- `geometry.py`: equirectangular <-> direction, perspective camera <->
+  direction, the six-face rotation math.
+- `cubemap.py`: the six-face 90-degree preset, polar faces excluded by
+  default per the handover doc's own guidance.
+- `render.py`: real numpy/Pillow bilinear resampling from an
+  equirectangular image to a perspective face, including seam wraparound.
+- Verified two ways: unit tests to 1e-9 precision (`test_projection_
+  geometry.py`, `test_projection_pose.py`), and a visual sanity check
+  (rendered a labeled synthetic panorama, inspected the front/right/up
+  face outputs directly) that showed exactly the expected marker
+  centering and polar radial-line convergence.
+- A01 (round-trip projection within one pixel) passes against the actual
+  transform; the image-based tests use a documented, wider pixel
+  tolerance to account for marker-block quantization under bilinear
+  resampling, not transform error (see the comment in
+  `test_projection_render.py`).
 
-- `vine360 project create` / `project info`: writes `project.yaml` plus
-  the full directory layout from section 5, and an `index.sqlite` index.
-- `vine360 ingest add-source`: probes a media file with ffprobe, computes
-  a sha256 checksum, infers media type/projection, and requires explicit
-  confirmation before treating a 2:1 still image as equirectangular.
-- `vine360 ingest extract-frames`: deterministic ffmpeg-based frame
-  extraction by interval or target count, with thumbnails, checksums, and
-  a persisted source-to-frame map.
-- `vine360 ingest manifest`: writes `exports/ingest_manifest.json`
-  (sources, frames, source-frame map, dependency versions used).
+**M3 -- Masking (`vine360/masking/`), fully implemented, not yet
+CLI-wired.**
+- `semantics.py`: mask value conventions, small-component removal +
+  dilation (deliberately reordered from the doc's literal step order --
+  see ADR 0008), keep/exclude mask derivation, `keep_fraction` anomaly
+  flagging, COLMAP mask path convention.
+- `classical_sky.py`: a weights-free sky heuristic (brightness/blue-
+  dominance/top-of-frame), explicitly a stand-in for SAM 3, not a
+  substitute for it. No equivalent exists (or can reasonably exist) for
+  person masks.
+- `sam3_adapter.py`: the real backend against `transformers`' `Sam3Model`/
+  `Sam3Processor`. Confirmed against a live call to the actual (gated,
+  currently unauthenticated) `facebook/sam3` repo -- caught and fixed a
+  real bug where `transformers` surfaces the gating failure as a plain
+  `OSError`, not `huggingface_hub`'s `GatedRepoError`.
 
-## Decisions
+**M4 -- SfM (`vine360/sfm/colmap_adapter.py`), fully implemented, not yet
+CLI-wired.**
+- Uses `pycolmap` (COLMAP's own Python bindings) instead of a subprocess
+  `colmap` binary -- see ADR 0007. `extract_and_match` (masked feature
+  extraction + sequential matching) and `map_and_diagnose` (incremental
+  mapping + the section-7 diagnostics) are separate, independently
+  testable functions; `run_sfm` composes them for the real-files case.
+- Real, unmocked tests: A04 ("no keypoints inside a zero-valued mask
+  region") against actual COLMAP database output; a documented,
+  *asserted* failure case showing that views rendered from a single
+  panorama (zero camera-position baseline) correctly cannot be
+  3D-reconstructed, no matter how good the 2D matching is; and a real
+  multi-position reconstruction via `pycolmap.synthesize_dataset`
+  (genuine parallax, genuine ground truth) proving `map_and_diagnose` and
+  `evaluate_registration_quality` work correctly end-to-end.
 
-- Built M0/M1 on the standard library instead of Typer/Pydantic --
-  [docs/adr/0001-stdlib-first-cli.md](adr/0001-stdlib-first-cli.md).
-- Runner + adapter contract for external tools --
-  [docs/adr/0002-runner-and-adapter-contract.md](adr/0002-runner-and-adapter-contract.md).
-- Project layout, deferred index tables, sources-by-reference (not copied)
-  -- [docs/adr/0003-project-layout-and-index.md](adr/0003-project-layout-and-index.md).
-- Assumptions adopted for open questions in section 12 (input format,
-  equirectangular detection, GPS/EXIF scope, compute environment) --
-  [docs/adr/0004-m1-scope-assumptions.md](adr/0004-m1-scope-assumptions.md).
+**M5 -- Training (`vine360/training/`), adapter architecture only, per
+an explicit choice not to install a backend or spend GPU time yet.**
+- `config.py` (typed run config + `runs/<run-id>/` layout wiring),
+  `adapter.py` (the backend contract), `nerfstudio_adapter.py` (a
+  concrete implementation). **Unlike every other adapter in this
+  project, `nerfstudio_adapter.py`'s CLI flags are unverified** -- no
+  Nerfstudio install exists to confirm them against, unlike ffmpeg/
+  pycolmap/SAM 3, which were each checked against real installed source
+  or a real live call. See ADR 0009.
 
-## Blockers
+## Environment notes (this dev machine)
 
-- **This development machine currently has no `pip`, no working `venv`
-  (`ensurepip` is missing), no passwordless `sudo`, and no `ffmpeg` or
-  `colmap` installed.** All 28 non-integration tests pass here; the one
-  ffmpeg-dependent integration test (`tests/test_ingest_integration.py`)
-  skips automatically rather than failing. It still needs to be run for
-  real once `ffmpeg`/`ffprobe` are available (e.g. `sudo apt-get install
-  ffmpeg`, once sudo access exists), and again against an actual Insta360
-  X6 export rather than a synthetic `testsrc` clip.
-- No GPU/COLMAP work was attempted -- correctly out of scope for M0/M1.
-- Photo EXIF/GPS parsing for drone stills is not implemented (see ADR
-  0004); only ffprobe's container-level tags are read.
-- Near-duplicate frame filtering (called for in section 4, step 2) is not
-  implemented; frame extraction is otherwise deterministic and tested.
+- No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
+  installed, and there's no passwordless sudo to add them) -- worked
+  around with `venv --without-pip` + a manually bootstrapped `get-pip.py`,
+  in a venv living outside the repo (`~/.venvs/vine360`) because `/mnt/e`
+  is a Windows-mounted drive that can't hold the symlinks `venv` needs.
+  See ADR 0005.
+- Real internet access exists, which is what made the rest of this
+  possible: `numpy`/`Pillow`/`scipy`/`pycolmap`/`torch`/`transformers`/
+  `static-ffmpeg` all installed and were exercised for real. See ADR 0006.
+- This machine has a real NVIDIA GPU passed through into WSL2 (confirmed
+  via `nvidia-smi` and `torch.cuda.is_available()`), matching the
+  handover doc's own "Secondary environment: WSL2" line -- this looks
+  like the actual target dev machine, not a disposable sandbox.
+- `facebook/sam3` requires **manual** Meta approval (confirmed live via
+  `HfApi().model_info(...).gated == "manual"`), not just a click-through
+  license. Real SAM 3 inference is therefore still untested; the adapter
+  is otherwise built and its failure path is verified against the real
+  endpoint.
 
-## Assumptions that materially affect later work (flagging per section 11's
-instruction to report these)
+## Decisions (see docs/adr/ for full reasoning)
 
-- Projection geometry: not yet touched (M2). No assumption made yet beyond
-  what ADR 0004 states about equirectangular *detection*, which is
-  separate from projection.
-- Operating-system support: implemented and tested on WSL2/Linux, matching
-  the handover's "secondary environment." Native Windows execution and the
-  eventual WSL-bridging `Runner` are not yet built or tested.
-- Licensing: no third-party ML/CV packages were added yet (stdlib +
-  PyYAML only), so there is nothing new to audit beyond what M0/M1 itself
-  introduces.
-- 3DGS backend selection: not made (M5); section 12 leaves this open.
+0001: stdlib-first CLI/config (argparse/dataclasses over Typer/Pydantic).
+0002: Runner + adapter contract for external tools.
+0003: project layout, deferred index tables, sources-by-reference.
+0004: M1 scope assumptions (input format, EXIF/GPS, compute environment).
+0005: venv lives outside the repo, under `$HOME` (DrvFs symlink limits).
+0006: real numpy/Pillow/pycolmap/ffmpeg once pip access existed after all.
+0007: pycolmap (not a subprocess `colmap` binary) for the SfM adapter.
+0008: SAM 3 as the real masking backend; classical sky as an interim
+      fallback; reordered mask-build pipeline (dedupe before dilate).
+0009: training stays adapter-only; Nerfstudio adapter is unverified.
+
+## Blockers / known gaps
+
+- **SAM 3 weights**: manual approval pending (see above). Once approved
+  and `huggingface-cli login` is run, replace
+  `test_masking_sam3_adapter.py`'s access-denied test with a real
+  segmentation assertion, and double check
+  `post_process_instance_segmentation`'s actual output against real
+  inference (currently confirmed only via source inspection).
+- **Nerfstudio adapter is unverified** (see ADR 0009) -- run its `--help`
+  output against a real install before trusting its flags.
+- **Projection/masking/SfM are not yet wired into the project CLI or
+  index database.** `vine360/project.py`'s `index.sqlite` only has
+  `sources`/`frames` tables (per ADR 0003's "add tables when their
+  milestone needs them"); M2-M4 are complete, tested library code, but
+  there's no `vine360 projection generate` / `masking build` / `sfm run`
+  CLI command yet, and no `views`/`masks`/`sfm_runs` tables. This is
+  explicitly the next task, not an oversight -- see below.
+- Near-duplicate frame filtering (M1, called for in section 4) still
+  isn't implemented.
+- Photo EXIF/GPS parsing for drone stills (ADR 0004) still isn't
+  implemented.
+- No real Insta360 X6 footage or real vineyard imagery has been used
+  anywhere; every test uses synthetic data (labeled panoramas, procedural
+  textures, `pycolmap.synthesize_dataset`). Section 12's open question
+  about a committable reference dataset is still open.
 
 ## Exact next task
 
-M2 -- Projection: implement equirectangular-to-perspective projection
-(start with the six-face cubemap preset at 90° FOV per section 4, step 3),
-implementing the pose-composition invariant
-`T_world_face = T_world_panorama · T_panorama_face` from section 4, with a
-documented coordinate convention (camera-to-world vs. world-to-camera).
-Add acceptance test A01 (round-trip projection of known points on a
-synthetic equirectangular grid, landing within one pixel) and A02 (pose
-conversion survives internal/COLMAP/trainer round-trips within tolerance)
-before touching COLMAP or trainer adapters.
+Wire M2-M4 into the project CLI and index database, so the pipeline is
+actually drivable end-to-end from `vine360` commands rather than only
+from library calls in tests:
+
+1. Add `views` and `masks` tables to `project.py`'s index schema (fields
+   per the data contracts already declared in `models.py`).
+2. `vine360 projection generate --project <path> --frame-id <id>
+   [--preset six-face] [--fov 90] [--face-size N]`: renders faces for a
+   frame, writes them under `project/projections/`, records `View` rows.
+3. `vine360 masking build --project <path> --view-id <id> [--sky
+   classical|sam3] [--person sam3]`: runs the requested backends, writes
+   class/keep/exclude masks under `project/masks/`, records `Mask` rows,
+   surfaces `is_keep_fraction_anomalous` warnings.
+4. `vine360 sfm run --project <path>`: gathers all views + their keep
+   masks, calls `extract_and_match` + `map_and_diagnose` against
+   `project/sfm/database.db` / `project/sfm/sparse/`, prints
+   `evaluate_registration_quality` warnings, records an `sfm_runs` row.
+5. Only after that: M6 (desktop UI) becomes "wrap the CLI in a wizard",
+   which is the doc's own intended shape (section 3: "every UI action
+   maps to a reproducible command").

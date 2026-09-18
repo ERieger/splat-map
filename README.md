@@ -11,31 +11,74 @@ The processing core is a typed CLI (`vine360`); a desktop UI comes later
 ## Requirements
 
 - Python 3.12+
-- `ffmpeg` / `ffprobe` on `PATH` (for ingest; not required to run the CLI
-  itself or the non-integration tests)
+- `pip`/`venv` working in *some* environment reachable from here (see
+  "Environment setup" below if, like this project's dev machine, the
+  system Python has neither)
 - `git` (used for version reporting only)
 
-M0/M1 are implemented with the standard library plus PyYAML, so no `pip
-install` is required to run them today -- see
-`docs/adr/0001-stdlib-first-cli.md` for why, and what changes once GUI/ML
-milestones need PySide6, Pydantic, etc.
+The M0/M1 CLI/config layer itself is standard-library-only (argparse,
+dataclasses) -- see `docs/adr/0001-stdlib-first-cli.md`. M2 onward
+(projection, masking, SfM) uses real numpy/Pillow/scipy/pycolmap/
+transformers, installed into a venv -- see `docs/adr/0006` through
+`0009`.
+
+## Environment setup
+
+If `python3 -m pip` fails with "externally managed environment" or
+`ensurepip` is missing (Debian/Ubuntu without `python3-venv`/`python3-pip`
+installed, and no sudo access to fix that):
+
+```
+python3 -m venv --without-pip ~/.venvs/vine360   # NOT under a Windows-mounted
+                                                   # drive (e.g. /mnt/e) -- venv
+                                                   # needs symlinks DrvFs can't
+                                                   # make; see docs/adr/0005.
+curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+~/.venvs/vine360/bin/python3 /tmp/get-pip.py
+
+~/.venvs/vine360/bin/python3 -m pip install -e ".[dev,sfm,masking]"
+# ingest-ffmpeg extra bundles real ffmpeg/ffprobe binaries (no system
+# install / sudo needed):
+~/.venvs/vine360/bin/python3 -m pip install static-ffmpeg
+```
+
+If you already have a normal working `pip`, just:
+
+```
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev,sfm,masking]" static-ffmpeg ffmpeg
+```
 
 ## Running
 
 ```
-export PYTHONPATH=src   # or: pip install -e . once pip is available
-python3 -m vine360 version
-python3 -m vine360 project create ./myproject --name "Block 7" --capture-mode 360
-python3 -m vine360 ingest add-source ./myproject --source /path/to/clip.mp4
-python3 -m vine360 ingest extract-frames ./myproject --source-id <id> --interval 1.0
-python3 -m vine360 ingest manifest ./myproject
+VENV=~/.venvs/vine360/bin/python3   # or just `python3` with an activated venv
+export PATH="$HOME/.venvs/vine360/lib/python3.12/site-packages/static_ffmpeg/bin/linux:$PATH"
+
+$VENV -m vine360 version
+$VENV -m vine360 project create ./myproject --name "Block 7" --capture-mode 360
+$VENV -m vine360 ingest add-source ./myproject --source /path/to/clip.mp4
+$VENV -m vine360 ingest extract-frames ./myproject --source-id <id> --interval 1.0
+$VENV -m vine360 ingest manifest ./myproject
 ```
+
+Projection (M2), masking (M3) and SfM (M4) are implemented and tested as
+library code (`vine360.projection`, `vine360.masking`, `vine360.sfm`) but
+not yet wired into the project CLI/index database -- see docs/status.md
+for the exact next task.
+
+SAM 3 (real person/sky segmentation, `vine360.masking.sam3_adapter`)
+requires **manual** Meta approval on Hugging Face: request access at
+https://huggingface.co/facebook/sam3, then once approved run
+`$VENV -m pip install huggingface_hub[cli] && huggingface-cli login` and
+paste your token when it prompts (never into chat/logs).
 
 ## Tests
 
 ```
-python3 -m pytest
+export PATH="$HOME/.venvs/vine360/lib/python3.12/site-packages/static_ffmpeg/bin/linux:$PATH"
+~/.venvs/vine360/bin/python3 -m pytest
 ```
 
-ffmpeg-dependent tests skip automatically if `ffmpeg`/`ffprobe` are not on
-`PATH`.
+Tests requiring ffmpeg, pycolmap, or a real (approved) SAM 3 login skip
+automatically when those aren't available.

@@ -9,15 +9,33 @@ description = "Orchestration and project-management application for 360-degree a
 requires-python = ">=3.12"
 dependencies = [
     "PyYAML>=6.0",
+    "numpy>=2.0",
+    "Pillow>=10.0",
+    "scipy>=1.11",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4",
 ]
-# Milestones beyond M1 (see docs/adr/0001-stdlib-first-cli.md) are expected to
-# add: pydantic, typer, PySide6, SQLModel, opencv-python. Add them here when
-# the target development machine has package-manager access.
+# COLMAP's official Python bindings (M4 SfM adapter) -- see docs/adr/0007.
+sfm = [
+    "pycolmap>=4.0",
+]
+# Bundles real ffmpeg/ffprobe binaries with no system install needed.
+ingest-ffmpeg = [
+    "static-ffmpeg",
+]
+# SAM 3 masking backend (M3) -- see docs/adr/0008. Large; gated weights.
+masking = [
+    "torch",
+    "transformers>=4.56",
+    "huggingface_hub",
+    "accelerate",
+]
+# A future desktop UI milestone (M6) is expected to add PySide6; the CLI's
+# own argparse/dataclasses choice over Typer/Pydantic is unaffected -- see
+# docs/adr/0001-stdlib-first-cli.md and docs/adr/0006-real-dependencies-for-m2-plus.md.
 
 [project.scripts]
 vine360 = "vine360.cli:main"
@@ -28,3 +46,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "network: makes a real network call (e.g. to Hugging Face); skip with -m 'not network' when offline",
+]
