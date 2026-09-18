@@ -2,14 +2,14 @@
 after comparing wizard_preview.py and dashboard_preview.py (see
 docs/status.md and memory).
 
-Project creation/loading and source ingest are wired to real vine360 code
-(vine360.project, vine360.ingest.sources) -- these are fast, local,
-metadata-only operations (ffprobe + a checksum), not pipeline "runs".
-
-Frame extraction, projection, masking and SfM stay preset-only for now:
-their controls reflect real config/enums, but their action buttons are
-disabled with an explanatory tooltip. Wiring those to actually execute is
-a deliberate next step, not done here -- see docs/status.md.
+Project creation, source ingest, and frame extraction are wired to real
+vine360 code (vine360.project, vine360.ingest.sources,
+vine360.ingest.frames), run on a background QThread so a large real file
+(e.g. a 7.65GB capture: ~25s to checksum, longer to extract frames from)
+never freezes the window. Projection, masking and SfM stay preset-only for
+now: their controls reflect real config/enums, but their action buttons
+are disabled with an explanatory tooltip -- wiring those to actually
+execute is the next step, not done here. See docs/status.md.
 
 Run with: python -m vine360.gui.main_window
 """
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -49,7 +49,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from vine360.config import CaptureMode, FramePreset
+from vine360.config import FRAME_PRESET_INTERVALS, CaptureMode, FramePreset
+from vine360.ingest.frames import FrameExtractionError, extract_frames
 from vine360.ingest.media_probe import ProbeError
 from vine360.ingest.sources import (
     EquirectangularConfirmationRequired,
@@ -84,6 +85,55 @@ class AppState:
     project_root: Path | None = None
     project: Project | None = None
     conn: sqlite3.Connection | None = None
+
+
+class _BackgroundWorker(QObject):
+    """Runs one callable off the GUI thread. Real bug this fixes: without
+    it, add_source's checksum on a multi-GB file (~25s for 7.65GB, seen on
+    real capture footage) freezes the whole window with zero feedback --
+    exactly the "video doesn't open" symptom.
+
+    The callable must not touch any sqlite3.Connection created on the main
+    thread (sqlite3 connections aren't usable across threads by default);
+    callers open their own connection by project_root inside `fn` instead.
+    """
+
+    finished = Signal(object)
+    failed = Signal(Exception)
+
+    def __init__(self, fn, args, kwargs):
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+
+    def run(self) -> None:
+        try:
+            result = self._fn(*self._args, **self._kwargs)
+        except Exception as exc:  # surfaced via `failed`, not swallowed
+            self.failed.emit(exc)
+        else:
+            self.finished.emit(result)
+
+
+def run_in_background(owner: QWidget, fn, *args, on_success=None, on_error=None, **kwargs) -> None:
+    """Starts fn(*args, **kwargs) on a QThread. `owner` must outlive the
+    call -- the thread/worker are kept alive as attributes on it so Python
+    doesn't garbage-collect them mid-run."""
+    thread = QThread()
+    worker = _BackgroundWorker(fn, args, kwargs)
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
+    worker.finished.connect(thread.quit)
+    worker.failed.connect(thread.quit)
+    if on_success:
+        worker.finished.connect(on_success)
+    if on_error:
+        worker.failed.connect(on_error)
+
+    owner._bg_thread = thread
+    owner._bg_worker = worker
+    thread.start()
 
 
 def _status_dot(status: str) -> QPixmap:
@@ -228,10 +278,31 @@ class ProjectPanel(QWidget):
         self.project_changed.emit()
 
 
+def _add_source_worker(
+    project_root: Path, file_path: Path, capture_group: str | None, confirm_equirectangular: bool, added_at: str
+):
+    """Runs on a background thread -- opens its own sqlite connection
+    rather than reusing one created on the GUI thread (sqlite3 connections
+    aren't valid across threads)."""
+    conn = open_index_db(project_root)
+    try:
+        return add_source(
+            conn,
+            file_path,
+            LocalRunner(),
+            capture_group=capture_group,
+            confirm_equirectangular=confirm_equirectangular,
+            added_at=added_at,
+        )
+    finally:
+        conn.close()
+
+
 class ImportPanel(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
+        self._pending_file_path: str | None = None
         layout = QVBoxLayout(self)
         _panel_header("Import", "Register real media sources into the open project.", layout)
 
@@ -243,15 +314,23 @@ class ImportPanel(QWidget):
         controls_layout.setContentsMargins(0, 0, 0, 0)
 
         add_row = QHBoxLayout()
-        add_btn = QPushButton("Add Source…")
-        add_btn.clicked.connect(self._on_add_source)
-        add_row.addWidget(add_btn)
+        self.add_btn = QPushButton("Add Source…")
+        self.add_btn.clicked.connect(self._on_add_source)
+        add_row.addWidget(self.add_btn)
         add_row.addWidget(QLabel("Capture group:"))
         self.capture_group_combo = QComboBox()
         self.capture_group_combo.setEditable(True)
         self.capture_group_combo.addItems(CAPTURE_GROUP_PRESETS)
         add_row.addWidget(self.capture_group_combo)
         controls_layout.addLayout(add_row)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setVisible(False)
+        controls_layout.addWidget(self.progress)
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        controls_layout.addWidget(self.status_label)
 
         self.sources_table = QTableWidget(0, 5)
         self.sources_table.setHorizontalHeaderLabels(["Media type", "Projection", "Capture group", "Checksum", "Path"])
@@ -298,34 +377,50 @@ class ImportPanel(QWidget):
         )
         if not file_path:
             return
+        self._pending_file_path = file_path
+        self._start_add_source(confirm_equirectangular=False)
 
-        confirm_equirect = False
-        while True:
-            try:
-                add_source(
-                    self.state.conn,
-                    Path(file_path),
-                    LocalRunner(),
-                    capture_group=self._resolved_capture_group(),
-                    confirm_equirectangular=confirm_equirect,
-                    added_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                )
-                break
-            except EquirectangularConfirmationRequired:
-                answer = QMessageBox.question(
-                    self,
-                    "Confirm equirectangular",
-                    f"{Path(file_path).name} has a 2:1 aspect ratio. Is it truly equirectangular?",
-                )
-                if answer != QMessageBox.Yes:
-                    return
-                confirm_equirect = True
-                continue
-            except (SourceError, ProbeError) as exc:
-                QMessageBox.warning(self, "Could not add source", str(exc))
-                return
+    def _start_add_source(self, *, confirm_equirectangular: bool) -> None:
+        self.add_btn.setEnabled(False)
+        self.progress.setVisible(True)
+        name = Path(self._pending_file_path).name
+        self.status_label.setText(f"Adding {name}… (checksumming a large file can take tens of seconds)")
+        run_in_background(
+            self,
+            _add_source_worker,
+            self.state.project_root,
+            Path(self._pending_file_path),
+            self._resolved_capture_group(),
+            confirm_equirectangular,
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            on_success=self._on_add_source_success,
+            on_error=self._on_add_source_error,
+        )
 
+    def _on_add_source_success(self, source) -> None:
+        self.add_btn.setEnabled(True)
+        self.progress.setVisible(False)
+        self.status_label.setText(f"Added {Path(source.path).name} ({source.media_type.value}, {source.projection.value}).")
         self._refresh_sources_table()
+
+    def _on_add_source_error(self, exc: Exception) -> None:
+        self.add_btn.setEnabled(True)
+        self.progress.setVisible(False)
+        if isinstance(exc, EquirectangularConfirmationRequired):
+            name = Path(self._pending_file_path).name
+            answer = QMessageBox.question(
+                self, "Confirm equirectangular", f"{name} has a 2:1 aspect ratio. Is it truly equirectangular?"
+            )
+            if answer == QMessageBox.Yes:
+                self._start_add_source(confirm_equirectangular=True)
+            else:
+                self.status_label.setText("")
+            return
+        self.status_label.setText("")
+        if isinstance(exc, (SourceError, ProbeError)):
+            QMessageBox.warning(self, "Could not add source", str(exc))
+        else:
+            QMessageBox.critical(self, "Unexpected error adding source", f"{type(exc).__name__}: {exc}")
 
     def _refresh_sources_table(self) -> None:
         rows = self.state.conn.execute(
@@ -341,17 +436,126 @@ class ImportPanel(QWidget):
         self.sources_table.resizeColumnsToContents()
 
 
-def build_frames_panel() -> QWidget:
-    widget = QWidget()
-    layout = QVBoxLayout(widget)
-    _panel_header("Frames", "Frame preset (real enum; extraction not wired up yet).", layout)
-    combo = QComboBox()
-    combo.addItems([p.value for p in FramePreset])
-    combo.setCurrentText(FramePreset.BALANCED.value)
-    layout.addWidget(combo)
-    layout.addWidget(_disabled_action_button("Extract Frames"))
-    layout.addStretch()
-    return widget
+def _extract_frames_worker(project_root: Path, source_id: str, interval_seconds: float):
+    conn = open_index_db(project_root)
+    try:
+        return extract_frames(conn, project_root, source_id, LocalRunner(), interval_seconds=interval_seconds)
+    finally:
+        conn.close()
+
+
+class FramesPanel(QWidget):
+    """Real extraction, wired to vine360.ingest.frames.extract_frames, run
+    off the GUI thread (a real capture clip's extraction can run for a
+    while -- it should never freeze the window the way unthreaded
+    add_source did on a 7.65GB file)."""
+
+    def __init__(self, state: AppState):
+        super().__init__()
+        self.state = state
+        layout = QVBoxLayout(self)
+        _panel_header("Frames", "Extract deterministic frames from a registered video source.", layout)
+
+        self.no_project_label = QLabel("Create or open a project first, then add a video source on Import.")
+        layout.addWidget(self.no_project_label)
+
+        self.controls = QWidget()
+        controls_layout = QVBoxLayout(self.controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+
+        form = QFormLayout()
+        self.source_combo = QComboBox()
+        form.addRow("Video source:", self.source_combo)
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems([FramePreset.PREVIEW.value, FramePreset.BALANCED.value, FramePreset.QUALITY.value])
+        self.preset_combo.setCurrentText(FramePreset.BALANCED.value)
+        form.addRow("Frame preset:", self.preset_combo)
+        controls_layout.addLayout(form)
+
+        intervals_note = QLabel(
+            "Intervals (vine360.config.FRAME_PRESET_INTERVALS): "
+            + ", ".join(f"{p.value}={FRAME_PRESET_INTERVALS[p]}s" for p in FRAME_PRESET_INTERVALS)
+            + ". 'Custom' isn't exposed here yet -- use the CLI's --interval/--count for a specific value."
+        )
+        intervals_note.setWordWrap(True)
+        intervals_note.setStyleSheet("color: palette(mid);")
+        controls_layout.addWidget(intervals_note)
+
+        self.extract_btn = QPushButton("Extract Frames")
+        self.extract_btn.clicked.connect(self._on_extract)
+        controls_layout.addWidget(self.extract_btn)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setVisible(False)
+        controls_layout.addWidget(self.progress)
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        controls_layout.addWidget(self.status_label)
+
+        layout.addWidget(self.controls)
+        self.controls.setVisible(False)
+        layout.addStretch()
+
+    def on_project_changed(self) -> None:
+        have_project = self.state.conn is not None
+        self.no_project_label.setVisible(not have_project)
+        self.controls.setVisible(have_project)
+        if have_project:
+            self.refresh_sources()
+
+    def on_shown(self) -> None:
+        if self.state.conn is not None:
+            self.refresh_sources()
+
+    def refresh_sources(self) -> None:
+        self.source_combo.clear()
+        if self.state.conn is None:
+            return
+        rows = self.state.conn.execute(
+            "SELECT source_id, path FROM sources WHERE media_type = 'video' ORDER BY rowid"
+        ).fetchall()
+        for source_id, path in rows:
+            self.source_combo.addItem(f"{Path(path).name} ({source_id[:8]})", userData=source_id)
+        has_sources = self.source_combo.count() > 0
+        self.extract_btn.setEnabled(has_sources)
+        self.status_label.setText("" if has_sources else "No video sources registered yet -- add one on Import.")
+
+    def _on_extract(self) -> None:
+        source_id = self.source_combo.currentData()
+        if source_id is None:
+            return
+        preset = FramePreset(self.preset_combo.currentText())
+        interval = FRAME_PRESET_INTERVALS[preset]
+
+        self.extract_btn.setEnabled(False)
+        self.progress.setVisible(True)
+        self.status_label.setText(
+            f"Extracting frames every {interval}s -- this can take a while for long or high-resolution video…"
+        )
+        run_in_background(
+            self,
+            _extract_frames_worker,
+            self.state.project_root,
+            source_id,
+            interval,
+            on_success=self._on_extract_success,
+            on_error=self._on_extract_error,
+        )
+
+    def _on_extract_success(self, frames) -> None:
+        self.extract_btn.setEnabled(True)
+        self.progress.setVisible(False)
+        self.status_label.setText(f"Extracted {len(frames)} frames.")
+
+    def _on_extract_error(self, exc: Exception) -> None:
+        self.extract_btn.setEnabled(True)
+        self.progress.setVisible(False)
+        self.status_label.setText("")
+        if isinstance(exc, FrameExtractionError):
+            QMessageBox.warning(self, "Frame extraction failed", str(exc))
+        else:
+            QMessageBox.critical(self, "Unexpected error extracting frames", f"{type(exc).__name__}: {exc}")
 
 
 def build_projection_panel() -> QWidget:
@@ -437,13 +641,15 @@ class Vine360MainWindow(QMainWindow):
 
         project_panel = ProjectPanel(self.state)
         import_panel = ImportPanel(self.state)
+        frames_panel = FramesPanel(self.state)
         project_panel.project_changed.connect(import_panel.on_project_changed)
+        project_panel.project_changed.connect(frames_panel.on_project_changed)
         project_panel.project_changed.connect(self._on_project_changed)
 
         stages = [
             ("Project", ACTIVE, project_panel),
             ("Import", PENDING, import_panel),
-            ("Frames", PENDING, build_frames_panel()),
+            ("Frames", PENDING, frames_panel),
             ("Projection", PENDING, build_projection_panel()),
             ("Masks", PENDING, build_masks_panel()),
             ("Pose estimation", PENDING, build_pose_panel()),
@@ -459,7 +665,7 @@ class Vine360MainWindow(QMainWindow):
             self.sidebar.addItem(item)
             self.stack.addWidget(widget)
 
-        self.sidebar.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.sidebar.currentRowChanged.connect(self._on_sidebar_row_changed)
         self.sidebar.setCurrentRow(0)
 
         splitter = QSplitter()
@@ -471,6 +677,13 @@ class Vine360MainWindow(QMainWindow):
     def _on_project_changed(self) -> None:
         self._sidebar_items[0].setIcon(QIcon(_status_dot(DONE)))
         self._sidebar_items[1].setIcon(QIcon(_status_dot(ACTIVE)))
+
+    def _on_sidebar_row_changed(self, index: int) -> None:
+        self.stack.setCurrentIndex(index)
+        widget = self.stack.widget(index)
+        on_shown = getattr(widget, "on_shown", None)
+        if callable(on_shown):
+            on_shown()
 
 
 def main() -> int:
