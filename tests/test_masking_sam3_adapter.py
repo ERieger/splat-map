@@ -1,7 +1,9 @@
 import numpy as np
 import pytest
 
-from vine360.masking.sam3_adapter import Sam3AccessDeniedError, Sam3Adapter, validate_installation
+from PIL import Image, ImageDraw
+
+from vine360.masking.sam3_adapter import Sam3Adapter, validate_installation
 
 pytestmark = pytest.mark.skipif(
     not validate_installation().torch_installed or not validate_installation().transformers_installed,
@@ -23,14 +25,20 @@ def test_construction_never_touches_network():
 
 
 @pytest.mark.network
-def test_segment_raises_access_denied_when_ungated_access_missing():
-    """Real integration check against the live, gated facebook/sam3 repo:
-    without an approved + authenticated Hugging Face account, this must
-    fail with a clearly classified error, not an unhandled exception.
-    Once access is granted and `huggingface-cli login` has been run, this
-    test's assumption (that access is currently denied) no longer holds
-    and it should be replaced with a real segmentation assertion."""
+def test_segment_finds_sky_on_a_real_image():
+    """Real integration check against the live facebook/sam3 model, now
+    that access has been approved and this environment is authenticated
+    (`hf auth login`) -- see docs/adr/0008 and docs/status.md. Downloads
+    (or reuses the cached) ~3.4GB model.safetensors on first run."""
+    image = Image.new("RGB", (256, 256), (135, 206, 235))  # sky blue
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([0, 150, 256, 256], fill=(34, 90, 34))  # green ground, bottom ~41%
+    image = np.asarray(image)
+
     adapter = Sam3Adapter()
-    image = np.zeros((64, 64, 3), dtype=np.uint8)
-    with pytest.raises(Sam3AccessDeniedError):
-        adapter.segment(image, {"sky": "sky"})
+    masks = adapter.segment(image, {"sky": "sky"})
+
+    coverage = masks["sky"].mean() / 255
+    assert 0.4 < coverage < 0.75, f"expected sky coverage near the true ~59% sky area, got {coverage:.0%}"
+    # the sky region should dominate the top rows and be largely absent from the bottom rows
+    assert masks["sky"][10:20, :].mean() > masks["sky"][230:250, :].mean()

@@ -11,3 +11,6 @@ dist/
 /projects/
 *.sqlite
 *.sqlite-journal
+
+# Claude Code's own local session state, not project source.
+/.claude/

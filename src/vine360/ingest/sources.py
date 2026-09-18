@@ -2,8 +2,15 @@
 
 Sources are recorded by absolute path, checksum and probed metadata rather
 than copied into the project (docs/adr/0003). Video is the primary MVP
-target (Insta360 X6 equirectangular export); still images are accepted for
-mixed/drone capture but frame extraction only applies to video.
+target (equirectangular exports); still images are accepted too, but frame
+extraction only applies to video.
+
+`capture_group` tags which physical rig a source came from (e.g.
+"insta360-ground" vs "antigravity-a1-aerial") -- both of this project's
+real capture devices are 360-degree platforms (a ground-based Insta360 and
+an airborne Antigravity A1), not the 360-plus-conventional-drone pairing
+the handover doc's "mixed capture" milestone (P1/M7) originally assumed.
+See docs/adr/0010.
 """
 
 from __future__ import annotations
@@ -67,6 +74,7 @@ def add_source(
     *,
     media_type_override: MediaType | None = None,
     confirm_equirectangular: bool = False,
+    capture_group: str | None = None,
     added_at: str,
 ) -> Source:
     file_path = Path(file_path).resolve()
@@ -102,7 +110,7 @@ def add_source(
             "frame_rate": metadata.frame_rate,
             "format_tags": metadata.format_tags,
         },
-        capture_group=None,
+        capture_group=capture_group,
     )
 
     conn.execute(

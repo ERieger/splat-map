@@ -49,7 +49,7 @@ in hand yet.
   Dilating first can fuse small noise specks into real regions, after
   which a component-size filter can no longer isolate and remove them.
 
-## Consequences
+## Consequences (original, at write time)
 
 - Real SAM 3 inference is untested (no weights available yet); once
   access is granted and `huggingface-cli login` is run, replace
@@ -63,3 +63,23 @@ in hand yet.
   `facebook/sam3-base`, not `facebook/sam3`), update `SAM3_MODEL_ID`
   accordingly -- `Sam3Adapter(model_id=...)` already supports overriding
   it without a code change.
+
+## Update, 2026-09-19: access granted, real inference confirmed
+
+Meta approved access the same day; `hf auth login` was run (token stored
+outside the repo, never in chat/logs), and `Sam3Model`/`Sam3Processor`
+loaded and ran for real on the GPU. `model.safetensors` (3.44 GB) needed
+roughly 15-20 minutes to download once; it's now cached under
+`~/.cache/huggingface/hub/models--facebook--sam3`.
+`test_segment_finds_sky_on_a_real_image` replaced the access-denied test
+and passes: on a synthetic sky/ground image, real SAM 3 correctly
+concentrates the sky mask in the top rows with plausible coverage. The
+`post_process_instance_segmentation` output shape assumed from source
+inspection was correct -- no adapter code changes were needed.
+
+One dependency gap surfaced and was fixed: `Sam3ImageProcessor` requires
+`torchvision`, which isn't pulled in by `torch`/`transformers` alone.
+Install it alongside them (same CUDA-matched index URL as `torch`).
+
+`SAM3_MODEL_ID = "facebook/sam3"` (not `facebook/sam3-base`) is confirmed
+correct as used.

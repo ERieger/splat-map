@@ -78,6 +78,27 @@ an explicit choice not to install a backend or spend GPU time yet.**
   pycolmap/SAM 3, which were each checked against real installed source
   or a real live call. See ADR 0009.
 
+**M6 -- Desktop UI (`vine360/gui/`), started.** Built two full PySide6
+previews to resolve the layout question directly rather than guessing:
+`wizard_preview.py` (linear QWizard) and `dashboard_preview.py`
+(persistent sidebar + stage panels). The user compared both running
+side by side and chose the dashboard -- "I prefer the dashboard. I like
+the more visual approach" (saved to memory). `main_window.py` is the real
+app going forward: its Project and Import panels are genuinely wired to
+`vine360.project`/`vine360.ingest.sources` (create/open a project on
+disk, register a real source with ffprobe metadata + checksum + a
+capture-group tag), verified end-to-end with an offscreen smoke test
+(mocked file dialogs, a real synthetic clip, a real add_source call).
+Frames/Projection/Masks/Pose/Training panels show real preset
+enums/computed values (e.g. the actual cubemap face count) but their
+action buttons are disabled with an explanatory tooltip -- wiring those
+to actually execute is intentionally deferred (see "Exact next task").
+The GUI calls the same typed library functions the CLI calls (not
+CLI-as-subprocess) -- this still satisfies the doc's "every UI action
+maps to a reproducible command" intent, since the action is backed by one
+well-defined function either surface can call; it just means the CLI
+isn't literally shelled out to.
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -95,9 +116,20 @@ an explicit choice not to install a backend or spend GPU time yet.**
   like the actual target dev machine, not a disposable sandbox.
 - `facebook/sam3` requires **manual** Meta approval (confirmed live via
   `HfApi().model_info(...).gated == "manual"`), not just a click-through
-  license. Real SAM 3 inference is therefore still untested; the adapter
-  is otherwise built and its failure path is verified against the real
-  endpoint.
+  license. **Approved and authenticated as of 2026-09-19** (`hf auth
+  login` -- the modern replacement for the now-deprecated
+  `huggingface-cli`); real SAM 3 inference now runs on this machine's GPU
+  and is covered by a real, passing test
+  (`test_segment_finds_sky_on_a_real_image`). Surfaced and fixed one real
+  gap: `Sam3ImageProcessor` needs `torchvision`, not installed
+  automatically alongside `torch`/`transformers`.
+- Real capture equipment: an Insta360 (ground) and an **Antigravity A1**,
+  which is itself an 8K 360-degree drone, not a conventional perspective
+  drone as the handover doc's "mixed capture" milestone assumed -- see
+  ADR 0010. Real sample footage exists at
+  `/mnt/e/11-9-26_EstoWines_Capture1/Equi/` (multi-GB clips, a `.gpx`
+  flight-telemetry sidecar); nothing has been run against it yet, per an
+  explicit "no runs yet" instruction.
 
 ## Decisions (see docs/adr/ for full reasoning)
 
@@ -110,53 +142,66 @@ an explicit choice not to install a backend or spend GPU time yet.**
 0007: pycolmap (not a subprocess `colmap` binary) for the SfM adapter.
 0008: SAM 3 as the real masking backend; classical sky as an interim
       fallback; reordered mask-build pipeline (dedupe before dilate).
+      Updated 2026-09-19: real access confirmed, real inference tested.
 0009: training stays adapter-only; Nerfstudio adapter is unverified.
+0010: real capture kit is two 360-degree platforms (Insta360 ground +
+      Antigravity A1 aerial), not 360 + conventional; capture_group is
+      now a real, wired parameter on add_source.
 
 ## Blockers / known gaps
 
-- **SAM 3 weights**: manual approval pending (see above). Once approved
-  and `huggingface-cli login` is run, replace
-  `test_masking_sam3_adapter.py`'s access-denied test with a real
-  segmentation assertion, and double check
-  `post_process_instance_segmentation`'s actual output against real
-  inference (currently confirmed only via source inspection).
 - **Nerfstudio adapter is unverified** (see ADR 0009) -- run its `--help`
   output against a real install before trusting its flags.
-- **Projection/masking/SfM are not yet wired into the project CLI or
-  index database.** `vine360/project.py`'s `index.sqlite` only has
-  `sources`/`frames` tables (per ADR 0003's "add tables when their
-  milestone needs them"); M2-M4 are complete, tested library code, but
-  there's no `vine360 projection generate` / `masking build` / `sfm run`
-  CLI command yet, and no `views`/`masks`/`sfm_runs` tables. This is
-  explicitly the next task, not an oversight -- see below.
+- **Projection/masking/SfM are not yet wired into the project CLI, GUI,
+  or index database for execution.** `vine360/project.py`'s
+  `index.sqlite` only has `sources`/`frames` tables (per ADR 0003's "add
+  tables when their milestone needs them"); M2-M4 are complete, tested
+  library code, and the GUI's Frames/Projection/Masks/Pose panels show
+  real preset values, but nothing actually runs extraction/projection/
+  masking/SfM from the CLI or GUI yet -- their action buttons are
+  present but disabled. This is explicitly the next task, not an
+  oversight -- see below.
 - Near-duplicate frame filtering (M1, called for in section 4) still
   isn't implemented.
 - Photo EXIF/GPS parsing for drone stills (ADR 0004) still isn't
-  implemented.
-- No real Insta360 X6 footage or real vineyard imagery has been used
-  anywhere; every test uses synthetic data (labeled panoramas, procedural
-  textures, `pycolmap.synthesize_dataset`). Section 12's open question
-  about a committable reference dataset is still open.
+  implemented -- and a GPX-sidecar reader (see ADR 0010) is now a better
+  first georeferencing step than EXIF parsing, given the real sample
+  data has a `.gpx` file, not JPEG GPS tags.
+- The GUI (`vine360/gui/`) has no automated tests yet (an offscreen smoke
+  test was run manually during development, not added to the pytest
+  suite -- PySide6 GUI testing needs `pytest-qt` or similar, not yet
+  added as a dependency).
+- No pipeline stage has been run against real footage. Real EstoWines
+  sample data exists (see above) but per an explicit "no runs yet"
+  instruction, only its GPX file and directory listing have been
+  inspected -- no video has been opened or processed.
 
 ## Exact next task
 
-Wire M2-M4 into the project CLI and index database, so the pipeline is
-actually drivable end-to-end from `vine360` commands rather than only
-from library calls in tests:
+Wire frame extraction, projection, masking and SfM into both the CLI and
+the GUI's disabled action buttons, so the pipeline is actually drivable
+end-to-end rather than only reachable from library calls in tests:
 
 1. Add `views` and `masks` tables to `project.py`'s index schema (fields
    per the data contracts already declared in `models.py`).
 2. `vine360 projection generate --project <path> --frame-id <id>
-   [--preset six-face] [--fov 90] [--face-size N]`: renders faces for a
-   frame, writes them under `project/projections/`, records `View` rows.
+   [--preset six-face] [--fov 90] [--face-size N]` (and the GUI's
+   "Generate Projections" button): renders faces for a frame, writes
+   them under `project/projections/`, records `View` rows.
 3. `vine360 masking build --project <path> --view-id <id> [--sky
-   classical|sam3] [--person sam3]`: runs the requested backends, writes
-   class/keep/exclude masks under `project/masks/`, records `Mask` rows,
-   surfaces `is_keep_fraction_anomalous` warnings.
-4. `vine360 sfm run --project <path>`: gathers all views + their keep
-   masks, calls `extract_and_match` + `map_and_diagnose` against
-   `project/sfm/database.db` / `project/sfm/sparse/`, prints
+   classical|sam3] [--person sam3]` (and "Build Masks"): runs the
+   requested backends, writes class/keep/exclude masks under
+   `project/masks/`, records `Mask` rows, surfaces
+   `is_keep_fraction_anomalous` warnings.
+4. `vine360 sfm run --project <path>` (and "Run SfM"): gathers all views
+   + their keep masks, calls `extract_and_match` + `map_and_diagnose`
+   against `project/sfm/database.db` / `project/sfm/sparse/`, prints
    `evaluate_registration_quality` warnings, records an `sfm_runs` row.
-5. Only after that: M6 (desktop UI) becomes "wrap the CLI in a wizard",
-   which is the doc's own intended shape (section 3: "every UI action
-   maps to a reproducible command").
+5. Long-running steps (extraction, SfM, eventual training) need to run
+   off the GUI's main thread (e.g. `QThread`/`QRunnable`) so the
+   dashboard stays responsive and can show live progress/logs -- not
+   needed for the CLI, but required before the GUI's action buttons can
+   be safely enabled.
+6. Only once frame extraction can run for real: validate against the
+   real Insta360/Antigravity A1 sample footage -- explicitly on request,
+   not proactively, given the multi-GB file sizes.

@@ -67,6 +67,7 @@ def cmd_ingest_add_source(args: argparse.Namespace) -> int:
             LocalRunner(),
             media_type_override=MediaType(args.media_type) if args.media_type else None,
             confirm_equirectangular=args.confirm_equirectangular,
+            capture_group=args.capture_group,
             added_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )
     except EquirectangularConfirmationRequired as exc:
@@ -157,6 +158,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-equirectangular",
         action="store_true",
         help="confirm that a detected 2:1 still image is truly equirectangular",
+    )
+    p_add_source.add_argument(
+        "--capture-group",
+        default=None,
+        help="tag for the physical rig this source came from, e.g. 'insta360-ground' or 'antigravity-a1-aerial'",
     )
     p_add_source.set_defaults(func=cmd_ingest_add_source)
 

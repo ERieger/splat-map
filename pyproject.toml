@@ -27,8 +27,11 @@ ingest-ffmpeg = [
     "static-ffmpeg",
 ]
 # SAM 3 masking backend (M3) -- see docs/adr/0008. Large; gated weights.
+# torch/torchvision should be installed from a CUDA-matched index (e.g.
+# https://download.pytorch.org/whl/cu126) rather than plain PyPI.
 masking = [
     "torch",
+    "torchvision",
     "transformers>=4.56",
     "huggingface_hub",
     "accelerate",
