@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QPoint, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -49,11 +49,11 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
-    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -285,6 +285,26 @@ def _status_dot(status: str) -> QPixmap:
     painter.setBrush(STATUS_COLOR[status])
     painter.setPen(Qt.NoPen)
     painter.drawEllipse(1, 1, 10, 10)
+    painter.end()
+    return pixmap
+
+
+def _flag_icon(size: int = 14) -> QPixmap:
+    """A small drawn flag glyph -- used instead of the Unicode flag emoji
+    (U+1F6A9), which renders as an empty box here: this machine has no
+    emoji font installed at all (confirmed: `fc-match "Noto Color Emoji"`
+    falls back to plain DejaVu Sans). Drawing icons with QPainter, like
+    the sidebar status dots already do, has no font dependency at all."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    pole_color = QColor(90, 90, 90)
+    painter.setPen(pole_color)
+    painter.drawLine(2, 1, 2, size - 1)
+    painter.setBrush(QColor(210, 60, 50))
+    painter.setPen(Qt.NoPen)
+    painter.drawPolygon([QPoint(3, 1), QPoint(size - 1, 4), QPoint(3, 7)])
     painter.end()
     return pixmap
 
@@ -1174,9 +1194,14 @@ class MasksPanel(QWidget):
         self.progress_area = ProgressArea()
         controls_layout.addWidget(self.progress_area)
 
-        self.flags_label = QLabel("")
-        self.flags_label.setWordWrap(True)
-        controls_layout.addWidget(self.flags_label)
+        self.flags_summary_label = QLabel("")
+        self.flags_summary_label.setWordWrap(True)
+        controls_layout.addWidget(self.flags_summary_label)
+        self.flags_list = QListWidget()
+        self.flags_list.setMaximumHeight(120)
+        self.flags_list.setVisible(False)
+        self.flags_list.itemDoubleClicked.connect(self._on_flags_list_double_clicked)
+        controls_layout.addWidget(self.flags_list)
 
         controls_layout.addWidget(QLabel("Preview frame:"))
         self.frame_selector = TemporalFrameSelector()
@@ -1188,14 +1213,17 @@ class MasksPanel(QWidget):
         self.face_combo = QComboBox()
         self.face_combo.currentIndexChanged.connect(self._refresh_preview)
         review_row.addWidget(self.face_combo)
-        self.prev_flagged_btn = QPushButton("⏮ Previous Flagged")
+        self.prev_flagged_btn = QPushButton("Previous Flagged")
+        self.prev_flagged_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowLeft))
         self.prev_flagged_btn.clicked.connect(lambda: self._jump_to_flagged(-1))
         review_row.addWidget(self.prev_flagged_btn)
-        self.flag_btn = QPushButton("🚩 Flag for Review")
+        self.flag_btn = QPushButton("Flag for Review")
+        self.flag_btn.setIcon(QIcon(_flag_icon()))
         self.flag_btn.setCheckable(True)
         self.flag_btn.toggled.connect(self._on_flag_toggled)
         review_row.addWidget(self.flag_btn)
-        self.next_flagged_btn = QPushButton("Next Flagged ⏭")
+        self.next_flagged_btn = QPushButton("Next Flagged")
+        self.next_flagged_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowRight))
         self.next_flagged_btn.clicked.connect(lambda: self._jump_to_flagged(1))
         review_row.addWidget(self.next_flagged_btn)
         controls_layout.addLayout(review_row)
@@ -1284,9 +1312,8 @@ class MasksPanel(QWidget):
                 continue
             face_name = view_id.split(":")[-1]
             status = f"keep {keep_fraction:.0%}" if keep_fraction is not None else "unmasked"
-            if flagged:
-                status += " 🚩"
-            self.face_combo.addItem(f"{face_name} ({status})", userData=view_id)
+            icon = QIcon(_flag_icon()) if flagged else QIcon()
+            self.face_combo.addItem(icon, f"{face_name} ({status})", userData=view_id)
         self.face_combo.blockSignals(False)
         self._refresh_preview()
 
@@ -1333,9 +1360,8 @@ class MasksPanel(QWidget):
         self._refresh_face_combo_labels_only()
 
     def _refresh_face_combo_labels_only(self) -> None:
-        """Updates the face combo's item text (flag marker) without
+        """Updates the face combo's item text/icon (flag marker) without
         emitting currentIndexChanged / disturbing the current preview."""
-        current_view_id = self._current_view_id()
         self.face_combo.blockSignals(True)
         for i in range(self.face_combo.count()):
             view_id = self.face_combo.itemData(i)
@@ -1344,11 +1370,9 @@ class MasksPanel(QWidget):
                 _frame_id, _v, keep_fraction, flagged = match
                 face_name = view_id.split(":")[-1]
                 status = f"keep {keep_fraction:.0%}" if keep_fraction is not None else "unmasked"
-                if flagged:
-                    status += " 🚩"
                 self.face_combo.setItemText(i, f"{face_name} ({status})")
+                self.face_combo.setItemIcon(i, QIcon(_flag_icon()) if flagged else QIcon())
         self.face_combo.blockSignals(False)
-        _ = current_view_id  # selection/index is unaffected by setItemText
 
     def _jump_to_flagged(self, direction: int) -> None:
         flagged_views = [(frame_id, view_id) for frame_id, view_id, _kf, flagged in self._flat_views if flagged]
@@ -1372,7 +1396,8 @@ class MasksPanel(QWidget):
         if source_id is None:
             return
         self.build_btn.setEnabled(False)
-        self.flags_label.setText("")
+        self.flags_summary_label.setText("")
+        self.flags_list.setVisible(False)
         self.progress_area.start("Building masks…")
         run_in_background(
             self,
@@ -1389,19 +1414,27 @@ class MasksPanel(QWidget):
     def _on_build_success(self, masks) -> None:
         self.build_btn.setEnabled(True)
         self.progress_area.finish(f"Masked {len(masks)} views.")
+
         flagged = [
             (m.view_id, is_keep_fraction_anomalous(m.keep_fraction))
             for m in masks
             if m.keep_fraction is not None and is_keep_fraction_anomalous(m.keep_fraction)
         ]
+        self.flags_list.clear()
         if flagged:
-            lines = "\n".join(f"  {view_id}: {reason}" for view_id, reason in flagged[:8])
-            more = f"\n  … and {len(flagged) - 8} more" if len(flagged) > 8 else ""
-            self.flags_label.setText(
-                f"⚠ {len(flagged)} view(s) auto-flagged for review (use Previous/Next Flagged below):\n{lines}{more}"
+            self.flags_summary_label.setText(
+                f"{len(flagged)} view(s) auto-flagged for review -- double-click one to jump to it "
+                "(or use Previous/Next Flagged below):"
             )
+            for view_id, reason in flagged:
+                item = QListWidgetItem(f"{view_id}: {reason}")
+                item.setData(Qt.UserRole, view_id)
+                self.flags_list.addItem(item)
+            self.flags_list.setVisible(True)
         else:
-            self.flags_label.setText("")
+            self.flags_summary_label.setText("")
+            self.flags_list.setVisible(False)
+
         current_frame_id = self.frame_selector.current_frame_id()
         current_view_id = self._current_view_id()
         self.refresh_sources()
@@ -1410,6 +1443,17 @@ class MasksPanel(QWidget):
             if index >= 0:
                 self.face_combo.setCurrentIndex(index)
         self.state.notify_change()
+
+    def _on_flags_list_double_clicked(self, item: QListWidgetItem) -> None:
+        view_id = item.data(Qt.UserRole)
+        match = next((v for v in self._flat_views if v[1] == view_id), None)
+        if match is None:
+            return
+        frame_id, _v, _kf, _flagged = match
+        self.frame_selector.jump_to_frame_id(frame_id)
+        index = self.face_combo.findData(view_id)
+        if index >= 0:
+            self.face_combo.setCurrentIndex(index)
 
     def _on_build_error(self, exc: Exception) -> None:
         self.build_btn.setEnabled(True)
