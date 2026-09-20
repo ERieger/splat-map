@@ -53,11 +53,17 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _init_index_db(root: Path) -> None:
-    conn = sqlite3.connect(root / INDEX_FILE)
-    try:
-        conn.executescript(
-            """
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Idempotent (CREATE TABLE IF NOT EXISTS throughout) -- called both
+    when a project is created AND every time an existing one is opened, so
+    a project made before a schema change (e.g. before views/masks/
+    sfm_runs existed) gets upgraded rather than silently missing tables.
+    Real bug this fixes: opening an older project and switching to the
+    Projection panel raised "no such table: views", which its refresh
+    handler didn't surface as an error -- it just looked like the source
+    picker silently refused to populate."""
+    conn.executescript(
+        """
             CREATE TABLE IF NOT EXISTS sources (
                 source_id TEXT PRIMARY KEY,
                 path TEXT NOT NULL,
@@ -106,11 +112,9 @@ def _init_index_db(root: Path) -> None:
                 selected_model TEXT,
                 created_at TEXT NOT NULL
             );
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
+        """
+    )
+    conn.commit()
 
 
 def create_project(root: Path, name: str, capture_mode: CaptureMode) -> Project:
@@ -132,7 +136,11 @@ def create_project(root: Path, name: str, capture_mode: CaptureMode) -> Project:
         capture_mode=capture_mode,
     )
     _write_project_yaml(root, project)
-    _init_index_db(root)
+    conn = sqlite3.connect(root / INDEX_FILE)
+    try:
+        _ensure_schema(conn)
+    finally:
+        conn.close()
     return project
 
 
@@ -159,4 +167,6 @@ def open_index_db(root: Path) -> sqlite3.Connection:
     path = index_db_path(root)
     if not path.exists():
         raise ProjectNotFoundError(f"no {INDEX_FILE} found under {root}")
-    return sqlite3.connect(path)
+    conn = sqlite3.connect(path)
+    _ensure_schema(conn)
+    return conn
