@@ -97,9 +97,24 @@ class Sam3Adapter:
         from huggingface_hub.errors import GatedRepoError
         from transformers import Sam3Model, Sam3Processor
 
+        def _load_local_first(cls, model_id):
+            try:
+                return cls.from_pretrained(model_id, local_files_only=True)
+            except OSError:
+                # Not (fully) cached -- fall back to a normal online load,
+                # which downloads whatever's missing and re-validates gated
+                # access. This fallback matters: confirmed empirically that
+                # from_pretrained's default online-first behavior can hang
+                # for tens of seconds against an unreachable network even
+                # when the ~3.3GB weights are already fully cached locally --
+                # a real problem for field use (a vineyard) with unreliable
+                # connectivity. Trying local_files_only first makes the
+                # already-cached case instant and fully offline.
+                return cls.from_pretrained(model_id)
+
         try:
-            self._processor = Sam3Processor.from_pretrained(self.model_id)
-            model = Sam3Model.from_pretrained(self.model_id)
+            self._processor = _load_local_first(Sam3Processor, self.model_id)
+            model = _load_local_first(Sam3Model, self.model_id)
         except (GatedRepoError, OSError) as exc:
             # transformers' from_pretrained doesn't reliably surface
             # huggingface_hub's GatedRepoError as its own type -- in

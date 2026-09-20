@@ -83,3 +83,17 @@ Install it alongside them (same CUDA-matched index URL as `torch`).
 
 `SAM3_MODEL_ID = "facebook/sam3"` (not `facebook/sam3-base`) is confirmed
 correct as used.
+
+## Update, 2026-09-20: offline-first loading
+
+A real, empirically-confirmed problem for field use: `from_pretrained`'s
+default (online-first) behavior hung for 30+ seconds against an
+unreachable network even with the ~3.3GB weights already fully cached
+locally, before presumably falling back. Fixed by trying
+`from_pretrained(model_id, local_files_only=True)` first and only falling
+back to the normal (online, gate-checking) call on `OSError` (not
+cached). Confirmed the fix: the same unreachable-network scenario that
+previously hung now completes in ~10s (dominated by torch/transformers
+import, not network). This matters directly for a vineyard site with
+unreliable connectivity, once the weights are cached from an initial
+online setup.
