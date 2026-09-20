@@ -123,7 +123,18 @@ def compute_stage_statuses(conn: sqlite3.Connection | None) -> dict[int, str]:
     """Derives every stage's status directly from the database -- the
     single source of truth, rather than tracking status ad hoc as panels
     act. A stage is DONE once it has produced at least one real artifact,
-    ACTIVE once its prerequisite exists but it hasn't yet, else PENDING."""
+    ACTIVE once its prerequisite exists but it hasn't yet (or its output
+    is stale relative to upstream changes -- see below), else PENDING.
+
+    Frames/Projection/Masks fully invalidate (hard-delete) their old
+    output when an earlier stage re-runs (clear_frames_for_source and
+    clear_views_for_frame cascade all the way down), so their status
+    already falls back to ACTIVE/PENDING correctly from the counts alone.
+    Pose estimation (SfM) is different on purpose: its runs are kept as
+    provenance history (docs/status.md's data contract), not overwritten,
+    so an old sfm_runs row can still exist after its inputs changed. That
+    case is detected here by comparing timestamps, and reported as ACTIVE
+    ("stale, should re-run") rather than DONE."""
     if conn is None:
         return {
             STAGE_IMPORT: PENDING,
@@ -138,12 +149,22 @@ def compute_stage_statuses(conn: sqlite3.Connection | None) -> dict[int, str]:
     n_views = conn.execute("SELECT COUNT(*) FROM views").fetchone()[0]
     n_masks = conn.execute("SELECT COUNT(*) FROM masks").fetchone()[0]
     n_sfm_runs = conn.execute("SELECT COUNT(*) FROM sfm_runs").fetchone()[0]
+
+    if n_sfm_runs > 0:
+        latest_run_at = conn.execute("SELECT MAX(created_at) FROM sfm_runs").fetchone()[0]
+        latest_input_at = conn.execute(
+            "SELECT MAX(t) FROM (SELECT MAX(updated_at) AS t FROM views UNION ALL SELECT MAX(updated_at) FROM masks)"
+        ).fetchone()[0]
+        pose_status = ACTIVE if (latest_input_at and latest_input_at > latest_run_at) else DONE
+    else:
+        pose_status = ACTIVE if n_masks > 0 else PENDING
+
     return {
         STAGE_IMPORT: DONE if n_sources > 0 else ACTIVE,
         STAGE_FRAMES: DONE if n_frames > 0 else (ACTIVE if n_video_sources > 0 else PENDING),
         STAGE_PROJECTION: DONE if n_views > 0 else (ACTIVE if n_frames > 0 else PENDING),
         STAGE_MASKS: DONE if n_masks > 0 else (ACTIVE if n_views > 0 else PENDING),
-        STAGE_POSE: DONE if n_sfm_runs > 0 else (ACTIVE if n_masks > 0 else PENDING),
+        STAGE_POSE: pose_status,
     }
 
 
@@ -1464,20 +1485,45 @@ class MasksPanel(QWidget):
             QMessageBox.critical(self, "Unexpected error building masks", f"{type(exc).__name__}: {exc}")
 
 
-def _run_sfm_worker(project_root: Path, progress_callback=None):
+ENGINE_COLMAP_PROJECTIONS = "colmap_projections"
+ENGINE_COLMAP_EQUIRECTANGULAR = "colmap_equirectangular"
+ENGINE_SPHERESFM = "spheresfm"
+
+
+def _run_sfm_worker(
+    project_root: Path,
+    image_source: str,
+    source_id: str | None,
+    camera_model: str,
+    progress_callback=None,
+):
+    from vine360.sfm.colmap_adapter import SfmConfig
+
     conn = open_index_db(project_root)
     try:
-        return run_sfm_for_project(conn, project_root, progress_callback=progress_callback)
+        return run_sfm_for_project(
+            conn,
+            project_root,
+            config=SfmConfig(camera_model=camera_model),
+            image_source=image_source,
+            source_id=source_id,
+            progress_callback=progress_callback,
+        )
     finally:
         conn.close()
 
 
 class PoseEstimationPanel(QWidget):
     """Real SfM: vine360.sfm.project_run.run_sfm_for_project (pycolmap),
-    run off the GUI thread. Operates on the whole project's projections/
-    masks at once -- COLMAP needs the full multi-frame view set to have
-    any real camera-position parallax to reconstruct from; a single
-    frame's projected faces share one optical center and cannot be
+    run off the GUI thread. Two real engine choices (six-face projections,
+    the default; or COLMAP's own native equirectangular camera model
+    directly on raw frames) plus SphereSfM, a genuinely separate COLMAP
+    fork that needs building from C++ source -- unverified here, its Run
+    button stays disabled with an explanation (see docs/adr/0017).
+
+    COLMAP needs real camera-position parallax across multiple frames to
+    reconstruct anything -- a single frame's projected faces (or a single
+    raw equirectangular frame) share one optical center and cannot be
     3D-reconstructed regardless of match quality (see docs/adr/0007)."""
 
     def __init__(self, state: AppState):
@@ -1493,10 +1539,23 @@ class PoseEstimationPanel(QWidget):
         controls_layout = QVBoxLayout(self.controls)
         controls_layout.setContentsMargins(0, 0, 0, 0)
 
-        controls_layout.addWidget(QLabel(
-            "Runs against every projected view in the project (project/projections/), "
-            "using masks from project/masks/keep/ if any have been built."
-        ))
+        form = QFormLayout()
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItem("COLMAP (six-face projections)", userData=ENGINE_COLMAP_PROJECTIONS)
+        self.engine_combo.addItem(
+            "COLMAP native equirectangular (raw frames)", userData=ENGINE_COLMAP_EQUIRECTANGULAR
+        )
+        self.engine_combo.addItem("SphereSfM (external -- unverified)", userData=ENGINE_SPHERESFM)
+        self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+        form.addRow("Engine:", self.engine_combo)
+        self.source_combo = QComboBox()
+        form.addRow("Source (equirectangular only):", self.source_combo)
+        controls_layout.addLayout(form)
+
+        self.engine_note = QLabel("")
+        self.engine_note.setWordWrap(True)
+        self.engine_note.setStyleSheet("color: palette(mid);")
+        controls_layout.addWidget(self.engine_note)
 
         self.run_btn = QPushButton("Run SfM")
         self.run_btn.clicked.connect(self._on_run)
@@ -1512,6 +1571,7 @@ class PoseEstimationPanel(QWidget):
         layout.addWidget(self.controls)
         self.controls.setVisible(False)
         layout.addStretch()
+        self._on_engine_changed()  # set initial note/visibility
 
     def on_project_changed(self) -> None:
         self.on_shown()
@@ -1521,12 +1581,63 @@ class PoseEstimationPanel(QWidget):
         self.no_project_label.setVisible(not have_project)
         self.controls.setVisible(have_project)
         if have_project:
+            self._refresh_sources()
             self._refresh_enabled()
             self._show_latest_run()
 
+    def _refresh_sources(self) -> None:
+        self.source_combo.clear()
+        if self.state.conn is None:
+            return
+        rows = self.state.conn.execute(
+            "SELECT DISTINCT s.source_id, s.path FROM sources s JOIN frames f ON f.source_id = s.source_id "
+            "WHERE s.projection = 'equirectangular' ORDER BY s.rowid"
+        ).fetchall()
+        for source_id, path in rows:
+            self.source_combo.addItem(f"{Path(path).name} ({source_id[:8]})", userData=source_id)
+
+    def _on_engine_changed(self) -> None:
+        engine = self.engine_combo.currentData()
+        self.source_combo.setEnabled(engine == ENGINE_COLMAP_EQUIRECTANGULAR)
+        if engine == ENGINE_COLMAP_PROJECTIONS:
+            self.engine_note.setText(
+                "Runs against every projected view in project/projections/, using masks from "
+                "project/masks/keep/ if any have been built. The handover doc's originally recommended pipeline."
+            )
+        elif engine == ENGINE_COLMAP_EQUIRECTANGULAR:
+            self.engine_note.setText(
+                "Runs directly on the selected source's raw equirectangular frames, using COLMAP's own native "
+                "EQUIRECTANGULAR camera model -- no projection step needed. Confirmed for real with synthetic "
+                "ground truth (full registration, near-zero error); real-photo feature-matching quality near the "
+                "poles and across the seam is unproven. No masking support yet on this path."
+            )
+        else:
+            from vine360.sfm.spheresfm_adapter import SPHERESFM_REPO_URL, validate_installation as spheresfm_status
+
+            status = spheresfm_status()
+            self.engine_note.setText(
+                f"SphereSfM ({SPHERESFM_REPO_URL}) is a separate COLMAP fork with its own spherical camera "
+                "model and sphere-aware matching/mapping. It must be compiled from C++ source -- no pip package "
+                "or prebuilt binary exists, and this environment cannot build it. "
+                f"colmap binary on PATH: {'yes, but ' + status['note'] if status['colmap_binary_found'] else 'no'}."
+            )
+        self._refresh_enabled()
+
     def _refresh_enabled(self) -> None:
-        n_views = self.state.conn.execute("SELECT COUNT(*) FROM views").fetchone()[0]
-        self.run_btn.setEnabled(n_views > 0)
+        if self.state.conn is None:
+            self.run_btn.setEnabled(False)
+            return
+        engine = self.engine_combo.currentData()
+        if engine == ENGINE_SPHERESFM:
+            self.run_btn.setEnabled(False)
+            self.run_btn.setToolTip("Not runnable here -- SphereSfM needs a custom build; see the note above.")
+            return
+        self.run_btn.setToolTip("")
+        if engine == ENGINE_COLMAP_EQUIRECTANGULAR:
+            self.run_btn.setEnabled(self.source_combo.count() > 0)
+        else:
+            n_views = self.state.conn.execute("SELECT COUNT(*) FROM views").fetchone()[0]
+            self.run_btn.setEnabled(n_views > 0)
 
     def _show_latest_run(self) -> None:
         row = self.state.conn.execute(
@@ -1543,12 +1654,21 @@ class PoseEstimationPanel(QWidget):
         )
 
     def _on_run(self) -> None:
+        engine = self.engine_combo.currentData()
+        if engine == ENGINE_COLMAP_EQUIRECTANGULAR:
+            image_source, source_id, camera_model = "frames", self.source_combo.currentData(), "EQUIRECTANGULAR"
+        else:
+            image_source, source_id, camera_model = "projections", None, "SIMPLE_RADIAL"
+
         self.run_btn.setEnabled(False)
         self.progress_area.start("Running SfM…")
         run_in_background(
             self,
             _run_sfm_worker,
             self.state.project_root,
+            image_source,
+            source_id,
+            camera_model,
             on_success=self._on_run_success,
             on_error=self._on_run_error,
             on_progress=self.progress_area.update_progress,

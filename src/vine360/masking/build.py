@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -111,8 +112,9 @@ def build_mask_for_view(
     conn.execute(
         """
         INSERT OR REPLACE INTO masks
-            (view_id, model, model_version, prompts, thresholds, morphology, keep_fraction, edited, flagged_for_review)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (view_id, model, model_version, prompts, thresholds, morphology, keep_fraction, edited,
+             flagged_for_review, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             mask.view_id,
@@ -124,6 +126,7 @@ def build_mask_for_view(
             mask.keep_fraction,
             int(mask.edited),
             int(mask.flagged_for_review),
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
         ),
     )
     conn.commit()

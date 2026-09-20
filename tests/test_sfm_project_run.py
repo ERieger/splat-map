@@ -110,3 +110,44 @@ def test_run_sfm_for_project_uses_mask_dir_only_when_masks_exist(project):
         run_sfm_for_project(conn, root)
     _, kwargs = mock_run.call_args
     assert kwargs["mask_dir"] is None  # no masks/ files were ever written in this test
+
+
+def test_run_sfm_for_project_frames_requires_source_id(project):
+    root, conn = project
+    with pytest.raises(ValueError):
+        run_sfm_for_project(conn, root, image_source="frames")
+
+
+def test_run_sfm_for_project_unknown_image_source_raises(project):
+    root, conn = project
+    with pytest.raises(ValueError):
+        run_sfm_for_project(conn, root, image_source="bogus")
+
+
+def test_run_sfm_for_project_frames_missing_raises_registration_error(project):
+    root, conn = project
+    with pytest.raises(SfmRegistrationError):
+        run_sfm_for_project(conn, root, image_source="frames", source_id="no-such-source")
+
+
+def test_run_sfm_for_project_frames_real_equirectangular_camera_model(project):
+    """Real pipeline (no mocking) against raw equirectangular frames using
+    COLMAP's native EQUIRECTANGULAR camera model -- confirmed for real via
+    pycolmap.synthesize_dataset that this camera model registers correctly
+    given real parallax (see docs/adr/0017). This single-frame source has
+    none (same limitation as the "projections" path -- ADR 0007), so it
+    correctly raises rather than fabricating a reconstruction; the point
+    of this test is that extraction/matching runs cleanly against a real
+    equirectangular image with this camera model, not that it registers."""
+    root, conn = project
+    _insert_fake_source_and_textured_frame(conn, root, frame_id="frame-1", source_id="s1")
+
+    from vine360.sfm.colmap_adapter import SfmConfig
+
+    with pytest.raises(SfmRegistrationError):
+        run_sfm_for_project(
+            conn, root, config=SfmConfig(camera_model="EQUIRECTANGULAR"), image_source="frames", source_id="s1"
+        )
+
+    row = conn.execute("SELECT COUNT(*) FROM sfm_runs").fetchone()
+    assert row[0] == 0  # no run recorded on failure

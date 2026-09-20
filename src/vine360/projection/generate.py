@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -89,8 +90,9 @@ def generate_views_for_frame(
         views.append(view)
         conn.execute(
             """
-            INSERT INTO views (view_id, frame_id, projection_id, width, height, intrinsics, fixed_rotation, image_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO views
+                (view_id, frame_id, projection_id, width, height, intrinsics, fixed_rotation, image_path, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 view.view_id,
@@ -101,6 +103,7 @@ def generate_views_for_frame(
                 json.dumps(view.intrinsics),
                 json.dumps(view.fixed_rotation),
                 view.image_path,
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
             ),
         )
     conn.commit()

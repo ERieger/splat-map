@@ -74,18 +74,45 @@ def resolve_interval_seconds(
 
 
 def clear_frames_for_source(conn: sqlite3.Connection, project_root: Path, source_id: str) -> None:
-    """Removes any previously extracted frames for this source -- both the
-    `frames` rows and the files on disk -- so extract_frames can be safely
-    re-run with different settings (e.g. a different interval). Without
-    this, a second extraction hits the frames table's frame_id PRIMARY KEY
-    (frame_id is deterministic per source+index) and can also leave stale
-    files behind from a larger prior extraction that a smaller new one
-    wouldn't overwrite."""
+    """Removes any previously extracted frames for this source -- rows and
+    files -- so extract_frames can be safely re-run with different
+    settings (e.g. a different interval). Without this, a second
+    extraction hits the frames table's frame_id PRIMARY KEY (frame_id is
+    deterministic per source+index) and can also leave stale files behind
+    from a larger prior extraction that a smaller new one wouldn't
+    overwrite.
+
+    Real data-integrity gap this also fixes: re-extracting frames used to
+    leave any downstream views/masks built from the *old* frames as
+    orphans -- their frame_id no longer existed, but the rows, files and
+    project/projections/<frame_id>/ directories stuck around. Regenerating
+    frames now cascades exactly like regenerating a single frame's views
+    already does (vine360.projection.generate.clear_views_for_frame):
+    delete masks for the affected views, delete the views, remove their
+    projected-image directories, then remove the frames themselves.
+    """
+    frame_rows = conn.execute("SELECT frame_id FROM frames WHERE source_id = ?", (source_id,)).fetchall()
+    frame_ids = [row[0] for row in frame_rows]
+
+    if frame_ids:
+        placeholders = ",".join("?" * len(frame_ids))
+        conn.execute(
+            f"DELETE FROM masks WHERE view_id IN "
+            f"(SELECT view_id FROM views WHERE frame_id IN ({placeholders}))",
+            frame_ids,
+        )
+        conn.execute(f"DELETE FROM views WHERE frame_id IN ({placeholders})", frame_ids)
     conn.execute("DELETE FROM frames WHERE source_id = ?", (source_id,))
     conn.commit()
+
     output_dir = Path(project_root) / "frames" / source_id
     if output_dir.exists():
         shutil.rmtree(output_dir)
+    projections_root = Path(project_root) / "projections"
+    for frame_id in frame_ids:
+        frame_projections_dir = projections_root / frame_id
+        if frame_projections_dir.exists():
+            shutil.rmtree(frame_projections_dir)
 
 
 def extract_frames(

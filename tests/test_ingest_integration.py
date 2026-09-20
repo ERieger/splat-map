@@ -126,3 +126,42 @@ def test_extract_frames_reports_progress(tmp_path):
     thumbnail_events = [(c, t) for m, c, t in events if "Generating thumbnails" in m]
     assert thumbnail_events[-1] == (len(frames), len(frames))
     conn.close()
+
+
+@requires_ffmpeg
+def test_re_extracting_frames_cascades_to_views_and_masks(tmp_path):
+    """Regression test: re-extracting frames used to leave any views/masks
+    built from the *old* frames as orphans (dangling frame_id references,
+    stale projections/ directories) -- clear_frames_for_source must
+    cascade the same way clear_views_for_frame already does for a single
+    frame."""
+    from vine360.masking.build import build_mask_for_view
+    from vine360.projection.generate import generate_views_for_frame
+
+    clip_path = tmp_path / "source_clip.mp4"
+    _make_synthetic_clip(clip_path, duration=4)
+
+    project_root = tmp_path / "project"
+    create_project(project_root, "Integration Test Vineyard", CaptureMode.THREE_SIXTY)
+    conn = open_index_db(project_root)
+    runner = LocalRunner()
+    source = add_source(
+        conn, clip_path, runner, media_type_override=MediaType.VIDEO, added_at="2026-01-01T00:00:00+00:00"
+    )
+
+    first_frames = extract_frames(conn, project_root, source.source_id, runner, interval_seconds=0.5)
+    first_frame_id = first_frames[0].frame_id
+    views = generate_views_for_frame(conn, project_root, first_frame_id, face_size=32)
+    build_mask_for_view(conn, project_root, views[0].view_id)
+
+    assert conn.execute("SELECT COUNT(*) FROM views").fetchone()[0] > 0
+    assert conn.execute("SELECT COUNT(*) FROM masks").fetchone()[0] > 0
+    old_projections_dir = project_root / "projections" / first_frame_id
+    assert old_projections_dir.exists()
+
+    extract_frames(conn, project_root, source.source_id, runner, interval_seconds=2.0)
+
+    assert conn.execute("SELECT COUNT(*) FROM views").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM masks").fetchone()[0] == 0
+    assert not old_projections_dir.exists()
+    conn.close()

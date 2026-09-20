@@ -91,7 +91,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 height INTEGER NOT NULL,
                 intrinsics TEXT NOT NULL,
                 fixed_rotation TEXT NOT NULL,
-                image_path TEXT NOT NULL
+                image_path TEXT NOT NULL,
+                updated_at TEXT
             );
             CREATE TABLE IF NOT EXISTS masks (
                 view_id TEXT PRIMARY KEY REFERENCES views(view_id),
@@ -101,7 +102,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 thresholds TEXT NOT NULL,
                 morphology TEXT NOT NULL,
                 keep_fraction REAL,
-                edited INTEGER NOT NULL DEFAULT 0
+                edited INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT
             );
             CREATE TABLE IF NOT EXISTS sfm_runs (
                 run_id TEXT PRIMARY KEY,
@@ -116,6 +118,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
     _ensure_column(conn, "masks", "flagged_for_review", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "views", "updated_at", "TEXT")
+    _ensure_column(conn, "masks", "updated_at", "TEXT")
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:

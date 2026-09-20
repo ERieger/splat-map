@@ -1,9 +1,23 @@
 """Persists an SfmRun record for a project-level SfM run (handover doc,
 section 4, step 5 "Estimate poses"). Bridges colmap_adapter.py (which
 knows nothing about sqlite or the project layout) to the project's index
-database, running against `project/projections/` as the image directory
-and `project/masks/keep/` as the mask directory -- exactly the layout
-`vine360.projection.generate` and `vine360.masking.build` produce.
+database.
+
+Two real, verified image sources:
+- "projections" (default): `project/projections/` (the six-face cubemap
+  renders) + `project/masks/keep/` if built -- the doc's originally
+  recommended pipeline.
+- "frames": raw equirectangular frames directly
+  (`project/frames/<source_id>/`), using COLMAP's own native
+  EQUIRECTANGULAR camera model. Confirmed for real via
+  `pycolmap.synthesize_dataset` with `camera_model_id=EQUIRECTANGULAR`
+  (full registration, near-zero reprojection error) -- this is COLMAP's
+  own spherical camera support, not the third-party "SphereSfM" project
+  (see docs/adr/0017), and doesn't apply masks (none are built against
+  raw frames in this pipeline yet). Real caveat, not yet validated: SIFT
+  feature matching itself isn't sphere-aware, so quality near the poles
+  and across the equirectangular seam is unproven on actual photos, only
+  on noise-free synthetic correspondences.
 """
 
 from __future__ import annotations
@@ -44,20 +58,39 @@ def run_sfm_for_project(
     project_root: Path,
     *,
     config: SfmConfig = SfmConfig(),
+    image_source: str = "projections",
+    source_id: str | None = None,
     progress_callback=None,
 ) -> tuple[SfmDiagnostics, list[str]]:
-    """Raises SfmRegistrationError if COLMAP produces no usable
+    """image_source="frames" requires source_id and runs directly against
+    that source's raw equirectangular frames (see module docstring) --
+    the caller should set config.camera_model="EQUIRECTANGULAR" for this
+    to be meaningful; it isn't forced here so an explicit config always
+    wins.
+
+    Raises SfmRegistrationError if COLMAP produces no usable
     reconstruction (a real, correct outcome for e.g. single-panorama,
     zero-parallax view sets -- see docs/adr/0007). Records an sfm_runs row
     on success only."""
     notify = progress_callback or (lambda *a: None)
     project_root = Path(project_root)
-    image_dir = project_root / "projections"
-    if not any(image_dir.rglob("*.png")):
-        raise SfmRegistrationError("no projected views found under projections/; generate projections first")
 
-    mask_dir = project_root / "masks" / "keep"
-    mask_dir_arg = mask_dir if any(mask_dir.rglob("*.png")) else None
+    if image_source == "projections":
+        image_dir = project_root / "projections"
+        mask_dir = project_root / "masks" / "keep"
+        mask_dir_arg = mask_dir if any(mask_dir.rglob("*.png")) else None
+        missing_message = "no projected views found under projections/; generate projections first"
+    elif image_source == "frames":
+        if not source_id:
+            raise ValueError("source_id is required when image_source='frames'")
+        image_dir = project_root / "frames" / source_id
+        mask_dir_arg = None  # masks aren't built against raw frames in this pipeline yet
+        missing_message = f"no extracted frames found under frames/{source_id}/; extract frames first"
+    else:
+        raise ValueError(f"unknown image_source: {image_source!r} (expected 'projections' or 'frames')")
+
+    if not any(image_dir.rglob("*.png")):
+        raise SfmRegistrationError(missing_message)
 
     database_path = project_root / "sfm" / "database.db"
     sparse_dir = project_root / "sfm" / "sparse"
@@ -81,7 +114,14 @@ def run_sfm_for_project(
             run_id,
             _image_set_hash(image_dir, project_root),
             json.dumps(validate_installation()),
-            json.dumps({"camera_model": config.camera_model, "sequential_overlap": config.sequential_overlap}),
+            json.dumps(
+                {
+                    "camera_model": config.camera_model,
+                    "sequential_overlap": config.sequential_overlap,
+                    "image_source": image_source,
+                    "source_id": source_id,
+                }
+            ),
             json.dumps(diagnostics.to_dict()),
             run_id,
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
