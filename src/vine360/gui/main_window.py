@@ -48,6 +48,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -286,20 +288,80 @@ def _status_dot(status: str) -> QPixmap:
     return pixmap
 
 
-def _placeholder_thumb(width: int, height: int, color: QColor, text: str) -> QWidget:
-    pixmap = QPixmap(width, height)
-    pixmap.fill(color)
-    label = QLabel()
-    label.setPixmap(pixmap)
-    label.setAlignment(Qt.AlignCenter)
-    caption = QLabel(text)
-    caption.setAlignment(Qt.AlignCenter)
+THUMBNAIL_SIZE = 160
+
+
+def _thumbnail_widget(path: Path, caption: str) -> QWidget:
+    """Loads a real image thumbnail from disk (a projected view or a mask
+    file), or a placeholder if the file is missing/unreadable -- never
+    raises, since a stale db row pointing at a since-moved/deleted file
+    shouldn't crash a preview."""
+    pixmap = QPixmap(str(path))
+    if pixmap.isNull():
+        pixmap = QPixmap(THUMBNAIL_SIZE, THUMBNAIL_SIZE)
+        pixmap.fill(QColor(80, 80, 80))
+    else:
+        pixmap = pixmap.scaled(
+            THUMBNAIL_SIZE, THUMBNAIL_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+    image_label = QLabel()
+    image_label.setPixmap(pixmap)
+    image_label.setAlignment(Qt.AlignCenter)
+    image_label.setToolTip(str(path))
+    caption_label = QLabel(caption)
+    caption_label.setAlignment(Qt.AlignCenter)
+    caption_label.setWordWrap(True)
     wrapper = QWidget()
     layout = QVBoxLayout(wrapper)
     layout.setContentsMargins(2, 2, 2, 2)
-    layout.addWidget(label)
-    layout.addWidget(caption)
+    layout.addWidget(image_label)
+    layout.addWidget(caption_label)
     return wrapper
+
+
+class PreviewGallery(QWidget):
+    """A horizontally scrollable row of image thumbnails, shared by the
+    Projection and Masks panels so generated views/masks can actually be
+    looked at rather than only counted."""
+
+    def __init__(self, empty_text: str = "Nothing to preview yet."):
+        super().__init__()
+        self._empty_text = empty_text
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self.empty_label = QLabel(empty_text)
+        self.empty_label.setStyleSheet("color: palette(mid);")
+        outer.addWidget(self.empty_label)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFixedHeight(THUMBNAIL_SIZE + 60)
+        self.scroll_area.setVisible(False)
+        self._content = QWidget()
+        self._content_layout = QHBoxLayout(self._content)
+        self._content_layout.setContentsMargins(4, 4, 4, 4)
+        self.scroll_area.setWidget(self._content)
+        outer.addWidget(self.scroll_area)
+
+    def set_items(self, items: list[tuple[Path, str]]) -> None:
+        """items: list of (image_path, caption)."""
+        while self._content_layout.count():
+            child = self._content_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        if not items:
+            self.empty_label.setText(self._empty_text)
+            self.empty_label.setVisible(True)
+            self.scroll_area.setVisible(False)
+            return
+
+        self.empty_label.setVisible(False)
+        self.scroll_area.setVisible(True)
+        for path, caption in items:
+            self._content_layout.addWidget(_thumbnail_widget(path, caption))
+        self._content_layout.addStretch()
 
 
 def _panel_header(title: str, subtitle: str, layout: QVBoxLayout) -> None:
@@ -836,7 +898,11 @@ class ProjectionPanel(QWidget):
 
         form = QFormLayout()
         self.source_combo = QComboBox()
+        self.source_combo.currentIndexChanged.connect(self._refresh_frame_combo)
         form.addRow("Source (its extracted frames):", self.source_combo)
+        self.frame_combo = QComboBox()
+        self.frame_combo.currentIndexChanged.connect(self._refresh_preview)
+        form.addRow("Preview frame:", self.frame_combo)
         self.face_size_spin = QSpinBox()
         self.face_size_spin.setRange(128, 4096)
         self.face_size_spin.setSingleStep(128)
@@ -869,6 +935,10 @@ class ProjectionPanel(QWidget):
 
         self.progress_area = ProgressArea()
         controls_layout.addWidget(self.progress_area)
+
+        controls_layout.addWidget(QLabel("Preview:"))
+        self.preview = PreviewGallery("No views generated yet for this frame.")
+        controls_layout.addWidget(self.preview)
 
         layout.addWidget(self.controls)
         self.controls.setVisible(False)
@@ -903,6 +973,38 @@ class ProjectionPanel(QWidget):
         has_sources = self.source_combo.count() > 0
         self.generate_btn.setEnabled(has_sources)
         self.progress_area.label.setText("" if has_sources else "No extracted frames yet -- extract frames first.")
+        self._refresh_frame_combo()
+
+    def _refresh_frame_combo(self) -> None:
+        self.frame_combo.blockSignals(True)
+        self.frame_combo.clear()
+        source_id = self.source_combo.currentData()
+        if self.state.conn is not None and source_id is not None:
+            rows = self.state.conn.execute(
+                "SELECT f.frame_id, f.source_time, COUNT(v.view_id) AS view_count "
+                "FROM frames f LEFT JOIN views v ON v.frame_id = f.frame_id "
+                "WHERE f.source_id = ? GROUP BY f.frame_id ORDER BY f.source_time",
+                (source_id,),
+            ).fetchall()
+            for frame_id, source_time, view_count in rows:
+                label = f"t={source_time:.2f}s" + (f" ({view_count} views)" if view_count else " (no views)")
+                self.frame_combo.addItem(label, userData=frame_id)
+        self.frame_combo.blockSignals(False)
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        frame_id = self.frame_combo.currentData()
+        if self.state.conn is None or frame_id is None:
+            self.preview.set_items([])
+            return
+        rows = self.state.conn.execute(
+            "SELECT projection_id, image_path FROM views WHERE frame_id = ? ORDER BY view_id", (frame_id,)
+        ).fetchall()
+        items = [
+            (self.state.project_root / image_path, Path(image_path).stem)
+            for _projection_id, image_path in rows
+        ]
+        self.preview.set_items(items)
 
     def _selected_face_names(self) -> list[str]:
         return [name for name, cb in self.face_checks.items() if cb.isChecked()]
@@ -933,6 +1035,7 @@ class ProjectionPanel(QWidget):
     def _on_generate_success(self, views) -> None:
         self.generate_btn.setEnabled(True)
         self.progress_area.finish(f"Generated {len(views)} views.")
+        self.refresh_sources()
         self.state.notify_change()
 
     def _on_generate_error(self, exc: Exception) -> None:
@@ -985,7 +1088,11 @@ class MasksPanel(QWidget):
 
         form = QFormLayout()
         self.source_combo = QComboBox()
+        self.source_combo.currentIndexChanged.connect(self._refresh_view_combo)
         form.addRow("Source (its generated views):", self.source_combo)
+        self.view_combo = QComboBox()
+        self.view_combo.currentIndexChanged.connect(self._refresh_preview)
+        form.addRow("Preview view:", self.view_combo)
         controls_layout.addLayout(form)
 
         sam3_row = QHBoxLayout()
@@ -1016,6 +1123,10 @@ class MasksPanel(QWidget):
         self.flags_label = QLabel("")
         self.flags_label.setWordWrap(True)
         controls_layout.addWidget(self.flags_label)
+
+        controls_layout.addWidget(QLabel("Preview (original view, then its keep-mask if built):"))
+        self.preview = PreviewGallery("No views generated yet.")
+        controls_layout.addWidget(self.preview)
 
         layout.addWidget(self.controls)
         self.controls.setVisible(False)
@@ -1063,6 +1174,38 @@ class MasksPanel(QWidget):
         has_sources = self.source_combo.count() > 0
         self.build_btn.setEnabled(has_sources)
         self.progress_area.label.setText("" if has_sources else "No projected views yet -- generate projections first.")
+        self._refresh_view_combo()
+
+    def _refresh_view_combo(self) -> None:
+        self.view_combo.blockSignals(True)
+        self.view_combo.clear()
+        source_id = self.source_combo.currentData()
+        if self.state.conn is not None and source_id is not None:
+            rows = self.state.conn.execute(
+                "SELECT v.view_id, m.keep_fraction FROM views v "
+                "JOIN frames f ON f.frame_id = v.frame_id LEFT JOIN masks m ON m.view_id = v.view_id "
+                "WHERE f.source_id = ? ORDER BY v.view_id",
+                (source_id,),
+            ).fetchall()
+            for view_id, keep_fraction in rows:
+                label = view_id + (f" (keep {keep_fraction:.0%})" if keep_fraction is not None else " (unmasked)")
+                self.view_combo.addItem(label, userData=view_id)
+        self.view_combo.blockSignals(False)
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        view_id = self.view_combo.currentData()
+        if self.state.conn is None or view_id is None:
+            self.preview.set_items([])
+            return
+        row = self.state.conn.execute("SELECT image_path FROM views WHERE view_id = ?", (view_id,)).fetchone()
+        items = []
+        if row is not None:
+            items.append((self.state.project_root / row[0], "original view"))
+            keep_path = self.state.project_root / "masks" / "keep" / (Path(row[0]).relative_to("projections").as_posix() + ".png")
+            if keep_path.exists():
+                items.append((keep_path, "keep mask"))
+        self.preview.set_items(items)
 
     def _on_build(self) -> None:
         source_id = self.source_combo.currentData()
@@ -1095,6 +1238,7 @@ class MasksPanel(QWidget):
             lines = "\n".join(f"  {view_id}: {reason}" for view_id, reason in flagged[:8])
             more = f"\n  … and {len(flagged) - 8} more" if len(flagged) > 8 else ""
             self.flags_label.setText(f"⚠ {len(flagged)} view(s) flagged for review:\n{lines}{more}")
+        self.refresh_sources()
         self.state.notify_change()
 
     def _on_build_error(self, exc: Exception) -> None:
