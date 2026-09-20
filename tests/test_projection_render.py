@@ -40,6 +40,23 @@ def test_six_face_preset_includes_polar_when_requested():
     assert {f.name for f in faces} == {"front", "right", "back", "left", "up", "down"}
 
 
+def test_six_face_preset_explicit_face_names_selects_subset():
+    faces = six_face_preset(face_size=64, face_names=["front", "up"])
+    assert {f.name for f in faces} == {"front", "up"}
+
+
+def test_six_face_preset_explicit_face_names_overrides_include_polar():
+    faces = six_face_preset(face_size=64, include_polar_faces=True, face_names=["front"])
+    assert {f.name for f in faces} == {"front"}
+
+
+def test_six_face_preset_unknown_face_name_raises():
+    import pytest
+
+    with pytest.raises(ValueError):
+        six_face_preset(face_size=64, face_names=["front", "sideways"])
+
+
 def test_a01_round_trip_projection_known_point_front_face():
     """Acceptance test A01: a known point on a synthetic equirectangular
     grid lands in the expected face pixel within one pixel."""

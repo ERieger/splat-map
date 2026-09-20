@@ -156,61 +156,55 @@ isn't literally shelled out to.
       runs under QT_QPA_PLATFORM=xcb (not wayland) for more reliable
       window stacking/dropdowns, using a user-space-extracted
       libxcb-cursor0 (no root needed).
+0012: wired Projection, Masking and SfM into the GUI (new
+      vine360.projection.generate / vine360.masking.build /
+      vine360.sfm.project_run persistence-layer modules, three new index
+      tables); unified every progress_callback to (message, current,
+      total) with real ETAs; sidebar stage status is now derived live
+      from the database (compute_stage_statuses) instead of tracked ad
+      hoc; Project panel split into clearly separated create/open
+      sections. Also fixed a real latent bug this surfaced:
+      pycolmap.COLMAP_version/COLMAP_build are str attributes, not
+      callables -- validate_installation() had been calling them as
+      functions since ADR 0007, uncaught until now.
 
 ## Blockers / known gaps
 
 - **Nerfstudio adapter is unverified** (see ADR 0009) -- run its `--help`
   output against a real install before trusting its flags.
-- **Projection/masking/SfM are not yet wired into the project CLI, GUI,
-  or index database for execution.** `vine360/project.py`'s
-  `index.sqlite` only has `sources`/`frames` tables (per ADR 0003's "add
-  tables when their milestone needs them"); M2-M4 are complete, tested
-  library code, and the GUI's Frames/Projection/Masks/Pose panels show
-  real preset values, but nothing actually runs extraction/projection/
-  masking/SfM from the CLI or GUI yet -- their action buttons are
-  present but disabled. This is explicitly the next task, not an
-  oversight -- see below.
 - Near-duplicate frame filtering (M1, called for in section 4) still
   isn't implemented.
 - Photo EXIF/GPS parsing for drone stills (ADR 0004) still isn't
   implemented -- and a GPX-sidecar reader (see ADR 0010) is now a better
   first georeferencing step than EXIF parsing, given the real sample
   data has a `.gpx` file, not JPEG GPS tags.
-- The GUI (`vine360/gui/`) has no automated tests yet (an offscreen smoke
-  test was run manually during development, not added to the pytest
-  suite -- PySide6 GUI testing needs `pytest-qt` or similar, not yet
-  added as a dependency).
+- The GUI (`vine360/gui/`) has no automated test *suite* yet -- every
+  verification so far (including the full Project-through-SfM pipeline)
+  was a manual offscreen smoke test run during development, not added to
+  pytest. `pytest-qt` or similar isn't a dependency yet.
 - No pipeline stage has been run against real footage. Real EstoWines
-  sample data exists (see above) but per an explicit "no runs yet"
-  instruction, only its GPX file and directory listing have been
-  inspected -- no video has been opened or processed.
+  sample data exists (see above); every test and smoke-test run so far
+  uses synthetic clips/images, per the standing preference not to run
+  multi-GB real files without it being explicitly asked for.
+- Training (preset selection UI, monitor UI) remains untouched --
+  adapter-only, per the explicit standing decision in ADR 0009. Not a gap;
+  the boundary of "wire up to training" was intentional.
 
 ## Exact next task
 
-Wire frame extraction, projection, masking and SfM into both the CLI and
-the GUI's disabled action buttons, so the pipeline is actually drivable
-end-to-end rather than only reachable from library calls in tests:
+With Project through Pose estimation now real and wired, reasonable next
+directions (none started):
 
-1. Add `views` and `masks` tables to `project.py`'s index schema (fields
-   per the data contracts already declared in `models.py`).
-2. `vine360 projection generate --project <path> --frame-id <id>
-   [--preset six-face] [--fov 90] [--face-size N]` (and the GUI's
-   "Generate Projections" button): renders faces for a frame, writes
-   them under `project/projections/`, records `View` rows.
-3. `vine360 masking build --project <path> --view-id <id> [--sky
-   classical|sam3] [--person sam3]` (and "Build Masks"): runs the
-   requested backends, writes class/keep/exclude masks under
-   `project/masks/`, records `Mask` rows, surfaces
-   `is_keep_fraction_anomalous` warnings.
-4. `vine360 sfm run --project <path>` (and "Run SfM"): gathers all views
-   + their keep masks, calls `extract_and_match` + `map_and_diagnose`
-   against `project/sfm/database.db` / `project/sfm/sparse/`, prints
-   `evaluate_registration_quality` warnings, records an `sfm_runs` row.
-5. Long-running steps (extraction, SfM, eventual training) need to run
-   off the GUI's main thread (e.g. `QThread`/`QRunnable`) so the
-   dashboard stays responsive and can show live progress/logs -- not
-   needed for the CLI, but required before the GUI's action buttons can
-   be safely enabled.
-6. Only once frame extraction can run for real: validate against the
-   real Insta360/Antigravity A1 sample footage -- explicitly on request,
-   not proactively, given the multi-GB file sizes.
+1. Add a `pytest-qt`-based automated GUI test suite -- codify the manual
+   offscreen smoke tests (create -> import -> frames -> projection ->
+   masks -> SfM, plus the remove-source/custom-interval/re-extraction
+   paths) as real pytest tests instead of ad hoc scripts.
+2. Wire Training for real (backend install + execution), which was
+   explicitly deferred, not attempted, in this pass -- would need to
+   revisit ADR 0009's "adapter only" decision first.
+3. Georeferencing (M8): a GPX-sidecar reader (see ADR 0010) is a better
+   first step than the still-unimplemented EXIF/GPS parsing, given real
+   sample data already has `.gpx` files.
+4. Near-duplicate frame filtering (M1 gap, still open).
+5. Validate the real, wired pipeline against actual Insta360/Antigravity
+   A1 footage -- explicitly on request given multi-GB file sizes.

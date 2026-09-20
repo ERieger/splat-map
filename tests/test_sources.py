@@ -115,16 +115,20 @@ def test_add_source_reports_progress(tmp_path):
     media_file = tmp_path / "clip.mp4"
     media_file.write_bytes(b"not a real video, ffprobe is faked")
 
-    messages = []
+    events = []
     add_source(
         conn,
         media_file,
         FakeRunner(),
         added_at="2026-09-20T00:00:00+00:00",
-        progress_callback=messages.append,
+        progress_callback=lambda m, c, t: events.append((m, c, t)),
     )
+    messages = [m for m, _, _ in events]
     assert any("Probing" in m for m in messages)
     assert any("checksum" in m.lower() for m in messages)
+    checksum_events = [(c, t) for m, c, t in events if "checksum" in m.lower()]
+    assert all(c is not None and t is not None for c, t in checksum_events)
+    assert checksum_events[-1][0] == checksum_events[-1][1]  # reached 100%
     conn.close()
 
 

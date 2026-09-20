@@ -77,6 +77,35 @@ def _init_index_db(root: Path) -> None:
                 path TEXT NOT NULL,
                 checksum TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS views (
+                view_id TEXT PRIMARY KEY,
+                frame_id TEXT NOT NULL REFERENCES frames(frame_id),
+                projection_id TEXT NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                intrinsics TEXT NOT NULL,
+                fixed_rotation TEXT NOT NULL,
+                image_path TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS masks (
+                view_id TEXT PRIMARY KEY REFERENCES views(view_id),
+                model TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                prompts TEXT NOT NULL,
+                thresholds TEXT NOT NULL,
+                morphology TEXT NOT NULL,
+                keep_fraction REAL,
+                edited INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sfm_runs (
+                run_id TEXT PRIMARY KEY,
+                image_set_hash TEXT NOT NULL,
+                engine_version TEXT NOT NULL,
+                config TEXT NOT NULL,
+                model_stats TEXT NOT NULL,
+                selected_model TEXT,
+                created_at TEXT NOT NULL
+            );
             """
         )
         conn.commit()

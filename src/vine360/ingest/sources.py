@@ -43,11 +43,19 @@ class EquirectangularConfirmationRequired(SourceError):
     """
 
 
-def sha256_file(path: Path) -> str:
+def sha256_file(path: Path, progress_callback=None) -> str:
+    """progress_callback, if given, is called with (bytes_read,
+    bytes_total) after each chunk -- this was the ~25s-for-a-7.65GB-file
+    step that used to freeze the GUI with zero feedback."""
     digest = hashlib.sha256()
+    total = path.stat().st_size
+    read = 0
     with open(path, "rb") as f:
         while chunk := f.read(_CHECKSUM_CHUNK_SIZE):
             digest.update(chunk)
+            read += len(chunk)
+            if progress_callback:
+                progress_callback(read, total)
     return digest.hexdigest()
 
 
@@ -78,17 +86,17 @@ def add_source(
     added_at: str,
     progress_callback=None,
 ) -> Source:
-    """progress_callback, if given, is called with short human-readable
-    phase descriptions (e.g. "Probing metadata…", "Computing checksum…") --
-    checksumming a multi-GB file can take tens of seconds with otherwise no
-    visible feedback."""
-    notify = progress_callback or (lambda _msg: None)
+    """progress_callback(message, current, total), if given, is called for
+    each phase -- current/total are None for phases without a natural
+    count (probing), and byte counts during checksumming (a multi-GB file
+    can take tens of seconds with otherwise no visible feedback)."""
+    notify = progress_callback or (lambda *a: None)
 
     file_path = Path(file_path).resolve()
     if not file_path.exists():
         raise SourceError(f"source file not found: {file_path}")
 
-    notify(f"Probing {file_path.name}…")
+    notify(f"Probing {file_path.name}…", None, None)
     metadata = probe_media(file_path, runner)
     declared_type = media_type_override or infer_media_type(file_path)
     resolved_type, projection = _resolve_projection(declared_type, metadata)
@@ -103,12 +111,17 @@ def add_source(
             "or an explicit --media-type to proceed"
         )
 
-    notify(f"Computing checksum for {file_path.name} (large files can take tens of seconds)…")
+    file_size = file_path.stat().st_size
+
+    def _checksum_progress(read: int, total: int) -> None:
+        notify(f"Computing checksum for {file_path.name} ({read / 1e6:.0f}/{total / 1e6:.0f} MB)…", read, total)
+
+    notify(f"Computing checksum for {file_path.name} (0/{file_size / 1e6:.0f} MB)…", 0, file_size)
     dimensions = (metadata.width, metadata.height) if metadata.width and metadata.height else None
     source = Source(
         source_id=uuid.uuid4().hex,
         path=str(file_path),
-        checksum=sha256_file(file_path),
+        checksum=sha256_file(file_path, progress_callback=_checksum_progress),
         media_type=resolved_type,
         projection=projection,
         dimensions=dimensions,

@@ -68,10 +68,14 @@ class SfmDiagnostics:
 
 
 def validate_installation() -> dict:
+    # COLMAP_version/COLMAP_build are plain str attributes, not callables --
+    # confirmed by direct inspection after this was found calling them as
+    # functions (a latent bug nothing had exercised until
+    # tests/test_sfm_project_run.py started calling validate_installation()).
     return {
         "pycolmap_version": pycolmap.__version__,
-        "colmap_version": pycolmap.COLMAP_version(),
-        "colmap_build": pycolmap.COLMAP_build(),
+        "colmap_version": pycolmap.COLMAP_version,
+        "colmap_build": pycolmap.COLMAP_build,
         "cuda_available": pycolmap.has_cuda,
     }
 

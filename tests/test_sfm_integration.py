@@ -181,3 +181,17 @@ def test_evaluate_registration_quality_flags_problems():
     )
     warnings = evaluate_registration_quality(bad)
     assert len(warnings) == 4
+
+
+def test_validate_installation_reports_real_versions():
+    """Regression test: COLMAP_version/COLMAP_build are plain str
+    attributes on pycolmap, not callables -- validate_installation() once
+    called them as functions and raised TypeError, uncaught because
+    nothing had exercised this function until
+    tests/test_sfm_project_run.py started calling it."""
+    from vine360.sfm.colmap_adapter import validate_installation
+
+    info = validate_installation()
+    assert info["pycolmap_version"]
+    assert "COLMAP" in info["colmap_version"]
+    assert isinstance(info["cuda_available"], bool)

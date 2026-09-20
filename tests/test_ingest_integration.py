@@ -110,11 +110,19 @@ def test_extract_frames_reports_progress(tmp_path):
         conn, clip_path, runner, media_type_override=MediaType.VIDEO, added_at="2026-01-01T00:00:00+00:00"
     )
 
-    messages = []
+    events = []
     frames = extract_frames(
-        conn, project_root, source.source_id, runner, interval_seconds=1.0, progress_callback=messages.append
+        conn,
+        project_root,
+        source.source_id,
+        runner,
+        interval_seconds=1.0,
+        progress_callback=lambda m, c, t: events.append((m, c, t)),
     )
+    messages = [m for m, _, _ in events]
     assert any("Extracting raw frames" in m for m in messages)
     assert any("Generating thumbnails" in m for m in messages)
     assert any(f"({len(frames)}/{len(frames)})" in m for m in messages), "should report reaching the last frame"
+    thumbnail_events = [(c, t) for m, c, t in events if "Generating thumbnails" in m]
+    assert thumbnail_events[-1] == (len(frames), len(frames))
     conn.close()

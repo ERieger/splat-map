@@ -27,6 +27,8 @@ _FACES = [
     ("down", 0.0, -90.0, True),
 ]
 
+ALL_FACE_NAMES = [name for name, *_ in _FACES]
+
 
 @dataclass(frozen=True)
 class FaceSpec:
@@ -39,12 +41,27 @@ class FaceSpec:
 
 
 def six_face_preset(
-    face_size: int, fov_degrees: float = DEFAULT_FOV_DEGREES, *, include_polar_faces: bool = False
+    face_size: int,
+    fov_degrees: float = DEFAULT_FOV_DEGREES,
+    *,
+    include_polar_faces: bool = False,
+    face_names: list[str] | None = None,
 ) -> list[FaceSpec]:
+    """face_names, if given, selects an explicit subset (in the order the
+    handover doc's preset defines: front, right, back, left, up, down) --
+    overrides include_polar_faces. Unknown names raise ValueError."""
+    if face_names is not None:
+        unknown = set(face_names) - set(ALL_FACE_NAMES)
+        if unknown:
+            raise ValueError(f"unknown face name(s): {sorted(unknown)}; valid names are {ALL_FACE_NAMES}")
+
     intrinsics = Intrinsics.from_fov(face_size, face_size, fov_degrees)
     faces = []
     for name, yaw_deg, pitch_deg, is_polar in _FACES:
-        if is_polar and not include_polar_faces:
+        if face_names is not None:
+            if name not in face_names:
+                continue
+        elif is_polar and not include_polar_faces:
             continue
         rotation = face_rotation(math.radians(yaw_deg), math.radians(pitch_deg))
         faces.append(FaceSpec(name=name, intrinsics=intrinsics, fixed_rotation=rotation))
