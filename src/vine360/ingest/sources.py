@@ -76,11 +76,19 @@ def add_source(
     confirm_equirectangular: bool = False,
     capture_group: str | None = None,
     added_at: str,
+    progress_callback=None,
 ) -> Source:
+    """progress_callback, if given, is called with short human-readable
+    phase descriptions (e.g. "Probing metadata…", "Computing checksum…") --
+    checksumming a multi-GB file can take tens of seconds with otherwise no
+    visible feedback."""
+    notify = progress_callback or (lambda _msg: None)
+
     file_path = Path(file_path).resolve()
     if not file_path.exists():
         raise SourceError(f"source file not found: {file_path}")
 
+    notify(f"Probing {file_path.name}…")
     metadata = probe_media(file_path, runner)
     declared_type = media_type_override or infer_media_type(file_path)
     resolved_type, projection = _resolve_projection(declared_type, metadata)
@@ -95,6 +103,7 @@ def add_source(
             "or an explicit --media-type to proceed"
         )
 
+    notify(f"Computing checksum for {file_path.name} (large files can take tens of seconds)…")
     dimensions = (metadata.width, metadata.height) if metadata.width and metadata.height else None
     source = Source(
         source_id=uuid.uuid4().hex,

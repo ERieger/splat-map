@@ -102,23 +102,30 @@ class _BackgroundWorker(QObject):
 
     finished = Signal(object)
     failed = Signal(Exception)
+    progress = Signal(str)
 
-    def __init__(self, fn, args, kwargs):
+    def __init__(self, fn, args, kwargs, report_progress: bool):
         super().__init__()
         self._fn = fn
         self._args = args
         self._kwargs = kwargs
+        self._report_progress = report_progress
 
     def run(self) -> None:
         try:
-            result = self._fn(*self._args, **self._kwargs)
+            if self._report_progress:
+                result = self._fn(*self._args, progress_callback=self.progress.emit, **self._kwargs)
+            else:
+                result = self._fn(*self._args, **self._kwargs)
         except Exception as exc:  # surfaced via `failed`, not swallowed
             self.failed.emit(exc)
         else:
             self.finished.emit(result)
 
 
-def run_in_background(owner: QWidget, fn, *args, on_success=None, on_error=None, **kwargs) -> None:
+def run_in_background(
+    owner: QWidget, fn, *args, on_success=None, on_error=None, on_progress=None, **kwargs
+) -> None:
     """Starts fn(*args, **kwargs) on a QThread. `owner` must outlive the
     call. Every in-flight (thread, worker) pair is kept in a list on
     `owner` -- a single overwritable attribute is NOT enough: our own
@@ -131,7 +138,7 @@ def run_in_background(owner: QWidget, fn, *args, on_success=None, on_error=None,
     still running" -- reproduced and fixed while wiring remove-source and
     re-extraction."""
     thread = QThread()
-    worker = _BackgroundWorker(fn, args, kwargs)
+    worker = _BackgroundWorker(fn, args, kwargs, report_progress=on_progress is not None)
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
     worker.finished.connect(thread.quit)
@@ -140,6 +147,8 @@ def run_in_background(owner: QWidget, fn, *args, on_success=None, on_error=None,
         worker.finished.connect(on_success)
     if on_error:
         worker.failed.connect(on_error)
+    if on_progress:
+        worker.progress.connect(on_progress)
 
     if not hasattr(owner, "_bg_pairs"):
         owner._bg_pairs = []
@@ -293,7 +302,12 @@ class ProjectPanel(QWidget):
 
 
 def _add_source_worker(
-    project_root: Path, file_path: Path, capture_group: str | None, confirm_equirectangular: bool, added_at: str
+    project_root: Path,
+    file_path: Path,
+    capture_group: str | None,
+    confirm_equirectangular: bool,
+    added_at: str,
+    progress_callback=None,
 ):
     """Runs on a background thread -- opens its own sqlite connection
     rather than reusing one created on the GUI thread (sqlite3 connections
@@ -307,6 +321,7 @@ def _add_source_worker(
             capture_group=capture_group,
             confirm_equirectangular=confirm_equirectangular,
             added_at=added_at,
+            progress_callback=progress_callback,
         )
     finally:
         conn.close()
@@ -429,6 +444,7 @@ class ImportPanel(QWidget):
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
             on_success=self._on_add_source_success,
             on_error=self._on_add_source_error,
+            on_progress=self.status_label.setText,
         )
 
     def _on_add_source_success(self, source) -> None:
@@ -522,10 +538,17 @@ class ImportPanel(QWidget):
             QMessageBox.critical(self, "Unexpected error removing source", f"{type(exc).__name__}: {exc}")
 
 
-def _extract_frames_worker(project_root: Path, source_id: str, interval_seconds: float):
+def _extract_frames_worker(project_root: Path, source_id: str, interval_seconds: float, progress_callback=None):
     conn = open_index_db(project_root)
     try:
-        return extract_frames(conn, project_root, source_id, LocalRunner(), interval_seconds=interval_seconds)
+        return extract_frames(
+            conn,
+            project_root,
+            source_id,
+            LocalRunner(),
+            interval_seconds=interval_seconds,
+            progress_callback=progress_callback,
+        )
     finally:
         conn.close()
 
@@ -644,6 +667,7 @@ class FramesPanel(QWidget):
             interval,
             on_success=self._on_extract_success,
             on_error=self._on_extract_error,
+            on_progress=self.status_label.setText,
         )
 
     def _on_extract_success(self, frames) -> None:

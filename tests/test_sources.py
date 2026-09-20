@@ -107,6 +107,27 @@ def test_remove_source_also_clears_its_frames(tmp_path):
     conn.close()
 
 
+def test_add_source_reports_progress(tmp_path):
+    project_root = tmp_path / "proj"
+    create_project(project_root, "Test", CaptureMode.THREE_SIXTY)
+    conn = open_index_db(project_root)
+
+    media_file = tmp_path / "clip.mp4"
+    media_file.write_bytes(b"not a real video, ffprobe is faked")
+
+    messages = []
+    add_source(
+        conn,
+        media_file,
+        FakeRunner(),
+        added_at="2026-09-20T00:00:00+00:00",
+        progress_callback=messages.append,
+    )
+    assert any("Probing" in m for m in messages)
+    assert any("checksum" in m.lower() for m in messages)
+    conn.close()
+
+
 def test_remove_source_unknown_id_raises(tmp_path):
     project_root = tmp_path / "proj"
     create_project(project_root, "Test", CaptureMode.THREE_SIXTY)

@@ -95,3 +95,26 @@ def test_re_extracting_frames_with_a_different_interval_does_not_collide(tmp_pat
     rows = conn.execute("SELECT frame_id FROM frames WHERE source_id = ?", (source.source_id,)).fetchall()
     assert len(rows) == len(second)
     conn.close()
+
+
+@requires_ffmpeg
+def test_extract_frames_reports_progress(tmp_path):
+    clip_path = tmp_path / "source_clip.mp4"
+    _make_synthetic_clip(clip_path, duration=3)
+
+    project_root = tmp_path / "project"
+    create_project(project_root, "Integration Test Vineyard", CaptureMode.THREE_SIXTY)
+    conn = open_index_db(project_root)
+    runner = LocalRunner()
+    source = add_source(
+        conn, clip_path, runner, media_type_override=MediaType.VIDEO, added_at="2026-01-01T00:00:00+00:00"
+    )
+
+    messages = []
+    frames = extract_frames(
+        conn, project_root, source.source_id, runner, interval_seconds=1.0, progress_callback=messages.append
+    )
+    assert any("Extracting raw frames" in m for m in messages)
+    assert any("Generating thumbnails" in m for m in messages)
+    assert any(f"({len(frames)}/{len(frames)})" in m for m in messages), "should report reaching the last frame"
+    conn.close()

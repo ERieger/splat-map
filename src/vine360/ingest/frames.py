@@ -96,7 +96,21 @@ def extract_frames(
     *,
     interval_seconds: float | None = None,
     target_count: int | None = None,
+    progress_callback=None,
 ) -> list[Frame]:
+    """progress_callback, if given, is called with short human-readable
+    phase descriptions. The raw ffmpeg extraction is a single fast command;
+    the per-frame thumbnail+checksum loop that follows is the slow part for
+    a high-resolution source (e.g. ~0.8s/frame at 8K -- 172 frames is ~2.5
+    minutes) and previously gave no feedback at all during that time,
+    which looked identical to a hang. Frame rows are also now committed
+    incrementally (every 20 frames) rather than only once at the very end,
+    so an interrupted run leaves a partially-usable record instead of
+    none -- full crash-resume (re-using already-done work) is still not
+    implemented; a re-run still clears and starts over via
+    clear_frames_for_source."""
+    notify = progress_callback or (lambda _msg: None)
+
     source = get_source(conn, source_id)
     if source.media_type.value != "video":
         raise FrameExtractionError(
@@ -117,6 +131,7 @@ def extract_frames(
     thumbs_dir = output_dir / "thumbs"
     thumbs_dir.mkdir(parents=True, exist_ok=True)
 
+    notify("Extracting raw frames via ffmpeg…")
     pattern = output_dir / "frame_%06d.png"
     command = build_frame_extraction_command(Path(source.path), pattern, interval)
     result = runner.run(command)
@@ -129,6 +144,7 @@ def extract_frames(
 
     frames: list[Frame] = []
     for index, frame_path in enumerate(frame_files):
+        notify(f"Generating thumbnails ({index + 1}/{len(frame_files)})…")
         thumb_path = thumbs_dir / f"{frame_path.stem}.jpg"
         thumb_result = runner.run(build_thumbnail_command(frame_path, thumb_path))
         if not thumb_result.ok:
@@ -159,5 +175,7 @@ def extract_frames(
                 frame.checksum,
             ),
         )
+        if (index + 1) % 20 == 0:
+            conn.commit()  # incremental, so an interrupted run keeps partial progress
     conn.commit()
     return frames
