@@ -109,6 +109,11 @@ class Mask:
     morphology: dict = field(default_factory=dict)
     keep_fraction: float | None = None
     edited: bool = False
+    # Not in the handover doc's original data contract -- added for the
+    # GUI's review workflow (auto-set for keep-fraction anomalies, freely
+    # toggleable by the user afterward). Distinct from `edited`: flagged
+    # means "needs a look", edited means "a human already corrected it".
+    flagged_for_review: bool = False
 
 
 @dataclass

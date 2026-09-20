@@ -25,6 +25,7 @@ from vine360.masking.semantics import (
     MaskBuildConfig,
     build_keep_and_exclude_masks,
     colmap_mask_path,
+    is_keep_fraction_anomalous,
     keep_fraction,
     save_mask,
 )
@@ -92,6 +93,7 @@ def build_mask_for_view(
     keep_path = colmap_mask_path(relative_to_projections, project_root / "masks" / "keep")
     save_mask(keep, keep_path)
 
+    kf = keep_fraction(keep)
     mask = Mask(
         view_id=view_id,
         model=model_name,
@@ -99,14 +101,18 @@ def build_mask_for_view(
         prompts=prompts,
         thresholds={},
         morphology={"dilation_px": mask_config.dilation_px, "min_component_px": mask_config.min_component_px},
-        keep_fraction=keep_fraction(keep),
+        keep_fraction=kf,
         edited=False,
+        # Auto-flag anomalies as a starting point for review; the user can
+        # freely flag/unflag afterward via set_view_flagged without
+        # re-running the build.
+        flagged_for_review=is_keep_fraction_anomalous(kf) is not None,
     )
     conn.execute(
         """
         INSERT OR REPLACE INTO masks
-            (view_id, model, model_version, prompts, thresholds, morphology, keep_fraction, edited)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (view_id, model, model_version, prompts, thresholds, morphology, keep_fraction, edited, flagged_for_review)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             mask.view_id,
@@ -117,10 +123,23 @@ def build_mask_for_view(
             json.dumps(mask.morphology),
             mask.keep_fraction,
             int(mask.edited),
+            int(mask.flagged_for_review),
         ),
     )
     conn.commit()
     return mask
+
+
+def set_view_flagged(conn: sqlite3.Connection, view_id: str, flagged: bool) -> None:
+    """Toggles flagged_for_review without touching anything else -- the
+    user reviewing masks shouldn't have to re-run the (potentially slow,
+    SAM-3-loading) build just to mark or clear a flag."""
+    cursor = conn.execute(
+        "UPDATE masks SET flagged_for_review = ? WHERE view_id = ?", (int(flagged), view_id)
+    )
+    if cursor.rowcount == 0:
+        raise MaskBuildError(f"unknown view_id (no mask built yet?): {view_id}")
+    conn.commit()
 
 
 def build_masks_for_source(

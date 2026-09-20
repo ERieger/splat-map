@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -68,7 +69,7 @@ from vine360.ingest.sources import (
     add_source,
     remove_source,
 )
-from vine360.masking.build import MaskBuildError, build_masks_for_source
+from vine360.masking.build import MaskBuildError, build_masks_for_source, set_view_flagged
 from vine360.masking.sam3_adapter import validate_installation as sam3_validate_installation
 from vine360.masking.semantics import is_keep_fraction_anomalous
 from vine360.models import Project
@@ -362,6 +363,64 @@ class PreviewGallery(QWidget):
         for path, caption in items:
             self._content_layout.addWidget(_thumbnail_widget(path, caption))
         self._content_layout.addStretch()
+
+
+class TemporalFrameSelector(QWidget):
+    """A slider for scrubbing through a source's extracted frames by time
+    -- scales much better than a long dropdown once there are dozens or
+    hundreds of frames (a real capture easily has 100+)."""
+
+    frame_changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(0)
+        self.slider.setMaximum(0)
+        self.slider.valueChanged.connect(self._on_slider_changed)
+        layout.addWidget(self.slider)
+        self.label = QLabel("No frames.")
+        self.label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.label)
+        self._frames: list[tuple[str, float, int]] = []
+
+    def set_frames(self, frames: list[tuple[str, float, int]]) -> None:
+        """frames: (frame_id, source_time, view_count), ordered by time."""
+        self._frames = frames
+        self.slider.blockSignals(True)
+        self.slider.setMaximum(max(len(frames) - 1, 0))
+        self.slider.setValue(0)
+        self.slider.setEnabled(len(frames) > 0)
+        self.slider.blockSignals(False)
+        self._update_label()
+        self.frame_changed.emit()
+
+    def _on_slider_changed(self, _value: int) -> None:
+        self._update_label()
+        self.frame_changed.emit()
+
+    def _update_label(self) -> None:
+        if not self._frames:
+            self.label.setText("No frames.")
+            return
+        index = self.slider.value()
+        frame_id, source_time, view_count = self._frames[index]
+        views_text = f"{view_count} views" if view_count else "no views"
+        self.label.setText(f"Frame {index + 1}/{len(self._frames)}  —  t={source_time:.2f}s  —  {views_text}")
+
+    def current_frame_id(self) -> str | None:
+        if not self._frames:
+            return None
+        return self._frames[self.slider.value()][0]
+
+    def jump_to_frame_id(self, frame_id: str) -> bool:
+        for index, (fid, _source_time, _view_count) in enumerate(self._frames):
+            if fid == frame_id:
+                self.slider.setValue(index)
+                return True
+        return False
 
 
 def _panel_header(title: str, subtitle: str, layout: QVBoxLayout) -> None:
@@ -898,11 +957,8 @@ class ProjectionPanel(QWidget):
 
         form = QFormLayout()
         self.source_combo = QComboBox()
-        self.source_combo.currentIndexChanged.connect(self._refresh_frame_combo)
+        self.source_combo.currentIndexChanged.connect(self._refresh_frame_list)
         form.addRow("Source (its extracted frames):", self.source_combo)
-        self.frame_combo = QComboBox()
-        self.frame_combo.currentIndexChanged.connect(self._refresh_preview)
-        form.addRow("Preview frame:", self.frame_combo)
         self.face_size_spin = QSpinBox()
         self.face_size_spin.setRange(128, 4096)
         self.face_size_spin.setSingleStep(128)
@@ -936,7 +992,10 @@ class ProjectionPanel(QWidget):
         self.progress_area = ProgressArea()
         controls_layout.addWidget(self.progress_area)
 
-        controls_layout.addWidget(QLabel("Preview:"))
+        controls_layout.addWidget(QLabel("Preview frame:"))
+        self.frame_selector = TemporalFrameSelector()
+        self.frame_selector.frame_changed.connect(self._refresh_preview)
+        controls_layout.addWidget(self.frame_selector)
         self.preview = PreviewGallery("No views generated yet for this frame.")
         controls_layout.addWidget(self.preview)
 
@@ -973,27 +1032,22 @@ class ProjectionPanel(QWidget):
         has_sources = self.source_combo.count() > 0
         self.generate_btn.setEnabled(has_sources)
         self.progress_area.label.setText("" if has_sources else "No extracted frames yet -- extract frames first.")
-        self._refresh_frame_combo()
+        self._refresh_frame_list()
 
-    def _refresh_frame_combo(self) -> None:
-        self.frame_combo.blockSignals(True)
-        self.frame_combo.clear()
+    def _refresh_frame_list(self) -> None:
         source_id = self.source_combo.currentData()
+        frames: list[tuple[str, float, int]] = []
         if self.state.conn is not None and source_id is not None:
-            rows = self.state.conn.execute(
+            frames = self.state.conn.execute(
                 "SELECT f.frame_id, f.source_time, COUNT(v.view_id) AS view_count "
                 "FROM frames f LEFT JOIN views v ON v.frame_id = f.frame_id "
                 "WHERE f.source_id = ? GROUP BY f.frame_id ORDER BY f.source_time",
                 (source_id,),
             ).fetchall()
-            for frame_id, source_time, view_count in rows:
-                label = f"t={source_time:.2f}s" + (f" ({view_count} views)" if view_count else " (no views)")
-                self.frame_combo.addItem(label, userData=frame_id)
-        self.frame_combo.blockSignals(False)
-        self._refresh_preview()
+        self.frame_selector.set_frames(frames)  # emits frame_changed -> _refresh_preview
 
     def _refresh_preview(self) -> None:
-        frame_id = self.frame_combo.currentData()
+        frame_id = self.frame_selector.current_frame_id()
         if self.state.conn is None or frame_id is None:
             self.preview.set_items([])
             return
@@ -1035,7 +1089,10 @@ class ProjectionPanel(QWidget):
     def _on_generate_success(self, views) -> None:
         self.generate_btn.setEnabled(True)
         self.progress_area.finish(f"Generated {len(views)} views.")
+        current_frame_id = self.frame_selector.current_frame_id()
         self.refresh_sources()
+        if current_frame_id:
+            self.frame_selector.jump_to_frame_id(current_frame_id)
         self.state.notify_change()
 
     def _on_generate_error(self, exc: Exception) -> None:
@@ -1088,11 +1145,8 @@ class MasksPanel(QWidget):
 
         form = QFormLayout()
         self.source_combo = QComboBox()
-        self.source_combo.currentIndexChanged.connect(self._refresh_view_combo)
+        self.source_combo.currentIndexChanged.connect(self._refresh_frame_list)
         form.addRow("Source (its generated views):", self.source_combo)
-        self.view_combo = QComboBox()
-        self.view_combo.currentIndexChanged.connect(self._refresh_preview)
-        form.addRow("Preview view:", self.view_combo)
         controls_layout.addLayout(form)
 
         sam3_row = QHBoxLayout()
@@ -1124,13 +1178,38 @@ class MasksPanel(QWidget):
         self.flags_label.setWordWrap(True)
         controls_layout.addWidget(self.flags_label)
 
-        controls_layout.addWidget(QLabel("Preview (original view, then its keep-mask if built):"))
+        controls_layout.addWidget(QLabel("Preview frame:"))
+        self.frame_selector = TemporalFrameSelector()
+        self.frame_selector.frame_changed.connect(self._refresh_face_combo)
+        controls_layout.addWidget(self.frame_selector)
+
+        review_row = QHBoxLayout()
+        review_row.addWidget(QLabel("View:"))
+        self.face_combo = QComboBox()
+        self.face_combo.currentIndexChanged.connect(self._refresh_preview)
+        review_row.addWidget(self.face_combo)
+        self.prev_flagged_btn = QPushButton("⏮ Previous Flagged")
+        self.prev_flagged_btn.clicked.connect(lambda: self._jump_to_flagged(-1))
+        review_row.addWidget(self.prev_flagged_btn)
+        self.flag_btn = QPushButton("🚩 Flag for Review")
+        self.flag_btn.setCheckable(True)
+        self.flag_btn.toggled.connect(self._on_flag_toggled)
+        review_row.addWidget(self.flag_btn)
+        self.next_flagged_btn = QPushButton("Next Flagged ⏭")
+        self.next_flagged_btn.clicked.connect(lambda: self._jump_to_flagged(1))
+        review_row.addWidget(self.next_flagged_btn)
+        controls_layout.addLayout(review_row)
+
         self.preview = PreviewGallery("No views generated yet.")
         controls_layout.addWidget(self.preview)
 
         layout.addWidget(self.controls)
         self.controls.setVisible(False)
         layout.addStretch()
+        # (frame_id, view_id, keep_fraction, flagged) across the whole
+        # selected source, ordered by (frame time, view_id) -- backs the
+        # previous/next-flagged navigation buttons.
+        self._flat_views: list[tuple[str, str, float | None, bool]] = []
 
     def on_project_changed(self) -> None:
         self.on_shown()
@@ -1174,27 +1253,58 @@ class MasksPanel(QWidget):
         has_sources = self.source_combo.count() > 0
         self.build_btn.setEnabled(has_sources)
         self.progress_area.label.setText("" if has_sources else "No projected views yet -- generate projections first.")
-        self._refresh_view_combo()
+        self._refresh_frame_list()
 
-    def _refresh_view_combo(self) -> None:
-        self.view_combo.blockSignals(True)
-        self.view_combo.clear()
+    def _refresh_frame_list(self) -> None:
         source_id = self.source_combo.currentData()
+        self._flat_views = []
+        frames: list[tuple[str, float, int]] = []
         if self.state.conn is not None and source_id is not None:
-            rows = self.state.conn.execute(
-                "SELECT v.view_id, m.keep_fraction FROM views v "
-                "JOIN frames f ON f.frame_id = v.frame_id LEFT JOIN masks m ON m.view_id = v.view_id "
-                "WHERE f.source_id = ? ORDER BY v.view_id",
+            frame_rows = self.state.conn.execute(
+                "SELECT f.frame_id, f.source_time, COUNT(v.view_id) AS view_count "
+                "FROM frames f JOIN views v ON v.frame_id = f.frame_id "
+                "WHERE f.source_id = ? GROUP BY f.frame_id ORDER BY f.source_time",
                 (source_id,),
             ).fetchall()
-            for view_id, keep_fraction in rows:
-                label = view_id + (f" (keep {keep_fraction:.0%})" if keep_fraction is not None else " (unmasked)")
-                self.view_combo.addItem(label, userData=view_id)
-        self.view_combo.blockSignals(False)
+            frames = [(fid, t, vc) for fid, t, vc in frame_rows]
+            self._flat_views = self.state.conn.execute(
+                "SELECT f.frame_id, v.view_id, m.keep_fraction, COALESCE(m.flagged_for_review, 0) "
+                "FROM views v JOIN frames f ON f.frame_id = v.frame_id LEFT JOIN masks m ON m.view_id = v.view_id "
+                "WHERE f.source_id = ? ORDER BY f.source_time, v.view_id",
+                (source_id,),
+            ).fetchall()
+        self.frame_selector.set_frames(frames)  # emits frame_changed -> _refresh_face_combo
+
+    def _refresh_face_combo(self) -> None:
+        self.face_combo.blockSignals(True)
+        self.face_combo.clear()
+        frame_id = self.frame_selector.current_frame_id()
+        for f_id, view_id, keep_fraction, flagged in self._flat_views:
+            if f_id != frame_id:
+                continue
+            face_name = view_id.split(":")[-1]
+            status = f"keep {keep_fraction:.0%}" if keep_fraction is not None else "unmasked"
+            if flagged:
+                status += " 🚩"
+            self.face_combo.addItem(f"{face_name} ({status})", userData=view_id)
+        self.face_combo.blockSignals(False)
         self._refresh_preview()
 
+    def _current_view_id(self) -> str | None:
+        return self.face_combo.currentData()
+
     def _refresh_preview(self) -> None:
-        view_id = self.view_combo.currentData()
+        view_id = self._current_view_id()
+        self.flag_btn.blockSignals(True)
+        if view_id is None:
+            self.flag_btn.setChecked(False)
+            self.flag_btn.setEnabled(False)
+        else:
+            flagged = any(v == view_id and f for _fr, v, _kf, f in self._flat_views)
+            self.flag_btn.setChecked(bool(flagged))
+            self.flag_btn.setEnabled(any(v == view_id for _fr, v, _kf, _f in self._flat_views))
+        self.flag_btn.blockSignals(False)
+
         if self.state.conn is None or view_id is None:
             self.preview.set_items([])
             return
@@ -1206,6 +1316,56 @@ class MasksPanel(QWidget):
             if keep_path.exists():
                 items.append((keep_path, "keep mask"))
         self.preview.set_items(items)
+
+    def _on_flag_toggled(self, checked: bool) -> None:
+        view_id = self._current_view_id()
+        if self.state.conn is None or view_id is None:
+            return
+        try:
+            set_view_flagged(self.state.conn, view_id, checked)
+        except MaskBuildError as exc:
+            QMessageBox.warning(self, "Could not update flag", str(exc))
+            return
+        for i, (frame_id, v, kf, _f) in enumerate(self._flat_views):
+            if v == view_id:
+                self._flat_views[i] = (frame_id, v, kf, checked)
+                break
+        self._refresh_face_combo_labels_only()
+
+    def _refresh_face_combo_labels_only(self) -> None:
+        """Updates the face combo's item text (flag marker) without
+        emitting currentIndexChanged / disturbing the current preview."""
+        current_view_id = self._current_view_id()
+        self.face_combo.blockSignals(True)
+        for i in range(self.face_combo.count()):
+            view_id = self.face_combo.itemData(i)
+            match = next((v for v in self._flat_views if v[1] == view_id), None)
+            if match:
+                _frame_id, _v, keep_fraction, flagged = match
+                face_name = view_id.split(":")[-1]
+                status = f"keep {keep_fraction:.0%}" if keep_fraction is not None else "unmasked"
+                if flagged:
+                    status += " 🚩"
+                self.face_combo.setItemText(i, f"{face_name} ({status})")
+        self.face_combo.blockSignals(False)
+        _ = current_view_id  # selection/index is unaffected by setItemText
+
+    def _jump_to_flagged(self, direction: int) -> None:
+        flagged_views = [(frame_id, view_id) for frame_id, view_id, _kf, flagged in self._flat_views if flagged]
+        if not flagged_views:
+            QMessageBox.information(self, "No flagged views", "No views are currently flagged for review.")
+            return
+        current_view_id = self._current_view_id()
+        ids = [v for _f, v in flagged_views]
+        if current_view_id in ids:
+            start = ids.index(current_view_id)
+            target_frame_id, target_view_id = flagged_views[(start + direction) % len(flagged_views)]
+        else:
+            target_frame_id, target_view_id = flagged_views[0]
+        self.frame_selector.jump_to_frame_id(target_frame_id)  # triggers _refresh_face_combo
+        index = self.face_combo.findData(target_view_id)
+        if index >= 0:
+            self.face_combo.setCurrentIndex(index)
 
     def _on_build(self) -> None:
         source_id = self.source_combo.currentData()
@@ -1237,8 +1397,18 @@ class MasksPanel(QWidget):
         if flagged:
             lines = "\n".join(f"  {view_id}: {reason}" for view_id, reason in flagged[:8])
             more = f"\n  … and {len(flagged) - 8} more" if len(flagged) > 8 else ""
-            self.flags_label.setText(f"⚠ {len(flagged)} view(s) flagged for review:\n{lines}{more}")
+            self.flags_label.setText(
+                f"⚠ {len(flagged)} view(s) auto-flagged for review (use Previous/Next Flagged below):\n{lines}{more}"
+            )
+        else:
+            self.flags_label.setText("")
+        current_frame_id = self.frame_selector.current_frame_id()
+        current_view_id = self._current_view_id()
         self.refresh_sources()
+        if current_frame_id and self.frame_selector.jump_to_frame_id(current_frame_id) and current_view_id:
+            index = self.face_combo.findData(current_view_id)
+            if index >= 0:
+                self.face_combo.setCurrentIndex(index)
         self.state.notify_change()
 
     def _on_build_error(self, exc: Exception) -> None:

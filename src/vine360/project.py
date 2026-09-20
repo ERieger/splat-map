@@ -115,6 +115,19 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
+    _ensure_column(conn, "masks", "flagged_for_review", "INTEGER NOT NULL DEFAULT 0")
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """CREATE TABLE IF NOT EXISTS handles new tables, but not new columns
+    on a table that already exists -- an older project's `masks` table
+    predates `flagged_for_review` and needs it added explicitly. Table/
+    column names here are always our own hardcoded schema, never user
+    input, so this f-string is not a SQL-injection concern."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        conn.commit()
 
 
 def create_project(root: Path, name: str, capture_mode: CaptureMode) -> Project:

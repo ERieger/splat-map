@@ -87,3 +87,31 @@ def test_opening_an_older_project_migrates_missing_tables(tmp_path):
         reopened.execute("SELECT COUNT(*) FROM views").fetchone()
     finally:
         reopened.close()
+
+
+def test_opening_an_older_project_migrates_missing_columns(tmp_path):
+    """Regression test: CREATE TABLE IF NOT EXISTS does nothing for a
+    table that already exists without a newer column (e.g.
+    masks.flagged_for_review, added after some projects' masks tables
+    already existed) -- open_index_db must add it via ALTER TABLE."""
+    root = tmp_path / "myproject"
+    create_project(root, "My Vineyard", CaptureMode.THREE_SIXTY)
+
+    conn = sqlite3.connect(root / "index.sqlite")
+    conn.execute("ALTER TABLE masks RENAME TO masks_old")
+    conn.execute(
+        "CREATE TABLE masks (view_id TEXT PRIMARY KEY, model TEXT NOT NULL, model_version TEXT NOT NULL, "
+        "prompts TEXT NOT NULL, thresholds TEXT NOT NULL, morphology TEXT NOT NULL, keep_fraction REAL, "
+        "edited INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute("DROP TABLE masks_old")
+    conn.commit()
+    conn.close()
+
+    reopened = open_index_db(root)
+    try:
+        columns = {row[1] for row in reopened.execute("PRAGMA table_info(masks)")}
+        assert "flagged_for_review" in columns
+        reopened.execute("SELECT flagged_for_review FROM masks").fetchall()
+    finally:
+        reopened.close()

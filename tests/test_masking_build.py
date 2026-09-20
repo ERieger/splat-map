@@ -5,7 +5,12 @@ import pytest
 from PIL import Image
 
 from vine360.config import CaptureMode
-from vine360.masking.build import MaskBuildError, build_mask_for_view, build_masks_for_source
+from vine360.masking.build import (
+    MaskBuildError,
+    build_mask_for_view,
+    build_masks_for_source,
+    set_view_flagged,
+)
 from vine360.project import create_project, open_index_db
 
 
@@ -61,6 +66,62 @@ def test_build_mask_for_view_unknown_view_raises(project):
     root, conn = project
     with pytest.raises(MaskBuildError):
         build_mask_for_view(conn, root, "no-such-view")
+
+
+def test_build_mask_for_view_does_not_flag_normal_keep_fraction(project):
+    root, conn = project
+    view_id = _insert_fake_view(conn, root)  # ~60% kept, within normal range
+
+    mask = build_mask_for_view(conn, root, view_id)
+
+    assert mask.flagged_for_review is False
+    row = conn.execute("SELECT flagged_for_review FROM masks WHERE view_id = ?", (view_id,)).fetchone()
+    assert row[0] == 0
+
+
+def test_build_mask_for_view_auto_flags_anomalous_keep_fraction(project):
+    root, conn = project
+    image_path = root / "projections" / "frame-1" / "front.png"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    # No sky-like color anywhere -> the classical heuristic excludes ~nothing,
+    # so keep_fraction lands above the "too much kept" anomaly threshold (0.98).
+    image = np.full((100, 100, 3), fill_value=[34, 90, 34], dtype=np.uint8)
+    Image.fromarray(image, "RGB").save(image_path)
+    conn.execute(
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
+        "VALUES ('frame-1', 's1', 0.0, '{}', 'x', 'y')"
+    )
+    conn.execute(
+        "INSERT INTO views (view_id, frame_id, projection_id, width, height, intrinsics, fixed_rotation, image_path) "
+        "VALUES ('frame-1:front', 'frame-1', 'six-face', 100, 100, '{}', '{}', ?)",
+        (str(image_path.relative_to(root)),),
+    )
+    conn.commit()
+
+    mask = build_mask_for_view(conn, root, "frame-1:front")
+
+    assert mask.keep_fraction > 0.98
+    assert mask.flagged_for_review is True
+    row = conn.execute("SELECT flagged_for_review FROM masks WHERE view_id = ?", ("frame-1:front",)).fetchone()
+    assert row[0] == 1
+
+
+def test_set_view_flagged_toggles(project):
+    root, conn = project
+    view_id = _insert_fake_view(conn, root)
+    build_mask_for_view(conn, root, view_id)
+
+    set_view_flagged(conn, view_id, True)
+    assert conn.execute("SELECT flagged_for_review FROM masks WHERE view_id = ?", (view_id,)).fetchone()[0] == 1
+
+    set_view_flagged(conn, view_id, False)
+    assert conn.execute("SELECT flagged_for_review FROM masks WHERE view_id = ?", (view_id,)).fetchone()[0] == 0
+
+
+def test_set_view_flagged_unknown_view_raises(project):
+    root, conn = project
+    with pytest.raises(MaskBuildError):
+        set_view_flagged(conn, "no-such-view", True)
 
 
 def test_keep_mask_excludes_sky_region(project):
