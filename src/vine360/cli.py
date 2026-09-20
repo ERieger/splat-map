@@ -15,7 +15,12 @@ from vine360.config import CaptureMode, MediaType
 from vine360.ingest.frames import FrameExtractionError, extract_frames
 from vine360.ingest.manifest import write_manifest
 from vine360.ingest.media_probe import ProbeError
-from vine360.ingest.sources import EquirectangularConfirmationRequired, SourceError, add_source
+from vine360.ingest.sources import (
+    EquirectangularConfirmationRequired,
+    SourceError,
+    add_source,
+    remove_source,
+)
 from vine360.project import (
     ProjectAlreadyExistsError,
     ProjectNotFoundError,
@@ -80,6 +85,24 @@ def cmd_ingest_add_source(args: argparse.Namespace) -> int:
         conn.close()
 
     print(f"added source {source.source_id} ({source.media_type.value}, {source.projection.value})")
+    return 0
+
+
+def cmd_ingest_remove_source(args: argparse.Namespace) -> int:
+    root = Path(args.path)
+    try:
+        conn = open_index_db(root)
+    except ProjectNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        remove_source(conn, root, args.source_id)
+    except SourceError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    print(f"removed source {args.source_id} (original media file left untouched)")
     return 0
 
 
@@ -165,6 +188,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="tag for the physical rig this source came from, e.g. 'insta360-ground' or 'antigravity-a1-aerial'",
     )
     p_add_source.set_defaults(func=cmd_ingest_add_source)
+
+    p_remove_source = ingest_sub.add_parser("remove-source", help="remove a registered source (never deletes the original file)")
+    p_remove_source.add_argument("path", help="project directory")
+    p_remove_source.add_argument("--source-id", required=True)
+    p_remove_source.set_defaults(func=cmd_ingest_remove_source)
 
     p_extract = ingest_sub.add_parser("extract-frames", help="extract deterministic frames from a video source")
     p_extract.add_argument("path", help="project directory")

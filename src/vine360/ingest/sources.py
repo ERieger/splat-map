@@ -155,3 +155,22 @@ def get_source(conn: sqlite3.Connection, source_id: str) -> Source:
         timestamps=json.loads(timestamps_json),
         capture_group=capture_group,
     )
+
+
+def remove_source(conn: sqlite3.Connection, project_root: Path, source_id: str) -> None:
+    """Removes a registered source: its extracted frames (rows + files,
+    via clear_frames_for_source) and its `sources` row. Never touches the
+    original media file on disk -- sources are recorded by reference, and
+    the handover doc explicitly requires "never delete source media
+    automatically" (see docs/adr/0003).
+
+    Imports clear_frames_for_source lazily to avoid a circular import
+    (frames.py already imports get_source/sha256_file from this module).
+    """
+    get_source(conn, source_id)  # raises SourceError if unknown
+
+    from vine360.ingest.frames import clear_frames_for_source
+
+    clear_frames_for_source(conn, project_root, source_id)
+    conn.execute("DELETE FROM sources WHERE source_id = ?", (source_id,))
+    conn.commit()

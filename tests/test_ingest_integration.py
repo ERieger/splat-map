@@ -64,3 +64,34 @@ def test_ingest_and_extract_frames_end_to_end(tmp_path):
     manifest = build_manifest(conn)
     assert manifest["source_frame_map"][source.source_id] == [f.frame_id for f in frames]
     conn.close()
+
+
+@requires_ffmpeg
+def test_re_extracting_frames_with_a_different_interval_does_not_collide(tmp_path):
+    """Regression test: extracting frames twice for the same source (e.g.
+    the user tries one interval, doesn't like it, picks another) used to
+    fail with a sqlite UNIQUE constraint error on frame_id, and could leave
+    stale files behind from the first, larger extraction."""
+    clip_path = tmp_path / "source_clip.mp4"
+    _make_synthetic_clip(clip_path, duration=4)
+
+    project_root = tmp_path / "project"
+    create_project(project_root, "Integration Test Vineyard", CaptureMode.THREE_SIXTY)
+    conn = open_index_db(project_root)
+    runner = LocalRunner()
+
+    source = add_source(
+        conn, clip_path, runner, media_type_override=MediaType.VIDEO, added_at="2026-01-01T00:00:00+00:00"
+    )
+
+    first = extract_frames(conn, project_root, source.source_id, runner, interval_seconds=0.5)
+    second = extract_frames(conn, project_root, source.source_id, runner, interval_seconds=2.0)
+
+    assert len(first) > len(second)  # smaller interval -> more frames
+    frames_dir = project_root / "frames" / source.source_id
+    remaining_frame_files = sorted(frames_dir.glob("frame_*.png"))
+    assert len(remaining_frame_files) == len(second), "stale files from the first extraction should be gone"
+
+    rows = conn.execute("SELECT frame_id FROM frames WHERE source_id = ?", (source.source_id,)).fetchall()
+    assert len(rows) == len(second)
+    conn.close()

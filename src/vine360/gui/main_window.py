@@ -27,6 +27,7 @@ from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -56,6 +57,7 @@ from vine360.ingest.sources import (
     EquirectangularConfirmationRequired,
     SourceError,
     add_source,
+    remove_source,
 )
 from vine360.masking.semantics import is_keep_fraction_anomalous
 from vine360.models import Project
@@ -118,8 +120,16 @@ class _BackgroundWorker(QObject):
 
 def run_in_background(owner: QWidget, fn, *args, on_success=None, on_error=None, **kwargs) -> None:
     """Starts fn(*args, **kwargs) on a QThread. `owner` must outlive the
-    call -- the thread/worker are kept alive as attributes on it so Python
-    doesn't garbage-collect them mid-run."""
+    call. Every in-flight (thread, worker) pair is kept in a list on
+    `owner` -- a single overwritable attribute is NOT enough: our own
+    `worker.finished`/`failed` fire (and callers may immediately start a
+    *second* background call, e.g. re-extracting frames right after adding
+    a source) before the QThread has actually stopped running (`quit()`
+    only requests a stop; `QThread.finished` confirms it). Overwriting the
+    reference before that point can garbage-collect a still-running
+    QThread and crash the process with "QThread: Destroyed while thread is
+    still running" -- reproduced and fixed while wiring remove-source and
+    re-extraction."""
     thread = QThread()
     worker = _BackgroundWorker(fn, args, kwargs)
     worker.moveToThread(thread)
@@ -131,8 +141,12 @@ def run_in_background(owner: QWidget, fn, *args, on_success=None, on_error=None,
     if on_error:
         worker.failed.connect(on_error)
 
-    owner._bg_thread = thread
-    owner._bg_worker = worker
+    if not hasattr(owner, "_bg_pairs"):
+        owner._bg_pairs = []
+    pair = (thread, worker)
+    owner._bg_pairs.append(pair)
+    thread.finished.connect(lambda: owner._bg_pairs.remove(pair) if pair in owner._bg_pairs else None)
+
     thread.start()
 
 
@@ -298,6 +312,15 @@ def _add_source_worker(
         conn.close()
 
 
+def _remove_source_worker(project_root: Path, source_id: str) -> str:
+    conn = open_index_db(project_root)
+    try:
+        remove_source(conn, project_root, source_id)
+        return source_id
+    finally:
+        conn.close()
+
+
 class ImportPanel(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
@@ -334,7 +357,18 @@ class ImportPanel(QWidget):
 
         self.sources_table = QTableWidget(0, 5)
         self.sources_table.setHorizontalHeaderLabels(["Media type", "Projection", "Capture group", "Checksum", "Path"])
+        self.sources_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.sources_table.setSelectionMode(QTableWidget.SingleSelection)
         controls_layout.addWidget(self.sources_table)
+
+        self.remove_btn = QPushButton("Remove Selected Source")
+        self.remove_btn.setToolTip("Removes this source and any frames extracted from it. Never deletes the original file.")
+        self.remove_btn.setEnabled(False)
+        self.remove_btn.clicked.connect(self._on_remove_source)
+        self.sources_table.itemSelectionChanged.connect(
+            lambda: self.remove_btn.setEnabled(bool(self.sources_table.selectedItems()))
+        )
+        controls_layout.addWidget(self.remove_btn)
 
         controls_layout.addWidget(QLabel("Dependency check (real, live probe):"))
         dep_table = QTableWidget(0, 3)
@@ -424,16 +458,68 @@ class ImportPanel(QWidget):
 
     def _refresh_sources_table(self) -> None:
         rows = self.state.conn.execute(
-            "SELECT media_type, projection, capture_group, checksum, path FROM sources ORDER BY rowid"
+            "SELECT source_id, media_type, projection, capture_group, checksum, path FROM sources ORDER BY rowid"
         ).fetchall()
         self.sources_table.setRowCount(len(rows))
-        for r, (media_type, projection, capture_group, checksum, path) in enumerate(rows):
-            self.sources_table.setItem(r, 0, QTableWidgetItem(media_type))
+        for r, (source_id, media_type, projection, capture_group, checksum, path) in enumerate(rows):
+            item0 = QTableWidgetItem(media_type)
+            item0.setData(Qt.UserRole, source_id)
+            self.sources_table.setItem(r, 0, item0)
             self.sources_table.setItem(r, 1, QTableWidgetItem(projection))
             self.sources_table.setItem(r, 2, QTableWidgetItem(capture_group or "—"))
             self.sources_table.setItem(r, 3, QTableWidgetItem(checksum[:12] + "…"))
             self.sources_table.setItem(r, 4, QTableWidgetItem(path))
         self.sources_table.resizeColumnsToContents()
+        self.remove_btn.setEnabled(False)
+
+    def _selected_source_id(self) -> str | None:
+        row = self.sources_table.currentRow()
+        if row < 0:
+            return None
+        item = self.sources_table.item(row, 0)
+        return item.data(Qt.UserRole) if item else None
+
+    def _on_remove_source(self) -> None:
+        source_id = self._selected_source_id()
+        if source_id is None:
+            return
+        row = self.sources_table.currentRow()
+        path = self.sources_table.item(row, 4).text()
+        answer = QMessageBox.question(
+            self,
+            "Remove source",
+            f"Remove {Path(path).name} from this project?\n\n"
+            "This deletes any frames already extracted from it, but never the original file.",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.remove_btn.setEnabled(False)
+        self.add_btn.setEnabled(False)
+        self.progress.setVisible(True)
+        self.status_label.setText(f"Removing {Path(path).name}…")
+        run_in_background(
+            self,
+            _remove_source_worker,
+            self.state.project_root,
+            source_id,
+            on_success=self._on_remove_source_success,
+            on_error=self._on_remove_source_error,
+        )
+
+    def _on_remove_source_success(self, source_id: str) -> None:
+        self.add_btn.setEnabled(True)
+        self.progress.setVisible(False)
+        self.status_label.setText("Removed.")
+        self._refresh_sources_table()
+
+    def _on_remove_source_error(self, exc: Exception) -> None:
+        self.add_btn.setEnabled(True)
+        self.progress.setVisible(False)
+        self.status_label.setText("")
+        if isinstance(exc, SourceError):
+            QMessageBox.warning(self, "Could not remove source", str(exc))
+        else:
+            QMessageBox.critical(self, "Unexpected error removing source", f"{type(exc).__name__}: {exc}")
 
 
 def _extract_frames_worker(project_root: Path, source_id: str, interval_seconds: float):
@@ -467,15 +553,26 @@ class FramesPanel(QWidget):
         self.source_combo = QComboBox()
         form.addRow("Video source:", self.source_combo)
         self.preset_combo = QComboBox()
-        self.preset_combo.addItems([FramePreset.PREVIEW.value, FramePreset.BALANCED.value, FramePreset.QUALITY.value])
+        self.preset_combo.addItems(
+            [FramePreset.PREVIEW.value, FramePreset.BALANCED.value, FramePreset.QUALITY.value, FramePreset.CUSTOM.value]
+        )
         self.preset_combo.setCurrentText(FramePreset.BALANCED.value)
+        self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
         form.addRow("Frame preset:", self.preset_combo)
+
+        self.custom_interval_spin = QDoubleSpinBox()
+        self.custom_interval_spin.setRange(0.01, 3600.0)
+        self.custom_interval_spin.setDecimals(2)
+        self.custom_interval_spin.setSuffix(" s")
+        self.custom_interval_spin.setValue(FRAME_PRESET_INTERVALS[FramePreset.BALANCED])
+        self.custom_interval_spin.setEnabled(False)
+        form.addRow("Custom interval:", self.custom_interval_spin)
         controls_layout.addLayout(form)
 
         intervals_note = QLabel(
-            "Intervals (vine360.config.FRAME_PRESET_INTERVALS): "
+            "Preset intervals (vine360.config.FRAME_PRESET_INTERVALS): "
             + ", ".join(f"{p.value}={FRAME_PRESET_INTERVALS[p]}s" for p in FRAME_PRESET_INTERVALS)
-            + ". 'Custom' isn't exposed here yet -- use the CLI's --interval/--count for a specific value."
+            + ". Re-extracting a source replaces its previous frames."
         )
         intervals_note.setWordWrap(True)
         intervals_note.setStyleSheet("color: palette(mid);")
@@ -521,12 +618,18 @@ class FramesPanel(QWidget):
         self.extract_btn.setEnabled(has_sources)
         self.status_label.setText("" if has_sources else "No video sources registered yet -- add one on Import.")
 
+    def _on_preset_changed(self, text: str) -> None:
+        self.custom_interval_spin.setEnabled(FramePreset(text) == FramePreset.CUSTOM)
+
     def _on_extract(self) -> None:
         source_id = self.source_combo.currentData()
         if source_id is None:
             return
         preset = FramePreset(self.preset_combo.currentText())
-        interval = FRAME_PRESET_INTERVALS[preset]
+        if preset == FramePreset.CUSTOM:
+            interval = self.custom_interval_spin.value()
+        else:
+            interval = FRAME_PRESET_INTERVALS[preset]
 
         self.extract_btn.setEnabled(False)
         self.progress.setVisible(True)

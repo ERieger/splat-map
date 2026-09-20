@@ -12,6 +12,7 @@ implemented yet -- see docs/status.md.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -72,6 +73,21 @@ def resolve_interval_seconds(
     raise ValueError("one of interval_seconds or target_count is required")
 
 
+def clear_frames_for_source(conn: sqlite3.Connection, project_root: Path, source_id: str) -> None:
+    """Removes any previously extracted frames for this source -- both the
+    `frames` rows and the files on disk -- so extract_frames can be safely
+    re-run with different settings (e.g. a different interval). Without
+    this, a second extraction hits the frames table's frame_id PRIMARY KEY
+    (frame_id is deterministic per source+index) and can also leave stale
+    files behind from a larger prior extraction that a smaller new one
+    wouldn't overwrite."""
+    conn.execute("DELETE FROM frames WHERE source_id = ?", (source_id,))
+    conn.commit()
+    output_dir = Path(project_root) / "frames" / source_id
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+
+
 def extract_frames(
     conn: sqlite3.Connection,
     project_root: Path,
@@ -95,6 +111,7 @@ def extract_frames(
         duration, interval_seconds=interval_seconds, target_count=target_count
     )
 
+    clear_frames_for_source(conn, project_root, source_id)
     output_dir = Path(project_root) / "frames" / source_id
     output_dir.mkdir(parents=True, exist_ok=True)
     thumbs_dir = output_dir / "thumbs"

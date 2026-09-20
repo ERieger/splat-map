@@ -42,3 +42,12 @@ def test_cli_project_create_twice_fails(tmp_path, capsys):
 def test_cli_requires_a_command(capsys):
     with pytest.raises(SystemExit):
         main([])
+
+
+def test_cli_remove_source_unknown_id_errors(tmp_path, capsys):
+    project_dir = tmp_path / "vineyard"
+    assert main(["project", "create", str(project_dir), "--name", "Block 7"]) == 0
+    capsys.readouterr()
+    rc = main(["ingest", "remove-source", str(project_dir), "--source-id", "does-not-exist"])
+    assert rc == 1
+    assert "error" in capsys.readouterr().err

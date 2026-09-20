@@ -9,9 +9,13 @@ below for what's since layered on top.
 
 **M1 -- Ingest.** `vine360 project create/info`, `ingest add-source`
 (ffprobe metadata, checksum, equirectangular confirmation gate),
+`ingest remove-source` (added 2026-09-20 -- deletes the registered source
+and its extracted frames, never the original file),
 `ingest extract-frames` (deterministic ffmpeg extraction + thumbnails +
-source-frame map), `ingest manifest`. The real end-to-end integration
-test now actually runs (previously skipped for lack of ffmpeg) against
+source-frame map; now clears a source's prior frames before re-extracting
+-- see ADR 0011, this was a real "UNIQUE constraint failed" bug found via
+use), `ingest manifest`. The real end-to-end integration test now
+actually runs (previously skipped for lack of ffmpeg) against
 `static-ffmpeg`'s bundled real binaries.
 
 **M2 -- Projection (`vine360/projection/`), fully implemented as library
@@ -147,6 +151,11 @@ isn't literally shelled out to.
 0010: real capture kit is two 360-degree platforms (Insta360 ground +
       Antigravity A1 aerial), not 360 + conventional; capture_group is
       now a real, wired parameter on add_source.
+0011: fixed re-extraction's UNIQUE constraint bug and a QThread
+      use-after-free crash in the GUI's background-worker helper; GUI now
+      runs under QT_QPA_PLATFORM=xcb (not wayland) for more reliable
+      window stacking/dropdowns, using a user-space-extracted
+      libxcb-cursor0 (no root needed).
 
 ## Blockers / known gaps
 

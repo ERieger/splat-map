@@ -5,8 +5,8 @@ masked, pose-estimated, trainable 3D Gaussian Splatting projects. See
 `Vineyard_360_3DGS_Software_Handover.docx` for the full product/technical
 spec and `docs/status.md` for current progress.
 
-The processing core is a typed CLI (`vine360`); a desktop UI comes later
-(M6) and will call the same functions the CLI calls.
+The processing core is a typed CLI (`vine360`); a desktop UI (`vine360.gui`,
+M6, in progress) calls the same functions the CLI calls.
 
 ## Requirements
 
@@ -72,6 +72,27 @@ requires **manual** Meta approval on Hugging Face: request access at
 https://huggingface.co/facebook/sam3, then once approved run
 `$VENV -m pip install huggingface_hub[cli] && huggingface-cli login` and
 paste your token when it prompts (never into chat/logs).
+
+## Desktop app
+
+```
+VENV=~/.venvs/vine360/bin/python3
+export LD_LIBRARY_PATH="$HOME/.local/lib/xcb-cursor:$LD_LIBRARY_PATH"
+export QT_QPA_PLATFORM=xcb   # not wayland -- see docs/adr/0011 (window
+                             # stacking / dropdown reliability on WSLg)
+PYTHONPATH=src $VENV -m vine360.gui.main_window
+```
+
+`~/.local/lib/xcb-cursor` needs the extracted `libxcb-cursor.so.0` (see
+docs/adr/0011 for how it was obtained without root: `apt-get download
+libxcb-cursor0` + `dpkg-deb -x`, no sudo needed for either). Without it,
+`xcb` fails to start and `QT_QPA_PLATFORM=wayland` is the fallback, which
+works but has had window-stacking and combo-box quirks under WSLg/Weston.
+
+Project creation, source ingest (add/remove) and frame extraction
+(including a custom interval) are wired to real code; Projection, Masks,
+Pose estimation and Training stay preset-only (buttons disabled) -- see
+docs/status.md.
 
 ## Tests
 
