@@ -47,6 +47,16 @@ Configuration"):
    image's own alpha channel (that phrase in Postshot's release notes
    turned out to refer to a different, internal mechanism; the documented
    *import* workflow is a separate mask image, matched by filename).
+   "Same base filename" turned out to mean literally that -- confirmed by
+   real ambiguous-mask-association failures once exported: every frame's
+   projections share the same five leaf filenames (`front.png`,
+   `back.png`, ...), which the *directory* they sit in disambiguates but
+   the *filename alone* does not, and Postshot's matching goes by
+   filename. So every exported file (image and mask) is flattened into a
+   single globally-unique filename via `_flatten_to_unique_filename`
+   (folding the original relative path into the name itself, e.g.
+   `<frame_id>/front.png` -> `<frame_id>__front.png`), rather than relying
+   on folder nesting for uniqueness -- see docs/adr/0020.
 2. **Locating the actual selected model.** `pycolmap.incremental_mapping`
    writes *every* candidate reconstruction it finds under
    `sfm/sparse/<key>/`, not only the one vine360 selected as the best.
@@ -79,6 +89,21 @@ _MANAGED_SUBDIRS = ("images", "masks", "sparse")
 
 class PostshotExportError(Exception):
     pass
+
+
+def _flatten_to_unique_filename(relative_path: Path) -> str:
+    """Turns a nested relative path (e.g. `<frame_id>/front.png`) into a
+    single, globally-unique, filesystem-safe flat filename (e.g.
+    `<frame_id>__front.png`). Every frame's projections share the same
+    five leaf filenames (`front.png`, `back.png`, ...) -- fine for COLMAP
+    import, which matches by full relative path, but Postshot's mask
+    association goes by filename alone (see the module docstring), so
+    relying on folder nesting for uniqueness there silently mismatches
+    masks to the wrong frame (or fails to match at all). Also replaces
+    ":" (vine360 frame_ids can contain it, e.g. "<source_id>:000042" --
+    invalid in a bare Windows filename, though tolerated in a WSL/drvfs
+    *directory* name, which is how this went unnoticed until export)."""
+    return "__".join(part.replace(":", "_") for part in relative_path.parts)
 
 
 def _reset_managed_subdirs(output_dir: Path) -> None:
@@ -117,10 +142,19 @@ def export_for_postshot(
     output_dir: Path,
     *,
     run_id: str | None = None,
+    progress_callback=None,
 ) -> PostshotExportResult:
     """Exports the given sfm_runs row (the most recent one, by default)
     to `output_dir/{sparse,images,masks}/`. Raises PostshotExportError if
-    there's no run to export, or its selected model is missing on disk."""
+    there's no run to export, or its selected model is missing on disk.
+
+    progress_callback(message, current, total), if given, is called once
+    before the (fast) sparse-model copy and once per image/mask file
+    copied -- real images can run into the thousands (a 343-frame,
+    five-face project is 1715 files per pass), so a bare "Exporting..."
+    spinner gives no sense of progress or remaining time for what can be
+    several GB of copying."""
+    notify = progress_callback or (lambda *a: None)
     project_root = Path(project_root)
     output_dir = Path(output_dir)
 
@@ -168,27 +202,36 @@ def export_for_postshot(
         raise PostshotExportError(f"unknown image_source in sfm run config: {image_source!r}")
 
     warnings: list[str] = []
+    notify("Clearing any previous export in this folder…", None, None)
     _reset_managed_subdirs(output_dir)
     sparse_out = output_dir / "sparse"
     images_out = output_dir / "images"
     sparse_out.mkdir(parents=True, exist_ok=True)
     images_out.mkdir(parents=True, exist_ok=True)
-    for name in _COLMAP_MODEL_FILES:
-        shutil.copy2(model_dir / name, sparse_out / name)
 
     reconstruction = pycolmap.Reconstruction(model_dir)
-    image_names = sorted(image.name for image in reconstruction.images.values())
+    # (original COLMAP image name, flattened export filename), sorted by
+    # the original name for a stable, predictable copy order.
+    renames = sorted(
+        ((image.name, _flatten_to_unique_filename(Path(image.name))) for image in reconstruction.images.values())
+    )
 
     num_images = 0
-    for name in image_names:
-        src = source_root / name
+    for i, (original_name, flat_name) in enumerate(renames):
+        notify(f"Copying images ({i + 1}/{len(renames)})…", i + 1, len(renames))
+        src = source_root / original_name
         if not src.exists():
             warnings.append(f"source image missing, skipped: {src}")
             continue
-        dst = images_out / name
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        shutil.copy2(src, images_out / flat_name)
         num_images += 1
+
+    # images.bin must reference the same flattened filenames images_out/
+    # was just populated with, or Postshot's COLMAP import can't locate them.
+    notify("Copying pose data…", None, None)
+    for image in reconstruction.images.values():
+        image.name = _flatten_to_unique_filename(Path(image.name))
+    reconstruction.write(sparse_out)
 
     masks_out: Path | None = None
     num_masks = 0
@@ -197,18 +240,18 @@ def export_for_postshot(
         if keep_root.exists() and any(keep_root.rglob("*.png")):
             masks_out = output_dir / "masks"
             masks_out.mkdir(parents=True, exist_ok=True)
-            for name in image_names:
-                keep_src = colmap_mask_path(name, keep_root)
+            for i, (original_name, flat_name) in enumerate(renames):
+                notify(f"Copying masks ({i + 1}/{len(renames)})…", i + 1, len(renames))
+                keep_src = colmap_mask_path(original_name, keep_root)
                 if not keep_src.exists():
                     continue
-                dst = masks_out / name  # strip the extra ".png" COLMAP's own convention adds
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(keep_src, dst)
+                shutil.copy2(keep_src, masks_out / flat_name)  # same flattened name as its color image
                 num_masks += 1
             if num_masks == 0:
                 warnings.append("masks/keep/ exists but no mask matched any exported image")
         else:
             warnings.append("no masks have been built yet -- exporting poses and images only")
+    notify("Export complete.", None, None)
 
     return PostshotExportResult(
         output_dir=output_dir,
@@ -225,13 +268,20 @@ def export_frames_and_masks_for_postshot(
     conn: sqlite3.Connection,
     project_root: Path,
     output_dir: Path,
+    *,
+    progress_callback=None,
 ) -> PostshotExportResult:
     """Exports every generated projection view and its keep-mask (if
     built) with no pose data at all, for Postshot to run its own SfM on
     -- see the module docstring for when to use this instead of
     export_for_postshot. Needs only project/views (Projection having
     run); masks are optional. Raises PostshotExportError if no
-    projections exist yet."""
+    projections exist yet.
+
+    progress_callback(message, current, total), if given, is called once
+    per view copied -- see export_for_postshot's docstring for why this
+    matters at real project scale (thousands of files)."""
+    notify = progress_callback or (lambda *a: None)
     project_root = Path(project_root)
     output_dir = Path(output_dir)
 
@@ -242,6 +292,7 @@ def export_frames_and_masks_for_postshot(
     keep_root = project_root / "masks" / "keep"
     has_masks = keep_root.exists() and any(keep_root.rglob("*.png"))
 
+    notify("Clearing any previous export in this folder…", None, None)
     _reset_managed_subdirs(output_dir)  # in particular, drops a stale sparse/ from a prior poses-mode export
     images_out = output_dir / "images"
     images_out.mkdir(parents=True, exist_ok=True)
@@ -252,30 +303,30 @@ def export_frames_and_masks_for_postshot(
     warnings: list[str] = []
     num_images = 0
     num_masks = 0
-    for (image_path,) in rows:
+    total = len(rows)
+    for i, (image_path,) in enumerate(rows):
+        notify(f"Copying images and masks ({i + 1}/{total})…", i + 1, total)
         relative_path = Path(image_path)
         src = project_root / relative_path
         if not src.exists():
             warnings.append(f"source image missing, skipped: {src}")
             continue
         relative_to_projections = relative_path.relative_to("projections")
-        dst = images_out / relative_to_projections
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        flat_name = _flatten_to_unique_filename(relative_to_projections)
+        shutil.copy2(src, images_out / flat_name)
         num_images += 1
 
         if masks_out is not None:
             keep_src = colmap_mask_path(relative_to_projections, keep_root)
             if keep_src.exists():
-                mask_dst = masks_out / relative_to_projections  # same basename as the color image
-                mask_dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(keep_src, mask_dst)
+                shutil.copy2(keep_src, masks_out / flat_name)  # same flattened name as its color image
                 num_masks += 1
 
     if masks_out is None:
         warnings.append("no masks have been built yet -- exporting images only")
     elif num_masks == 0:
         warnings.append("masks/keep/ exists but no mask matched any exported image")
+    notify("Export complete.", None, None)
 
     return PostshotExportResult(
         output_dir=output_dir,

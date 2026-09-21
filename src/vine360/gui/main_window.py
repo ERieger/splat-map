@@ -1738,7 +1738,9 @@ def build_training_monitor_panel() -> QWidget:
 def _export_postshot_worker(project_root: Path, output_dir: Path, run_id: str | None, progress_callback=None):
     conn = open_index_db(project_root)
     try:
-        return export_for_postshot(conn, project_root, output_dir, run_id=run_id)
+        return export_for_postshot(
+            conn, project_root, output_dir, run_id=run_id, progress_callback=progress_callback
+        )
     finally:
         conn.close()
 
@@ -1746,7 +1748,9 @@ def _export_postshot_worker(project_root: Path, output_dir: Path, run_id: str | 
 def _export_frames_and_masks_worker(project_root: Path, output_dir: Path, progress_callback=None):
     conn = open_index_db(project_root)
     try:
-        return export_frames_and_masks_for_postshot(conn, project_root, output_dir)
+        return export_frames_and_masks_for_postshot(
+            conn, project_root, output_dir, progress_callback=progress_callback
+        )
     finally:
         conn.close()
 
@@ -1910,6 +1914,7 @@ class ExportPanel(QWidget):
                 self.run_combo.currentData(),
                 on_success=self._on_export_success,
                 on_error=self._on_export_error,
+                on_progress=self.progress_area.update_progress,
             )
         else:
             run_in_background(
@@ -1919,6 +1924,7 @@ class ExportPanel(QWidget):
                 self.output_dir,
                 on_success=self._on_export_success,
                 on_error=self._on_export_error,
+                on_progress=self.progress_area.update_progress,
             )
 
     def _on_export_success(self, result) -> None:

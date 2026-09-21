@@ -143,7 +143,10 @@ def test_export_for_postshot_copies_images_sparse_and_masks(project):
 
     _insert_sfm_run(conn, root, model_dir)
 
-    result = export_for_postshot(conn, root, root / "exports" / "postshot")
+    progress_calls = []
+    result = export_for_postshot(
+        conn, root, root / "exports" / "postshot", progress_callback=lambda m, c, t: progress_calls.append((m, c, t))
+    )
 
     assert result.num_images == len(image_names)
     assert result.num_masks == len(image_names)
@@ -155,6 +158,50 @@ def test_export_for_postshot_copies_images_sparse_and_masks(project):
         assert (result.sparse_dir / fname).exists()
     reloaded = pycolmap.Reconstruction(result.sparse_dir)
     assert len(reloaded.images) == len(image_names)
+
+    # Real progress reporting, not just an indeterminate spinner: one call per
+    # image and per mask, with an accurate running (current, total).
+    image_progress_calls = [c for c in progress_calls if c[0].startswith("Copying images")]
+    mask_progress_calls = [c for c in progress_calls if c[0].startswith("Copying masks")]
+    assert len(image_progress_calls) == len(image_names)
+    assert len(mask_progress_calls) == len(image_names)
+    assert image_progress_calls[-1][1:] == (len(image_names), len(image_names))
+
+
+def test_export_for_postshot_disambiguates_same_face_name_across_frames(project):
+    """Same real bug as the frames-and-masks-only mode, but here the
+    filenames also have to stay in sync with images.bin, or Postshot's
+    COLMAP import can't find them at all."""
+    root, conn = project
+    model_dir, image_names = _build_real_model(root, num_frames=4)
+
+    # Rename this model's images to vine360's real naming shape --
+    # "<source_id>:<index>/<face>.png" -- so every image shares the same
+    # leaf filename ("front.png"), exactly the real-project collision.
+    reconstruction = pycolmap.Reconstruction(model_dir)
+    renamed = {}
+    for i, image in enumerate(reconstruction.images.values()):
+        new_name = f"source-a:{i:06d}/front.png"
+        renamed[image.name] = new_name
+        image.name = new_name
+    reconstruction.write(model_dir)
+    for original_name, new_name in renamed.items():
+        _write_dummy_image(root / "projections" / new_name)
+
+    _insert_sfm_run(conn, root, model_dir)
+    result = export_for_postshot(conn, root, root / "exports" / "postshot")
+
+    assert result.num_images == len(image_names)
+    image_files = sorted(p.name for p in result.images_dir.iterdir())
+    assert len(image_files) == len(image_names)  # not collapsed into one "front.png"
+    assert len(set(image_files)) == len(image_names)
+    for name in image_files:
+        assert ":" not in name
+
+    # images.bin must reference the same flattened filenames the files were written under.
+    reloaded = pycolmap.Reconstruction(result.sparse_dir)
+    reloaded_names = sorted(image.name for image in reloaded.images.values())
+    assert reloaded_names == image_files
 
 
 def test_export_for_postshot_no_masks_built_warns(project):
@@ -247,14 +294,45 @@ def test_export_frames_and_masks_copies_images_and_masks(project):
     _insert_view_with_image(conn, root, "frame-1", "front", with_mask=True)
     _insert_view_with_image(conn, root, "frame-1", "back", with_mask=True)
 
-    result = export_frames_and_masks_for_postshot(conn, root, root / "exports" / "frames")
+    progress_calls = []
+    result = export_frames_and_masks_for_postshot(
+        conn, root, root / "exports" / "frames", progress_callback=lambda m, c, t: progress_calls.append((m, c, t))
+    )
 
     assert result.sparse_dir is None  # no pose data at all -- Postshot solves its own
     assert result.num_images == 2
     assert result.num_masks == 2
     assert result.warnings == []
-    assert (result.images_dir / "frame-1" / "front.png").exists()
-    assert (result.masks_dir / "frame-1" / "front.png").exists()  # not "front.png.png"
+    assert (result.images_dir / "frame-1__front.png").exists()  # flattened, not nested
+    assert (result.masks_dir / "frame-1__front.png").exists()  # not "frame-1/front.png.png"
+
+    determinate_calls = [c for c in progress_calls if c[1] is not None]
+    assert len(determinate_calls) == 2
+    assert determinate_calls[-1][1:] == (2, 2)
+
+
+def test_export_frames_and_masks_disambiguates_same_face_name_across_frames(project):
+    """Real bug: every frame's projections share the same five leaf
+    filenames (front.png, back.png, ...) -- fine for our own on-disk
+    layout since the frame_id folder disambiguates them, but Postshot
+    associates a dropped mask to a color image by filename alone (its own
+    docs: "the same base filename"), so two different frames' front.png
+    files must not become two files of the same name in the export."""
+    root, conn = project
+    _insert_view_with_image(conn, root, "source-a:000000", "front", with_mask=True)
+    _insert_view_with_image(conn, root, "source-a:000001", "front", with_mask=True)
+
+    result = export_frames_and_masks_for_postshot(conn, root, root / "exports" / "frames")
+
+    assert result.num_images == 2
+    assert result.num_masks == 2
+    image_files = sorted(p.name for p in result.images_dir.iterdir())
+    mask_files = sorted(p.name for p in result.masks_dir.iterdir())
+    assert len(image_files) == 2  # not silently overwritten into one "front.png"
+    assert len(set(image_files)) == 2
+    assert image_files == mask_files  # each mask shares its color image's exact flattened name
+    for name in image_files:
+        assert ":" not in name  # frame_ids can contain ":" -- not valid in a bare Windows filename
 
 
 def test_export_frames_and_masks_without_masks_warns(project):
@@ -289,7 +367,7 @@ def test_frames_and_masks_export_removes_stale_sparse_dir_from_a_prior_poses_exp
 
     assert second.sparse_dir is None
     assert not (output_dir / "sparse").exists()  # not left over from the first export
-    assert (output_dir / "images" / "frame-x" / "front.png").exists()
+    assert (output_dir / "images" / "frame-x__front.png").exists()
 
 
 def test_export_for_postshot_does_not_leave_images_from_a_previous_larger_run(project):
