@@ -101,6 +101,14 @@ def export_for_postshot(
         )
 
     model_dir = project_root / selected_model
+    if not model_dir.exists():
+        raise PostshotExportError(
+            f"sfm run {found_run_id!r}'s recorded selected_model ({selected_model!r}) doesn't exist on "
+            f"disk at {model_dir}. This run predates a bug fix where selected_model stored the run's own "
+            "ID instead of its real model directory -- the underlying reconstruction files can't be "
+            "reliably identified for a run recorded that way. Re-run Pose estimation for this project; "
+            "runs made after this fix export correctly."
+        )
     missing = [name for name in _COLMAP_MODEL_FILES if not (model_dir / name).exists()]
     if missing:
         raise PostshotExportError(f"selected model directory {model_dir} is missing {missing}")

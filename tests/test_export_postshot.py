@@ -98,6 +98,22 @@ def test_export_for_postshot_missing_selected_model_raises(project):
         export_for_postshot(conn, root, root / "exports" / "postshot")
 
 
+def test_export_for_postshot_stale_selected_model_raises_actionable_error(project):
+    """Real regression: every sfm_runs row created before the selected_
+    model bug fix (docs/adr/0018) has selected_model == its own run_id,
+    which never resolves to a real directory -- confirmed against a real
+    project on disk with exactly this old data. Must not surface as a
+    bare 'missing files' error."""
+    root, conn = project
+    conn.execute(
+        "INSERT INTO sfm_runs (run_id, image_set_hash, engine_version, config, model_stats, selected_model, "
+        "created_at) VALUES ('sfm-old1', 'h', 'v', '{}', '{}', 'sfm-old1', datetime('now'))"
+    )
+    conn.commit()
+    with pytest.raises(PostshotExportError, match="predates a bug fix"):
+        export_for_postshot(conn, root, root / "exports" / "postshot")
+
+
 def test_export_for_postshot_copies_images_sparse_and_masks(project):
     root, conn = project
     model_dir, image_names = _build_real_model(root)
