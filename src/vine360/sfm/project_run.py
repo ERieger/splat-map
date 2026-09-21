@@ -92,8 +92,15 @@ def run_sfm_for_project(
     if not any(image_dir.rglob("*.png")):
         raise SfmRegistrationError(missing_message)
 
+    # Each run gets its own sparse/<run_id>/ subtree. A shared sparse_dir
+    # across runs let a later run's pycolmap.incremental_mapping silently
+    # overwrite an earlier run's numbered model directories (both start
+    # numbering candidate reconstructions from 0) -- discovered as a real
+    # data-loss bug on a project with 4 historical runs, only the most
+    # recent of which still had its files on disk (see docs/adr/0019).
+    run_id = f"sfm-{uuid.uuid4().hex[:8]}"
     database_path = project_root / "sfm" / "database.db"
-    sparse_dir = project_root / "sfm" / "sparse"
+    sparse_dir = project_root / "sfm" / "sparse" / run_id
 
     notify("Extracting features and matching views…", None, None)
     _reconstruction, diagnostics, model_dir = run_sfm(
@@ -103,7 +110,6 @@ def run_sfm_for_project(
 
     warnings = evaluate_registration_quality(diagnostics)
 
-    run_id = f"sfm-{uuid.uuid4().hex[:8]}"
     conn.execute(
         """
         INSERT INTO sfm_runs

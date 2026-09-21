@@ -86,6 +86,7 @@ from vine360.runners.local import LocalRunner
 from vine360.runners.probe import probe_dependencies
 from vine360.export.postshot import PostshotExportError, export_for_postshot
 from vine360.sfm.project_run import SfmRegistrationError, run_sfm_for_project
+from vine360.sfm.repair_selected_model import repair_selected_model
 
 # Real sample capture location (see memory: project_capture_equipment_and_sample_data) --
 # used only as a file-dialog starting point, nothing here reads or processes it.
@@ -1738,6 +1739,14 @@ def _export_postshot_worker(project_root: Path, output_dir: Path, run_id: str | 
         conn.close()
 
 
+def _repair_selected_model_worker(project_root: Path, progress_callback=None):
+    conn = open_index_db(project_root)
+    try:
+        return repair_selected_model(conn, project_root)
+    finally:
+        conn.close()
+
+
 class ExportPanel(QWidget):
     """Bundles a completed SfM run's poses/images/masks for import into
     Postshot (or any other COLMAP-based external trainer) -- see
@@ -1782,6 +1791,16 @@ class ExportPanel(QWidget):
         self.export_btn = QPushButton("Export for Postshot")
         self.export_btn.clicked.connect(self._on_export)
         controls_layout.addWidget(self.export_btn)
+
+        self.repair_btn = QPushButton("Repair runs from before this feature (one-time)")
+        self.repair_btn.setToolTip(
+            "Some SfM runs made before the Export feature was added recorded the wrong model "
+            "directory. This looks for the real one on disk and fixes the record where it can -- "
+            "see docs/adr/0019. A run whose files were later overwritten by a newer run can't be "
+            "recovered this way; re-run Pose estimation for that one instead."
+        )
+        self.repair_btn.clicked.connect(self._on_repair)
+        controls_layout.addWidget(self.repair_btn)
 
         self.progress_area = ProgressArea()
         controls_layout.addWidget(self.progress_area)
@@ -1872,6 +1891,40 @@ class ExportPanel(QWidget):
             QMessageBox.warning(self, "Export failed", str(exc))
         else:
             QMessageBox.critical(self, "Unexpected error exporting", f"{type(exc).__name__}: {exc}")
+
+    def _on_repair(self) -> None:
+        self.repair_btn.setEnabled(False)
+        self.progress_area.start("Checking past runs…")
+        run_in_background(
+            self,
+            _repair_selected_model_worker,
+            self.state.project_root,
+            on_success=self._on_repair_success,
+            on_error=self._on_repair_error,
+        )
+
+    def _on_repair_success(self, result) -> None:
+        self.repair_btn.setEnabled(True)
+        self.progress_area.finish("Done.")
+        lines = []
+        if result.fixed:
+            lines.append(f"Fixed {len(result.fixed)} run(s): {', '.join(result.fixed)}.")
+        if result.already_fine:
+            lines.append(f"{len(result.already_fine)} run(s) were already fine.")
+        if result.unrecoverable:
+            lines.append(
+                f"{len(result.unrecoverable)} run(s) couldn't be recovered (their files were "
+                "overwritten by a later run) -- re-run Pose estimation for those."
+            )
+        if not lines:
+            lines.append("No SfM runs found.")
+        QMessageBox.information(self, "Repair complete", "\n".join(lines))
+        self._refresh_runs()
+
+    def _on_repair_error(self, exc: Exception) -> None:
+        self.repair_btn.setEnabled(True)
+        self.progress_area.finish("")
+        QMessageBox.critical(self, "Unexpected error repairing", f"{type(exc).__name__}: {exc}")
 
 
 class Vine360MainWindow(QMainWindow):

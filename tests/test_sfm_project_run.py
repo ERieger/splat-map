@@ -120,6 +120,38 @@ def test_run_sfm_for_project_uses_mask_dir_only_when_masks_exist(project):
     assert kwargs["mask_dir"] is None  # no masks/ files were ever written in this test
 
 
+def test_run_sfm_for_project_uses_a_distinct_sparse_dir_per_run(project):
+    """Real regression: sparse_dir used to be the same project/sfm/sparse/
+    for every run, so a later run's pycolmap.incremental_mapping (which
+    numbers its own candidate reconstructions starting from 0 every time)
+    could silently overwrite an earlier run's model files on disk, even
+    though the sfm_runs row was kept as history (see docs/adr/0019).
+    Confirmed for real on a project with 4 historical runs where only the
+    most recent one's files still existed."""
+    root, conn = project
+    _insert_fake_source_and_textured_frame(conn, root)
+    generate_views_for_frame(conn, root, "frame-1", face_size=64)
+
+    fake_diagnostics = SfmDiagnostics(4, 4, 1.0, 1, 1, 0.1, 1.0, 1.0)
+    sparse_dirs_used = []
+
+    def fake_run_sfm(image_dir, database_path, sparse_dir, *, mask_dir=None, config=None):
+        sparse_dirs_used.append(sparse_dir)
+        model_dir = sparse_dir / "0"
+        model_dir.mkdir(parents=True)
+        return object(), fake_diagnostics, model_dir
+
+    with patch("vine360.sfm.project_run.run_sfm", side_effect=fake_run_sfm):
+        run_sfm_for_project(conn, root)
+        run_sfm_for_project(conn, root)
+
+    assert len(sparse_dirs_used) == 2
+    assert sparse_dirs_used[0] != sparse_dirs_used[1]
+
+    selected_models = [row[0] for row in conn.execute("SELECT selected_model FROM sfm_runs").fetchall()]
+    assert len(set(selected_models)) == 2  # each run's recorded model path is distinct
+
+
 def test_run_sfm_for_project_frames_requires_source_id(project):
     root, conn = project
     with pytest.raises(ValueError):

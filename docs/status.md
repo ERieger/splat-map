@@ -112,7 +112,13 @@ selected_model` was recording the run's own `run_id`, not the COLMAP
 model directory actually written -- `pycolmap.incremental_mapping`
 writes every candidate reconstruction it finds under `sfm/sparse/<key>/`,
 not just the best one, so this field is the only way to know which
-subdirectory is real. See ADR 0018.
+subdirectory is real. See ADR 0018. Follow-up (ADR 0019) found a second,
+worse bug behind it: every run shared the same `sfm/sparse/` directory,
+so a later run could silently overwrite an earlier one's files --
+confirmed for real on `/mnt/e/TEST` (3 of 4 historical runs
+unrecoverable). Fixed going forward (each run gets `sfm/sparse/<run_id>/`
+now) and added `vine360/sfm/repair_selected_model.py` (+ an Export-panel
+button) to recover what's still recoverable from before the fix.
 
 ## Environment notes (this dev machine)
 
