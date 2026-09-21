@@ -84,7 +84,11 @@ from vine360.projection.cubemap import ALL_FACE_NAMES
 from vine360.projection.generate import ProjectionGenerationError, generate_views_for_source
 from vine360.runners.local import LocalRunner
 from vine360.runners.probe import probe_dependencies
-from vine360.export.postshot import PostshotExportError, export_for_postshot
+from vine360.export.postshot import (
+    PostshotExportError,
+    export_for_postshot,
+    export_frames_and_masks_for_postshot,
+)
 from vine360.sfm.project_run import SfmRegistrationError, run_sfm_for_project
 from vine360.sfm.repair_selected_model import repair_selected_model
 
@@ -1739,6 +1743,14 @@ def _export_postshot_worker(project_root: Path, output_dir: Path, run_id: str | 
         conn.close()
 
 
+def _export_frames_and_masks_worker(project_root: Path, output_dir: Path, progress_callback=None):
+    conn = open_index_db(project_root)
+    try:
+        return export_frames_and_masks_for_postshot(conn, project_root, output_dir)
+    finally:
+        conn.close()
+
+
 def _repair_selected_model_worker(project_root: Path, progress_callback=None):
     conn = open_index_db(project_root)
     try:
@@ -1766,7 +1778,7 @@ class ExportPanel(QWidget):
             layout,
         )
 
-        self.no_project_label = QLabel("Run Pose estimation first.")
+        self.no_project_label = QLabel("Open a project first.")
         layout.addWidget(self.no_project_label)
 
         self.controls = QWidget()
@@ -1774,9 +1786,21 @@ class ExportPanel(QWidget):
         controls_layout.setContentsMargins(0, 0, 0, 0)
 
         form = QFormLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Poses + images + masks (import our SfM run)", userData="poses")
+        self.mode_combo.addItem(
+            "Images + masks only (let Postshot run its own pose estimation)", userData="frames_masks"
+        )
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        form.addRow("Export:", self.mode_combo)
         self.run_combo = QComboBox()
         form.addRow("SfM run:", self.run_combo)
         controls_layout.addLayout(form)
+
+        self.mode_note = QLabel("")
+        self.mode_note.setWordWrap(True)
+        self.mode_note.setStyleSheet("color: palette(mid);")
+        controls_layout.addWidget(self.mode_note)
 
         self.output_dir: Path | None = None
         output_row = QHBoxLayout()
@@ -1812,6 +1836,7 @@ class ExportPanel(QWidget):
         layout.addWidget(self.controls)
         self.controls.setVisible(False)
         layout.addStretch()
+        self._on_mode_changed()  # set initial note text
 
     def on_project_changed(self) -> None:
         self.on_shown()
@@ -1825,7 +1850,7 @@ class ExportPanel(QWidget):
             if self.output_dir is None:
                 self.output_dir = self.state.project_root / "exports" / "postshot"
                 self.output_label.setText(str(self.output_dir))
-            self._refresh_enabled()
+            self._on_mode_changed()
 
     def _refresh_runs(self) -> None:
         self.run_combo.clear()
@@ -1841,8 +1866,29 @@ class ExportPanel(QWidget):
             self.run_combo.addItem(label, userData=run_id)
         self._refresh_enabled()
 
+    def _on_mode_changed(self) -> None:
+        mode = self.mode_combo.currentData()
+        poses_mode = mode == "poses"
+        self.run_combo.setEnabled(poses_mode)
+        if poses_mode:
+            self.mode_note.setText(
+                "Imports vine360's own already-computed COLMAP reconstruction into Postshot."
+            )
+        else:
+            self.mode_note.setText(
+                "No pose data is exported -- Postshot runs its own COLMAP-based pose estimation on "
+                "these images instead. Only the six-face projection images are used (masks aren't "
+                "built against raw equirectangular frames yet); no SfM run is required in vine360 "
+                "for this mode."
+            )
+        self._refresh_enabled()
+
     def _refresh_enabled(self) -> None:
-        self.export_btn.setEnabled(self.run_combo.count() > 0 and self.output_dir is not None)
+        mode = self.mode_combo.currentData()
+        if mode == "poses":
+            self.export_btn.setEnabled(self.run_combo.count() > 0 and self.output_dir is not None)
+        else:
+            self.export_btn.setEnabled(self.output_dir is not None)
 
     def _on_choose_output_dir(self) -> None:
         default = str(self.output_dir) if self.output_dir else str(self.state.project_root)
@@ -1853,32 +1899,43 @@ class ExportPanel(QWidget):
             self._refresh_enabled()
 
     def _on_export(self) -> None:
-        run_id = self.run_combo.currentData()
         self.export_btn.setEnabled(False)
         self.progress_area.start("Exporting…")
-        run_in_background(
-            self,
-            _export_postshot_worker,
-            self.state.project_root,
-            self.output_dir,
-            run_id,
-            on_success=self._on_export_success,
-            on_error=self._on_export_error,
-        )
+        if self.mode_combo.currentData() == "poses":
+            run_in_background(
+                self,
+                _export_postshot_worker,
+                self.state.project_root,
+                self.output_dir,
+                self.run_combo.currentData(),
+                on_success=self._on_export_success,
+                on_error=self._on_export_error,
+            )
+        else:
+            run_in_background(
+                self,
+                _export_frames_and_masks_worker,
+                self.state.project_root,
+                self.output_dir,
+                on_success=self._on_export_success,
+                on_error=self._on_export_error,
+            )
 
     def _on_export_success(self, result) -> None:
         self.export_btn.setEnabled(True)
         self.progress_area.finish("Export complete.")
-        text = (
-            f"Exported to {result.output_dir}\n"
-            f"{result.num_images} image(s), {result.num_masks} mask(s).\n"
-            f"In Postshot: import {result.sparse_dir} as a COLMAP dataset with images from "
-            f"{result.images_dir}"
-        )
+        text = f"Exported to {result.output_dir}\n{result.num_images} image(s), {result.num_masks} mask(s).\n"
+        if result.sparse_dir is not None:
+            text += (
+                f"In Postshot: import {result.sparse_dir} as a COLMAP dataset with images from "
+                f"{result.images_dir}"
+            )
+        else:
+            text += f"In Postshot: start a new project from the images under {result.images_dir}"
         if result.masks_dir is not None:
             text += f", then drop the files under {result.masks_dir} into the Image Masks list."
         else:
-            text += " (no masks were built for this run)."
+            text += " (no masks were built)."
         if result.warnings:
             text += "\n⚠ " + "; ".join(result.warnings)
         self.result_label.setText(text)

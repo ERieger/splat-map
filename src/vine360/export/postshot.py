@@ -1,12 +1,27 @@
-"""Bundles a completed SfM run's poses, images and masks into a
-self-contained folder ready to import into Postshot (Jawset) -- or any
-other COLMAP-based external trainer.
+"""Bundles vine360 artifacts into a self-contained folder ready to import
+into Postshot (Jawset) -- or any other COLMAP-based external trainer.
 
-This step only reformats and copies real, already-computed vine360
-artifacts; it runs no new pose estimation or masking. Two things Postshot
-specifically needs that vine360's own on-disk layout doesn't already
-provide, confirmed against Postshot's own documentation (jawset.com/docs,
-"Importing Images" and "Interface/Training Configuration"):
+Two export modes, both real, already-computed vine360 artifacts copied
+and reformatted, not regenerated:
+
+- `export_for_postshot`: poses + images + masks, for importing vine360's
+  own already-computed COLMAP reconstruction.
+- `export_frames_and_masks_for_postshot`: images + masks only, no poses
+  -- for letting Postshot run its *own* pose estimation instead (its own
+  COLMAP-based SfM step, the same one it runs when you give it a folder
+  of images/video rather than an existing COLMAP dataset). This needs
+  only that Projection (and optionally Masking) has run -- no SfM run at
+  all. Requires the six-face-projection images (pinhole), not the raw
+  equirectangular frames: masks are only ever built against projections
+  in this pipeline (see vine360.sfm.project_run), and pinhole images are
+  the safe, universally-supported choice for an external tool's own SfM
+  regardless -- Postshot's equirectangular/360 support, if any, isn't
+  confirmed in its own docs (see docs/adr/0018).
+
+Two things Postshot specifically needs that vine360's own on-disk layout
+doesn't already provide, confirmed against Postshot's own documentation
+(jawset.com/docs, "Importing Images" and "Interface/Training
+Configuration"):
 
 1. **Mask filenames.** vine360 writes keep-masks under
    `masks/keep/<image-relative-path>.png` (see
@@ -61,11 +76,13 @@ class PostshotExportError(Exception):
 @dataclass
 class PostshotExportResult:
     output_dir: Path
-    sparse_dir: Path
     images_dir: Path
     masks_dir: Path | None
     num_images: int
     num_masks: int
+    # None when exporting via export_frames_and_masks_for_postshot --
+    # there's no vine360-computed pose model in that mode by design.
+    sparse_dir: Path | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -170,6 +187,71 @@ def export_for_postshot(
     return PostshotExportResult(
         output_dir=output_dir,
         sparse_dir=sparse_out,
+        images_dir=images_out,
+        masks_dir=masks_out,
+        num_images=num_images,
+        num_masks=num_masks,
+        warnings=warnings,
+    )
+
+
+def export_frames_and_masks_for_postshot(
+    conn: sqlite3.Connection,
+    project_root: Path,
+    output_dir: Path,
+) -> PostshotExportResult:
+    """Exports every generated projection view and its keep-mask (if
+    built) with no pose data at all, for Postshot to run its own SfM on
+    -- see the module docstring for when to use this instead of
+    export_for_postshot. Needs only project/views (Projection having
+    run); masks are optional. Raises PostshotExportError if no
+    projections exist yet."""
+    project_root = Path(project_root)
+    output_dir = Path(output_dir)
+
+    rows = conn.execute("SELECT image_path FROM views").fetchall()
+    if not rows:
+        raise PostshotExportError("no projected views found -- generate projections first")
+
+    keep_root = project_root / "masks" / "keep"
+    has_masks = keep_root.exists() and any(keep_root.rglob("*.png"))
+
+    images_out = output_dir / "images"
+    images_out.mkdir(parents=True, exist_ok=True)
+    masks_out = output_dir / "masks" if has_masks else None
+    if masks_out is not None:
+        masks_out.mkdir(parents=True, exist_ok=True)
+
+    warnings: list[str] = []
+    num_images = 0
+    num_masks = 0
+    for (image_path,) in rows:
+        relative_path = Path(image_path)
+        src = project_root / relative_path
+        if not src.exists():
+            warnings.append(f"source image missing, skipped: {src}")
+            continue
+        relative_to_projections = relative_path.relative_to("projections")
+        dst = images_out / relative_to_projections
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        num_images += 1
+
+        if masks_out is not None:
+            keep_src = colmap_mask_path(relative_to_projections, keep_root)
+            if keep_src.exists():
+                mask_dst = masks_out / relative_to_projections  # same basename as the color image
+                mask_dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(keep_src, mask_dst)
+                num_masks += 1
+
+    if masks_out is None:
+        warnings.append("no masks have been built yet -- exporting images only")
+    elif num_masks == 0:
+        warnings.append("masks/keep/ exists but no mask matched any exported image")
+
+    return PostshotExportResult(
+        output_dir=output_dir,
         images_dir=images_out,
         masks_dir=masks_out,
         num_images=num_images,

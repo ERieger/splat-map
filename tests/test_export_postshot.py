@@ -15,7 +15,11 @@ pytest.importorskip("pycolmap")
 import pycolmap
 
 from vine360.config import CaptureMode
-from vine360.export.postshot import PostshotExportError, export_for_postshot
+from vine360.export.postshot import (
+    PostshotExportError,
+    export_for_postshot,
+    export_frames_and_masks_for_postshot,
+)
 from vine360.masking.build import build_mask_for_view
 from vine360.masking.semantics import colmap_mask_path
 from vine360.project import create_project, open_index_db
@@ -210,3 +214,55 @@ def test_export_for_postshot_frames_engine_skips_masks(project):
     assert result.num_images == len(image_names)
     assert result.masks_dir is None
     assert result.num_masks == 0
+
+
+def _insert_view_with_image(conn, root, frame_id, face_name, *, with_mask=False):
+    image_path = root / "projections" / frame_id / f"{face_name}.png"
+    _write_dummy_image(image_path)
+    conn.execute(
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
+        "VALUES (?, 's1', 0.0, '{}', 'x', 'y') ON CONFLICT(frame_id) DO NOTHING",
+        (frame_id,),
+    )
+    view_id = f"{frame_id}:{face_name}"
+    conn.execute(
+        "INSERT INTO views (view_id, frame_id, projection_id, width, height, intrinsics, "
+        "fixed_rotation, image_path) VALUES (?, ?, 'p', 32, 32, '{}', '{}', ?)",
+        (view_id, frame_id, f"projections/{frame_id}/{face_name}.png"),
+    )
+    conn.commit()
+    if with_mask:
+        build_mask_for_view(conn, root, view_id)
+    return view_id
+
+
+def test_export_frames_and_masks_no_views_raises(project):
+    root, conn = project
+    with pytest.raises(PostshotExportError, match="generate projections"):
+        export_frames_and_masks_for_postshot(conn, root, root / "exports" / "frames")
+
+
+def test_export_frames_and_masks_copies_images_and_masks(project):
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-1", "front", with_mask=True)
+    _insert_view_with_image(conn, root, "frame-1", "back", with_mask=True)
+
+    result = export_frames_and_masks_for_postshot(conn, root, root / "exports" / "frames")
+
+    assert result.sparse_dir is None  # no pose data at all -- Postshot solves its own
+    assert result.num_images == 2
+    assert result.num_masks == 2
+    assert result.warnings == []
+    assert (result.images_dir / "frame-1" / "front.png").exists()
+    assert (result.masks_dir / "frame-1" / "front.png").exists()  # not "front.png.png"
+
+
+def test_export_frames_and_masks_without_masks_warns(project):
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-1", "front", with_mask=False)
+
+    result = export_frames_and_masks_for_postshot(conn, root, root / "exports" / "frames")
+
+    assert result.num_images == 1
+    assert result.masks_dir is None
+    assert any("no masks" in w for w in result.warnings)
