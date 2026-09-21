@@ -18,6 +18,13 @@ and reformatted, not regenerated:
   regardless -- Postshot's equirectangular/360 support, if any, isn't
   confirmed in its own docs (see docs/adr/0018).
 
+Both functions reset their own managed subdirectories (`images/`,
+`masks/`, `sparse/`) under `output_dir` before writing (see
+`_reset_managed_subdirs`), so exporting to a folder used by a previous
+export -- by either mode, or the same mode with a different view/run --
+never leaves stale files behind (e.g. a poses-mode `sparse/` lingering
+after a later frames-and-masks-only export to the same folder).
+
 Two things Postshot specifically needs that vine360's own on-disk layout
 doesn't already provide, confirmed against Postshot's own documentation
 (jawset.com/docs, "Importing Images" and "Interface/Training
@@ -67,10 +74,28 @@ import pycolmap
 from vine360.masking.semantics import colmap_mask_path
 
 _COLMAP_MODEL_FILES = ("cameras.bin", "images.bin", "points3D.bin")
+_MANAGED_SUBDIRS = ("images", "masks", "sparse")
 
 
 class PostshotExportError(Exception):
     pass
+
+
+def _reset_managed_subdirs(output_dir: Path) -> None:
+    """Removes any of this module's own output subdirectories already
+    present under output_dir, so exporting to a folder used before -- by
+    either mode, or a previous run of the same mode with a different view
+    set -- never leaves stale files behind. For example: export poses
+    mode writes an output_dir/sparse/; exporting frames-and-masks mode to
+    that same output_dir afterward doesn't produce a sparse/ of its own,
+    but without this, the old one would still be sitting there for
+    Postshot (or a person) to mistake for current data. Only ever touches
+    these three well-known subdirectory names, never output_dir itself or
+    anything else in it."""
+    for name in _MANAGED_SUBDIRS:
+        path = output_dir / name
+        if path.exists():
+            shutil.rmtree(path)
 
 
 @dataclass
@@ -143,6 +168,7 @@ def export_for_postshot(
         raise PostshotExportError(f"unknown image_source in sfm run config: {image_source!r}")
 
     warnings: list[str] = []
+    _reset_managed_subdirs(output_dir)
     sparse_out = output_dir / "sparse"
     images_out = output_dir / "images"
     sparse_out.mkdir(parents=True, exist_ok=True)
@@ -216,6 +242,7 @@ def export_frames_and_masks_for_postshot(
     keep_root = project_root / "masks" / "keep"
     has_masks = keep_root.exists() and any(keep_root.rglob("*.png"))
 
+    _reset_managed_subdirs(output_dir)  # in particular, drops a stale sparse/ from a prior poses-mode export
     images_out = output_dir / "images"
     images_out.mkdir(parents=True, exist_ok=True)
     masks_out = output_dir / "masks" if has_masks else None

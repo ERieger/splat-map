@@ -266,3 +266,49 @@ def test_export_frames_and_masks_without_masks_warns(project):
     assert result.num_images == 1
     assert result.masks_dir is None
     assert any("no masks" in w for w in result.warnings)
+
+
+def test_frames_and_masks_export_removes_stale_sparse_dir_from_a_prior_poses_export(project):
+    """The real scenario this guards against: export poses+images+masks to
+    a folder, then export images+masks-only to that *same* folder -- the
+    old sparse/ (real poses) must not linger where Postshot, or a person,
+    could mistake it for part of the second, pose-free export."""
+    root, conn = project
+    model_dir, image_names = _build_real_model(root, num_frames=4)
+    for name in image_names:
+        _write_dummy_image(root / "projections" / name)
+    _insert_sfm_run(conn, root, model_dir)
+
+    output_dir = root / "exports" / "shared"
+    first = export_for_postshot(conn, root, output_dir)
+    assert first.sparse_dir.exists()
+    assert (output_dir / "sparse" / "cameras.bin").exists()
+
+    _insert_view_with_image(conn, root, "frame-x", "front", with_mask=False)
+    second = export_frames_and_masks_for_postshot(conn, root, output_dir)
+
+    assert second.sparse_dir is None
+    assert not (output_dir / "sparse").exists()  # not left over from the first export
+    assert (output_dir / "images" / "frame-x" / "front.png").exists()
+
+
+def test_export_for_postshot_does_not_leave_images_from_a_previous_larger_run(project):
+    """A second export to the same folder with a smaller image set must
+    not leave the first export's now-irrelevant extra images behind."""
+    root, conn = project
+    model_dir_1, names_1 = _build_real_model(root, num_frames=6)
+    for name in names_1:
+        _write_dummy_image(root / "projections" / name)
+    output_dir = root / "exports" / "shrinking"
+    _insert_sfm_run(conn, root, model_dir_1, run_id="sfm-big")
+    export_for_postshot(conn, root, output_dir, run_id="sfm-big")
+    assert len(list((output_dir / "images").iterdir())) == len(names_1)
+
+    model_dir_2, names_2 = _build_real_model(root, num_frames=4)
+    for name in names_2:
+        _write_dummy_image(root / "projections" / name)
+    _insert_sfm_run(conn, root, model_dir_2, run_id="sfm-small")
+    export_for_postshot(conn, root, output_dir, run_id="sfm-small")
+
+    assert len(names_2) < len(names_1)
+    assert sorted(p.name for p in (output_dir / "images").iterdir()) == sorted(names_2)
