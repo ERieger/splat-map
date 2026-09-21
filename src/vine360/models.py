@@ -123,6 +123,11 @@ class SfmRun:
     engine_version: str
     config: dict
     model_stats: dict
+    # Path to the written COLMAP model directory, relative to project_root
+    # (e.g. "sfm/sparse/0") -- pycolmap.incremental_mapping writes every
+    # candidate reconstruction it finds under sfm/sparse/<key>/, not just
+    # the best one, so this field is what actually identifies which
+    # subdirectory holds the reconstruction this run selected.
     selected_model: str | None
 
 

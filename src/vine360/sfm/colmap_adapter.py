@@ -130,12 +130,16 @@ def map_and_diagnose(
     sparse_output_dir: Path,
     *,
     total_images: int | None = None,
-) -> tuple[pycolmap.Reconstruction, SfmDiagnostics]:
+) -> tuple[pycolmap.Reconstruction, SfmDiagnostics, Path]:
     """Incremental mapping against an already-populated database (from
     `extract_and_match`, or any other source of keypoints/matches -- e.g. a
     pre-populated database for testing). Returns the largest reconstruction
-    (by registered image count) and its diagnostics; writes that
-    reconstruction to sparse_output_dir.
+    (by registered image count), its diagnostics, and the directory it was
+    written to -- `pycolmap.incremental_mapping` writes every candidate
+    reconstruction it finds under `sparse_output_dir/<key>/`, not just the
+    selected one, so callers that need to locate the actual selected model
+    on disk (e.g. to hand it to external software) must use this returned
+    path rather than guessing a subdirectory name.
 
     Note: 3D reconstruction requires real camera-position parallax between
     matched images. A set of views all rendered from a single panorama's
@@ -183,7 +187,7 @@ def map_and_diagnose(
         mean_track_length=selected.compute_mean_track_length(),
         mean_observations_per_reg_image=selected.compute_mean_observations_per_reg_image(),
     )
-    return selected, diagnostics
+    return selected, diagnostics, model_dir
 
 
 def run_sfm(
@@ -193,7 +197,7 @@ def run_sfm(
     *,
     mask_dir: Path | None = None,
     config: SfmConfig = SfmConfig(),
-) -> tuple[pycolmap.Reconstruction, SfmDiagnostics]:
+) -> tuple[pycolmap.Reconstruction, SfmDiagnostics, Path]:
     """extract_and_match + map_and_diagnose against real image files on disk."""
     extract_and_match(image_dir, database_path, mask_dir=mask_dir, config=config)
     total_images = len(list(Path(image_dir).iterdir()))

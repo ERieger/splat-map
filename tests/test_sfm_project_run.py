@@ -83,8 +83,12 @@ def test_run_sfm_for_project_success_records_sfm_run_row(project):
         mean_track_length=3.0,
         mean_observations_per_reg_image=20.0,
     )
+    fake_model_dir = root / "sfm" / "sparse" / "0"
+    fake_model_dir.mkdir(parents=True)
     messages = []
-    with patch("vine360.sfm.project_run.run_sfm", return_value=(object(), fake_diagnostics)):
+    with patch(
+        "vine360.sfm.project_run.run_sfm", return_value=(object(), fake_diagnostics, fake_model_dir)
+    ):
         diagnostics, warnings = run_sfm_for_project(
             conn, root, progress_callback=lambda m, c, t: messages.append(m)
         )
@@ -93,11 +97,11 @@ def test_run_sfm_for_project_success_records_sfm_run_row(project):
     assert warnings == []
     assert any("Extracting features" in m for m in messages)
 
-    row = conn.execute("SELECT model_stats, selected_model FROM sfm_runs").fetchone()
+    row = conn.execute("SELECT run_id, model_stats, selected_model FROM sfm_runs").fetchone()
     assert row is not None
-    stats = json.loads(row[0])
+    stats = json.loads(row[1])
     assert stats["num_points3d"] == 150
-    assert row[1]  # a run_id was recorded
+    assert row[2] == "sfm/sparse/0"  # the actual model directory, not the run_id
 
 
 def test_run_sfm_for_project_uses_mask_dir_only_when_masks_exist(project):
@@ -105,8 +109,12 @@ def test_run_sfm_for_project_uses_mask_dir_only_when_masks_exist(project):
     _insert_fake_source_and_textured_frame(conn, root)
     generate_views_for_frame(conn, root, "frame-1", face_size=64)
 
+    fake_model_dir = root / "sfm" / "sparse" / "0"
+    fake_model_dir.mkdir(parents=True)
     fake_diagnostics = SfmDiagnostics(4, 4, 1.0, 1, 1, 0.1, 1.0, 1.0)
-    with patch("vine360.sfm.project_run.run_sfm", return_value=(object(), fake_diagnostics)) as mock_run:
+    with patch(
+        "vine360.sfm.project_run.run_sfm", return_value=(object(), fake_diagnostics, fake_model_dir)
+    ) as mock_run:
         run_sfm_for_project(conn, root)
     _, kwargs = mock_run.call_args
     assert kwargs["mask_dir"] is None  # no masks/ files were ever written in this test

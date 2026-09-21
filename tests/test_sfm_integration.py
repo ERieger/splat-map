@@ -143,7 +143,7 @@ def synthetic_multiview_database(tmp_path_factory):
 
 def test_map_and_diagnose_with_real_parallax(synthetic_multiview_database, tmp_path):
     sparse_dir = tmp_path / "sparse"
-    reconstruction, diagnostics = map_and_diagnose(
+    reconstruction, diagnostics, model_dir = map_and_diagnose(
         synthetic_multiview_database["database_path"],
         synthetic_multiview_database["image_dir"],
         sparse_dir,
@@ -156,6 +156,8 @@ def test_map_and_diagnose_with_real_parallax(synthetic_multiview_database, tmp_p
     assert diagnostics.num_connected_models == 1
     assert diagnostics.num_points3d == synthetic_multiview_database["num_points"]
     assert diagnostics.mean_reprojection_error < 0.1  # exact synthetic ground truth
+    assert model_dir.parent == sparse_dir
+    assert (model_dir / "cameras.bin").exists()
 
     assert evaluate_registration_quality(diagnostics) == []
 

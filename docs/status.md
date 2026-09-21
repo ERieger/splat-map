@@ -103,6 +103,17 @@ maps to a reproducible command" intent, since the action is backed by one
 well-defined function either surface can call; it just means the CLI
 isn't literally shelled out to.
 
+**Export (`vine360/export/postshot.py`), new.** Bundles a completed SfM
+run's poses/images/masks into a folder for import into Postshot (or any
+COLMAP-based external trainer) -- the GUI's Export panel is now real
+(pick a run, choose an output folder, export in the background). Found
+and fixed a real pre-existing bug while building it: `sfm_runs.
+selected_model` was recording the run's own `run_id`, not the COLMAP
+model directory actually written -- `pycolmap.incremental_mapping`
+writes every candidate reconstruction it finds under `sfm/sparse/<key>/`,
+not just the best one, so this field is the only way to know which
+subdirectory is real. See ADR 0018.
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't

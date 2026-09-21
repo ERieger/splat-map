@@ -84,6 +84,7 @@ from vine360.projection.cubemap import ALL_FACE_NAMES
 from vine360.projection.generate import ProjectionGenerationError, generate_views_for_source
 from vine360.runners.local import LocalRunner
 from vine360.runners.probe import probe_dependencies
+from vine360.export.postshot import PostshotExportError, export_for_postshot
 from vine360.sfm.project_run import SfmRegistrationError, run_sfm_for_project
 
 # Real sample capture location (see memory: project_capture_equipment_and_sample_data) --
@@ -1729,16 +1730,148 @@ def build_training_monitor_panel() -> QWidget:
     return widget
 
 
-def build_export_panel() -> QWidget:
-    widget = QWidget()
-    layout = QVBoxLayout(widget)
-    _panel_header("Export", "Not wired up yet.", layout)
-    button = QPushButton("Export")
-    button.setEnabled(False)
-    button.setToolTip("Execution isn't wired up yet.")
-    layout.addWidget(button)
-    layout.addStretch()
-    return widget
+def _export_postshot_worker(project_root: Path, output_dir: Path, run_id: str | None, progress_callback=None):
+    conn = open_index_db(project_root)
+    try:
+        return export_for_postshot(conn, project_root, output_dir, run_id=run_id)
+    finally:
+        conn.close()
+
+
+class ExportPanel(QWidget):
+    """Bundles a completed SfM run's poses/images/masks for import into
+    Postshot (or any other COLMAP-based external trainer) -- see
+    vine360.export.postshot's module docstring and docs/adr/0018 for
+    exactly what's copied/renamed and why, and what's still unverified
+    (no real Postshot install is available here)."""
+
+    def __init__(self, state: AppState):
+        super().__init__()
+        self.state = state
+        layout = QVBoxLayout(self)
+        _panel_header(
+            "Export",
+            "Bundle a Pose estimation run's poses, images and masks for Postshot (or another "
+            "COLMAP-based external trainer). Verified against Postshot's published docs, not against "
+            "a real install -- see docs/adr/0018.",
+            layout,
+        )
+
+        self.no_project_label = QLabel("Run Pose estimation first.")
+        layout.addWidget(self.no_project_label)
+
+        self.controls = QWidget()
+        controls_layout = QVBoxLayout(self.controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+
+        form = QFormLayout()
+        self.run_combo = QComboBox()
+        form.addRow("SfM run:", self.run_combo)
+        controls_layout.addLayout(form)
+
+        self.output_dir: Path | None = None
+        output_row = QHBoxLayout()
+        self.output_label = QLabel("No output folder chosen.")
+        self.output_label.setWordWrap(True)
+        choose_btn = QPushButton("Choose output folder…")
+        choose_btn.clicked.connect(self._on_choose_output_dir)
+        output_row.addWidget(self.output_label, stretch=1)
+        output_row.addWidget(choose_btn)
+        controls_layout.addLayout(output_row)
+
+        self.export_btn = QPushButton("Export for Postshot")
+        self.export_btn.clicked.connect(self._on_export)
+        controls_layout.addWidget(self.export_btn)
+
+        self.progress_area = ProgressArea()
+        controls_layout.addWidget(self.progress_area)
+
+        self.result_label = QLabel("")
+        self.result_label.setWordWrap(True)
+        controls_layout.addWidget(self.result_label)
+
+        layout.addWidget(self.controls)
+        self.controls.setVisible(False)
+        layout.addStretch()
+
+    def on_project_changed(self) -> None:
+        self.on_shown()
+
+    def on_shown(self) -> None:
+        have_project = self.state.conn is not None
+        self.no_project_label.setVisible(not have_project)
+        self.controls.setVisible(have_project)
+        if have_project:
+            self._refresh_runs()
+            if self.output_dir is None:
+                self.output_dir = self.state.project_root / "exports" / "postshot"
+                self.output_label.setText(str(self.output_dir))
+            self._refresh_enabled()
+
+    def _refresh_runs(self) -> None:
+        self.run_combo.clear()
+        rows = self.state.conn.execute(
+            "SELECT run_id, created_at, model_stats FROM sfm_runs ORDER BY created_at DESC"
+        ).fetchall()
+        for run_id, created_at, model_stats in rows:
+            stats = json.loads(model_stats)
+            label = (
+                f"{created_at} -- {stats['registered_images']}/{stats['total_images']} registered "
+                f"({run_id[:12]})"
+            )
+            self.run_combo.addItem(label, userData=run_id)
+        self._refresh_enabled()
+
+    def _refresh_enabled(self) -> None:
+        self.export_btn.setEnabled(self.run_combo.count() > 0 and self.output_dir is not None)
+
+    def _on_choose_output_dir(self) -> None:
+        default = str(self.output_dir) if self.output_dir else str(self.state.project_root)
+        directory = QFileDialog.getExistingDirectory(self, "Choose a folder to export into", default)
+        if directory:
+            self.output_dir = Path(directory)
+            self.output_label.setText(str(self.output_dir))
+            self._refresh_enabled()
+
+    def _on_export(self) -> None:
+        run_id = self.run_combo.currentData()
+        self.export_btn.setEnabled(False)
+        self.progress_area.start("Exporting…")
+        run_in_background(
+            self,
+            _export_postshot_worker,
+            self.state.project_root,
+            self.output_dir,
+            run_id,
+            on_success=self._on_export_success,
+            on_error=self._on_export_error,
+        )
+
+    def _on_export_success(self, result) -> None:
+        self.export_btn.setEnabled(True)
+        self.progress_area.finish("Export complete.")
+        text = (
+            f"Exported to {result.output_dir}\n"
+            f"{result.num_images} image(s), {result.num_masks} mask(s).\n"
+            f"In Postshot: import {result.sparse_dir} as a COLMAP dataset with images from "
+            f"{result.images_dir}"
+        )
+        if result.masks_dir is not None:
+            text += f", then drop the files under {result.masks_dir} into the Image Masks list."
+        else:
+            text += " (no masks were built for this run)."
+        if result.warnings:
+            text += "\n⚠ " + "; ".join(result.warnings)
+        self.result_label.setText(text)
+        self.state.notify_change()
+
+    def _on_export_error(self, exc: Exception) -> None:
+        self.export_btn.setEnabled(True)
+        self.progress_area.finish("")
+        if isinstance(exc, PostshotExportError):
+            QMessageBox.warning(self, "Export failed", str(exc))
+        else:
+            QMessageBox.critical(self, "Unexpected error exporting", f"{type(exc).__name__}: {exc}")
 
 
 class Vine360MainWindow(QMainWindow):
@@ -1758,12 +1891,14 @@ class Vine360MainWindow(QMainWindow):
         projection_panel = ProjectionPanel(self.state)
         masks_panel = MasksPanel(self.state)
         pose_panel = PoseEstimationPanel(self.state)
+        export_panel = ExportPanel(self.state)
 
         project_panel.project_changed.connect(import_panel.on_project_changed)
         project_panel.project_changed.connect(frames_panel.on_project_changed)
         project_panel.project_changed.connect(projection_panel.on_project_changed)
         project_panel.project_changed.connect(masks_panel.on_project_changed)
         project_panel.project_changed.connect(pose_panel.on_project_changed)
+        project_panel.project_changed.connect(export_panel.on_project_changed)
 
         self._panels = [
             project_panel,
@@ -1774,7 +1909,7 @@ class Vine360MainWindow(QMainWindow):
             pose_panel,
             build_training_preset_panel(),
             build_training_monitor_panel(),
-            build_export_panel(),
+            export_panel,
         ]
         labels = [
             "Project",

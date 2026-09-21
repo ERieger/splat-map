@@ -96,7 +96,7 @@ def run_sfm_for_project(
     sparse_dir = project_root / "sfm" / "sparse"
 
     notify("Extracting features and matching views…", None, None)
-    _reconstruction, diagnostics = run_sfm(
+    _reconstruction, diagnostics, model_dir = run_sfm(
         image_dir, database_path, sparse_dir, mask_dir=mask_dir_arg, config=config
     )
     notify("Mapping complete.", None, None)
@@ -123,7 +123,7 @@ def run_sfm_for_project(
                 }
             ),
             json.dumps(diagnostics.to_dict()),
-            run_id,
+            model_dir.relative_to(project_root).as_posix(),
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
         ),
     )
