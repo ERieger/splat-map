@@ -336,6 +336,46 @@ def _flag_icon(size: int = 14) -> QPixmap:
     return pixmap
 
 
+class StageIndicator(QWidget):
+    """A small horizontal step row for a panel that has more than one
+    distinct action to move through in sequence (e.g. build a mask, then
+    review it; configure an export, then run it) -- reuses the sidebar's
+    own status-dot/color vocabulary (_status_dot/STATUS_COLOR) so
+    done/current/not-yet reads the same way here as it does there,
+    instead of inventing a second visual language for the same idea."""
+
+    def __init__(self, stage_labels: list[str]):
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 4)
+        self._dots: list[QLabel] = []
+        self._texts: list[QLabel] = []
+        for i, text in enumerate(stage_labels):
+            dot = QLabel()
+            dot.setPixmap(_status_dot(PENDING))
+            label = QLabel(text)
+            layout.addWidget(dot)
+            layout.addWidget(label)
+            self._dots.append(dot)
+            self._texts.append(label)
+            if i < len(stage_labels) - 1:
+                arrow = QLabel("→")
+                arrow.setStyleSheet("color: palette(mid);")
+                layout.addWidget(arrow)
+        layout.addStretch()
+        self.statuses: list[str] = []
+        self.set_stages([PENDING] * len(stage_labels))
+
+    def set_stages(self, statuses: list[str]) -> None:
+        """statuses[i] is one of DONE/ACTIVE/PENDING for stage i."""
+        self.statuses = list(statuses)
+        for dot, label, status in zip(self._dots, self._texts, statuses):
+            dot.setPixmap(_status_dot(status))
+            weight = "600" if status == ACTIVE else "400"
+            color = "palette(mid)" if status == PENDING else "palette(text)"
+            label.setStyleSheet(f"font-weight: {weight}; color: {color};")
+
+
 THUMBNAIL_SIZE = 160
 
 
@@ -1190,6 +1230,9 @@ class MasksPanel(QWidget):
         controls_layout = QVBoxLayout(self.controls)
         controls_layout.setContentsMargins(0, 0, 0, 0)
 
+        self.stage_indicator = StageIndicator(["Build masks", "Review flagged"])
+        controls_layout.addWidget(self.stage_indicator)
+
         form = QFormLayout()
         self.source_combo = QComboBox()
         self.source_combo.currentIndexChanged.connect(self._refresh_frame_list)
@@ -1329,6 +1372,15 @@ class MasksPanel(QWidget):
                 (source_id,),
             ).fetchall()
         self.frame_selector.set_frames(frames)  # emits frame_changed -> _refresh_face_combo
+        self._update_stage_indicator()
+
+    def _update_stage_indicator(self) -> None:
+        has_masks = any(keep_fraction is not None for _, _, keep_fraction, _ in self._flat_views)
+        if not has_masks:
+            self.stage_indicator.set_stages([ACTIVE, PENDING])
+        else:
+            any_flagged = any(flagged for _, _, _, flagged in self._flat_views)
+            self.stage_indicator.set_stages([DONE, ACTIVE if any_flagged else DONE])
 
     def _refresh_face_combo(self) -> None:
         self.face_combo.blockSignals(True)
@@ -1385,6 +1437,7 @@ class MasksPanel(QWidget):
                 self._flat_views[i] = (frame_id, v, kf, checked)
                 break
         self._refresh_face_combo_labels_only()
+        self._update_stage_indicator()
 
     def _refresh_face_combo_labels_only(self) -> None:
         """Updates the face combo's item text/icon (flag marker) without
@@ -1789,6 +1842,10 @@ class ExportPanel(QWidget):
         controls_layout = QVBoxLayout(self.controls)
         controls_layout.setContentsMargins(0, 0, 0, 0)
 
+        self.stage_indicator = StageIndicator(["Configure", "Export"])
+        controls_layout.addWidget(self.stage_indicator)
+        self._exported = False  # whether the *current* configuration has been successfully exported
+
         form = QFormLayout()
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Poses + images + masks (import our SfM run)", userData="poses")
@@ -1885,14 +1942,22 @@ class ExportPanel(QWidget):
                 "built against raw equirectangular frames yet); no SfM run is required in vine360 "
                 "for this mode."
             )
+        self._exported = False  # a mode change means the last export no longer matches this configuration
         self._refresh_enabled()
 
     def _refresh_enabled(self) -> None:
         mode = self.mode_combo.currentData()
         if mode == "poses":
-            self.export_btn.setEnabled(self.run_combo.count() > 0 and self.output_dir is not None)
+            configured = self.run_combo.count() > 0 and self.output_dir is not None
         else:
-            self.export_btn.setEnabled(self.output_dir is not None)
+            configured = self.output_dir is not None
+        self.export_btn.setEnabled(configured)
+        self.stage_indicator.set_stages(
+            [
+                DONE if configured else ACTIVE,
+                DONE if self._exported else (ACTIVE if configured else PENDING),
+            ]
+        )
 
     def _on_choose_output_dir(self) -> None:
         default = str(self.output_dir) if self.output_dir else str(self.state.project_root)
@@ -1900,6 +1965,7 @@ class ExportPanel(QWidget):
         if directory:
             self.output_dir = Path(directory)
             self.output_label.setText(str(self.output_dir))
+            self._exported = False  # a new output folder means the last export no longer matches it
             self._refresh_enabled()
 
     def _on_export(self) -> None:
@@ -1929,6 +1995,8 @@ class ExportPanel(QWidget):
 
     def _on_export_success(self, result) -> None:
         self.export_btn.setEnabled(True)
+        self._exported = True
+        self._refresh_enabled()
         self.progress_area.finish("Export complete.")
         text = f"Exported to {result.output_dir}\n{result.num_images} image(s), {result.num_masks} mask(s).\n"
         if result.sparse_dir is not None:
