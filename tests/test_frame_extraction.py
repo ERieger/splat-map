@@ -1,8 +1,11 @@
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from vine360.ingest.frames import (
+    _poll_output_frame_count,
     build_frame_extraction_command,
     build_thumbnail_command,
     resolve_interval_seconds,
@@ -64,3 +67,35 @@ def test_resolve_interval_seconds_rejects_neither():
 def test_resolve_interval_seconds_rejects_zero_duration_with_count():
     with pytest.raises(ValueError):
         resolve_interval_seconds(0.0, interval_seconds=None, target_count=10)
+
+
+def test_poll_output_frame_count_reports_files_as_they_appear(tmp_path):
+    """Real regression: the raw ffmpeg extraction call previously reported
+    zero progress at all -- current/total always None -- for however long
+    it took, indistinguishable from a hang for a large real source. This
+    poller runs concurrently with that blocking call and counts files
+    ffmpeg has already written, the same way the thumbnail loop already
+    reported real per-frame progress."""
+    events: list[tuple[int, int]] = []
+    stop_event = threading.Event()
+    poller = threading.Thread(
+        target=_poll_output_frame_count,
+        args=(tmp_path, 2, lambda m, c, t: events.append((c, t)), stop_event, 0.01),
+    )
+    poller.start()
+    try:
+        time.sleep(0.05)
+        assert events, "should have polled at least once before any files existed"
+        assert events[-1] == (0, 2)
+
+        (tmp_path / "frame_000000.png").touch()
+        time.sleep(0.05)
+        assert events[-1] == (1, 2)
+
+        (tmp_path / "frame_000001.png").touch()
+        time.sleep(0.05)
+        assert events[-1] == (2, 2)
+    finally:
+        stop_event.set()
+        poller.join(timeout=1.0)
+    assert not poller.is_alive()

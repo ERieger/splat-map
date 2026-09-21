@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import threading
 from pathlib import Path
 
 from vine360.config import ExtractionSettings
@@ -115,6 +116,24 @@ def clear_frames_for_source(conn: sqlite3.Connection, project_root: Path, source
             shutil.rmtree(frame_projections_dir)
 
 
+def _poll_output_frame_count(
+    output_dir: Path, expected_total: int, notify, stop_event: threading.Event, poll_interval_seconds: float
+) -> None:
+    """Runs on a side thread for the duration of the blocking ffmpeg
+    extraction call, which otherwise gives no feedback at all until it
+    fully completes -- for a real high-resolution/360 source this can run
+    long enough to look identical to a hang (the same problem the
+    thumbnail loop below already had, and was fixed for -- see docs/adr
+    for this fix). ffmpeg's image2 muxer (the `frame_%06d.png` pattern)
+    writes each numbered frame to disk as soon as it's decoded, so
+    counting files on disk is a real, if approximate, progress signal
+    (the last file may be mid-write for one tick, undercounting by at
+    most one)."""
+    while not stop_event.wait(poll_interval_seconds):
+        count = len(list(output_dir.glob("frame_*.png")))
+        notify(f"Extracting raw frames via ffmpeg… ({count}/{expected_total})", count, expected_total)
+
+
 def extract_frames(
     conn: sqlite3.Connection,
     project_root: Path,
@@ -124,19 +143,22 @@ def extract_frames(
     interval_seconds: float | None = None,
     target_count: int | None = None,
     progress_callback=None,
+    poll_interval_seconds: float = 0.5,
 ) -> list[Frame]:
     """progress_callback(message, current, total), if given, is called for
-    each phase -- current/total are None for the raw ffmpeg extraction (a
-    single fast command with no natural sub-progress), and frame counts
-    during the thumbnail loop that follows, which is the slow part for a
-    high-resolution source (e.g. ~0.8s/frame at 8K -- 172 frames is ~2.5
-    minutes) and previously gave no feedback at all during that time,
-    which looked identical to a hang. Frame rows are also now committed
+    each phase. The raw ffmpeg extraction's progress is polled from a side
+    thread (see _poll_output_frame_count) since the extraction itself is a
+    single blocking command with no built-in sub-progress of its own; the
+    thumbnail loop that follows reports real per-frame counts directly,
+    and is the slow part for a high-resolution source (e.g. ~0.8s/frame at
+    8K -- 172 frames is ~2.5 minutes). Frame rows are also committed
     incrementally (every 20 frames) rather than only once at the very end,
     so an interrupted run leaves a partially-usable record instead of
     none -- full crash-resume (re-using already-done work) is still not
     implemented; a re-run still clears and starts over via
-    clear_frames_for_source."""
+    clear_frames_for_source. poll_interval_seconds is a constructor knob
+    mainly so tests can shrink it well below a real ffmpeg call's
+    duration."""
     notify = progress_callback or (lambda *a: None)
 
     source = get_source(conn, source_id)
@@ -162,7 +184,21 @@ def extract_frames(
     notify("Extracting raw frames via ffmpeg…", None, None)
     pattern = output_dir / "frame_%06d.png"
     command = build_frame_extraction_command(Path(source.path), pattern, interval)
-    result = runner.run(command)
+
+    expected_frame_count = max(1, round(duration / interval))
+    stop_polling = threading.Event()
+    poller = threading.Thread(
+        target=_poll_output_frame_count,
+        args=(output_dir, expected_frame_count, notify, stop_polling, poll_interval_seconds),
+        daemon=True,
+    )
+    poller.start()
+    try:
+        result = runner.run(command)
+    finally:
+        stop_polling.set()
+        poller.join(timeout=2.0)
+
     if not result.ok:
         raise FrameExtractionError(f"ffmpeg failed extracting {source_id}: {result.stderr.strip()}")
 

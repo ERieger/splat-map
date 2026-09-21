@@ -118,11 +118,18 @@ def test_extract_frames_reports_progress(tmp_path):
         runner,
         interval_seconds=1.0,
         progress_callback=lambda m, c, t: events.append((m, c, t)),
+        poll_interval_seconds=0.001,  # tiny, so the raw-extraction poller fires even on this fast synthetic clip
     )
     messages = [m for m, _, _ in events]
     assert any("Extracting raw frames" in m for m in messages)
     assert any("Generating thumbnails" in m for m in messages)
     assert any(f"({len(frames)}/{len(frames)})" in m for m in messages), "should report reaching the last frame"
+
+    extraction_events = [(c, t) for m, c, t in events if m.startswith("Extracting raw frames") and c is not None]
+    assert extraction_events, (
+        "the raw ffmpeg extraction call previously reported zero progress at all for however long it took"
+    )
+    assert all(t == extraction_events[0][1] for _, t in extraction_events)  # expected total stays constant
     thumbnail_events = [(c, t) for m, c, t in events if "Generating thumbnails" in m]
     assert thumbnail_events[-1] == (len(frames), len(frames))
     conn.close()
