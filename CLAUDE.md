@@ -74,6 +74,10 @@ $VENV -m vine360 ingest extract-frames ./myproject --source-id <id> --interval 1
 export LD_LIBRARY_PATH="$HOME/.local/lib/xcb-cursor:$LD_LIBRARY_PATH"
 export QT_QPA_PLATFORM=xcb
 PYTHONPATH=src $VENV -m vine360.gui.main_window
+
+# ...or just use the launcher, which does all of the above (and falls back to wayland
+# if libxcb-cursor is missing):
+./run-gui.sh
 ```
 
 `~/.local/lib/xcb-cursor` needs `libxcb-cursor.so.0` extracted without root (`apt-get download
