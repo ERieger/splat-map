@@ -23,6 +23,11 @@ actively working (e.g. mid-extraction, mid-projection, mid-masking, running SfM,
 running queued jobs), do not kill or restart that process -- let it finish or reach a natural
 stopping point first.
 
+Updating source control means committing **and** pushing to the remote. When asked to commit /
+update source control, commit on `main` and then `git push origin main`
+(`origin` = https://github.com/ERieger/splat-map.git) -- don't leave commits local-only. Check
+`git fetch` / `git status -sb` first so a push isn't rejected for being behind the remote.
+
 ## Environment setup
 
 Python 3.12+. On this dev machine the system Python has neither working `pip` nor `venv`
