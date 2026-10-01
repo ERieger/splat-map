@@ -9,6 +9,7 @@ from vine360.ingest.frames import (
     build_frame_extraction_command,
     build_thumbnail_command,
     resolve_interval_seconds,
+    resolve_time_range,
 )
 
 
@@ -67,6 +68,80 @@ def test_resolve_interval_seconds_rejects_neither():
 def test_resolve_interval_seconds_rejects_zero_duration_with_count():
     with pytest.raises(ValueError):
         resolve_interval_seconds(0.0, interval_seconds=None, target_count=10)
+
+
+def test_build_frame_extraction_command_with_range():
+    cmd = build_frame_extraction_command(
+        Path("/media/clip.mp4"),
+        Path("/proj/frames/s1/frame_%06d.png"),
+        2.0,
+        start_time=1.5,
+        duration_limit=4.0,
+    )
+    assert cmd == [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        "1.5",
+        "-i",
+        "/media/clip.mp4",
+        "-t",
+        "4.0",
+        "-vf",
+        "fps=1/2.0",
+        "-vsync",
+        "0",
+        "/proj/frames/s1/frame_%06d.png",
+    ]
+
+
+def test_build_frame_extraction_command_zero_start_matches_no_range():
+    with_zero_start = build_frame_extraction_command(
+        Path("/media/clip.mp4"), Path("/proj/frames/s1/frame_%06d.png"), 2.0, start_time=0.0, duration_limit=None
+    )
+    without_range = build_frame_extraction_command(
+        Path("/media/clip.mp4"), Path("/proj/frames/s1/frame_%06d.png"), 2.0
+    )
+    assert with_zero_start == without_range
+
+
+def test_resolve_time_range_explicit_range():
+    assert resolve_time_range(10.0, start_time=2.0, end_time=6.0) == (2.0, 4.0)
+
+
+def test_resolve_time_range_only_start():
+    assert resolve_time_range(10.0, start_time=3.0, end_time=None) == (3.0, None)
+
+
+def test_resolve_time_range_only_end():
+    assert resolve_time_range(10.0, start_time=None, end_time=6.0) == (0.0, 6.0)
+
+
+def test_resolve_time_range_no_range():
+    assert resolve_time_range(10.0, start_time=None, end_time=None) == (0.0, None)
+
+
+def test_resolve_time_range_clamps_end_beyond_duration():
+    assert resolve_time_range(10.0, start_time=1.0, end_time=100.0) == (1.0, 9.0)
+
+
+def test_resolve_time_range_rejects_negative_start():
+    with pytest.raises(ValueError):
+        resolve_time_range(10.0, start_time=-1.0, end_time=None)
+
+
+def test_resolve_time_range_rejects_start_at_or_past_duration():
+    with pytest.raises(ValueError):
+        resolve_time_range(10.0, start_time=10.0, end_time=None)
+    with pytest.raises(ValueError):
+        resolve_time_range(10.0, start_time=11.0, end_time=None)
+
+
+def test_resolve_time_range_rejects_end_before_or_equal_start():
+    with pytest.raises(ValueError):
+        resolve_time_range(10.0, start_time=5.0, end_time=5.0)
+    with pytest.raises(ValueError):
+        resolve_time_range(10.0, start_time=5.0, end_time=4.0)
 
 
 def test_poll_output_frame_count_reports_files_as_they_appear(tmp_path):

@@ -17,8 +17,12 @@ import pycolmap
 from vine360.config import CaptureMode
 from vine360.export.postshot import (
     PostshotExportError,
+    _migrate_legacy_export_layout,
+    _select_priors_run,
     export_for_postshot,
+    export_for_realityscan,
     export_frames_and_masks_for_postshot,
+    realityscan_priors_available,
 )
 from vine360.masking.build import build_mask_for_view
 from vine360.masking.semantics import colmap_mask_path
@@ -263,13 +267,13 @@ def test_export_for_postshot_frames_engine_skips_masks(project):
     assert result.num_masks == 0
 
 
-def _insert_view_with_image(conn, root, frame_id, face_name, *, with_mask=False):
+def _insert_view_with_image(conn, root, frame_id, face_name, *, with_mask=False, source_id="s1"):
     image_path = root / "projections" / frame_id / f"{face_name}.png"
     _write_dummy_image(image_path)
     conn.execute(
         "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES (?, 's1', 0.0, '{}', 'x', 'y') ON CONFLICT(frame_id) DO NOTHING",
-        (frame_id,),
+        "VALUES (?, ?, 0.0, '{}', 'x', 'y') ON CONFLICT(frame_id) DO NOTHING",
+        (frame_id, source_id),
     )
     view_id = f"{frame_id}:{face_name}"
     conn.execute(
@@ -344,6 +348,399 @@ def test_export_frames_and_masks_without_masks_warns(project):
     assert result.num_images == 1
     assert result.masks_dir is None
     assert any("no masks" in w for w in result.warnings)
+
+
+def test_export_frames_and_masks_filters_by_source_id(project):
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-a", "front", with_mask=True, source_id="source-a")
+    _insert_view_with_image(conn, root, "frame-b", "front", with_mask=True, source_id="source-b")
+
+    result = export_frames_and_masks_for_postshot(
+        conn, root, root / "exports" / "source-a-only", source_id="source-a"
+    )
+
+    assert result.num_images == 1
+    assert (result.images_dir / "frame-a__front.png").exists()
+    assert not (result.images_dir / "frame-b__front.png").exists()
+
+
+def test_export_frames_and_masks_no_filter_includes_every_source(project):
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-a", "front", with_mask=False, source_id="source-a")
+    _insert_view_with_image(conn, root, "frame-b", "front", with_mask=False, source_id="source-b")
+
+    result = export_frames_and_masks_for_postshot(conn, root, root / "exports" / "all")
+
+    assert result.num_images == 2  # source_id=None (the default) -- unfiltered, matches prior behavior
+
+
+def test_export_frames_and_masks_source_filter_with_no_views_raises_actionable_error(project):
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-a", "front", source_id="source-a")
+
+    with pytest.raises(PostshotExportError, match="source-b.*generate projections"):
+        export_frames_and_masks_for_postshot(
+            conn, root, root / "exports" / "source-b-only", source_id="source-b"
+        )
+
+
+def test_export_for_realityscan_no_views_raises(project):
+    root, conn = project
+    with pytest.raises(PostshotExportError, match="generate projections"):
+        export_for_realityscan(conn, root, root / "exports" / "cap" / "realityscan")
+
+
+def test_export_for_realityscan_writes_mask_in_dedicated_subfolder(project):
+    """RealityScan's other documented mask convention (used here instead
+    of the flat-adjacent one, so a plain images/ listing stays mask-free
+    -- see docs/adr/0028): a mask sits in images/layers/.mask/, using the
+    *same* filename as its color image, no extra suffix."""
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-1", "front", with_mask=True)
+
+    result = export_for_realityscan(conn, root, root / "exports" / "cap" / "realityscan")
+
+    assert result.num_images == 1
+    assert result.num_masks == 1
+    assert (result.images_dir / "frame-1__front.png").exists()
+    mask_path = result.images_dir / "layers" / ".mask" / "frame-1__front.png"
+    assert mask_path.exists()
+    assert result.masks_dir == mask_path.parent
+    # images/ itself stays mask-free -- the whole point of the subfolder
+    assert not (result.images_dir / "frame-1__front.png.mask.png").exists()
+    top_level_names = {p.name for p in result.images_dir.iterdir()}
+    assert "frame-1__front.png.mask.png" not in top_level_names
+
+
+def test_export_for_realityscan_filters_by_source_id(project):
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-a", "front", with_mask=True, source_id="source-a")
+    _insert_view_with_image(conn, root, "frame-b", "front", with_mask=True, source_id="source-b")
+
+    result = export_for_realityscan(
+        conn, root, root / "exports" / "source-a" / "realityscan", source_id="source-a"
+    )
+
+    assert result.num_images == 1
+    assert (result.images_dir / "frame-a__front.png").exists()
+    assert not (result.images_dir / "frame-b__front.png").exists()
+
+
+def test_export_for_realityscan_without_masks_warns(project):
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-1", "front", with_mask=False)
+
+    result = export_for_realityscan(conn, root, root / "exports" / "cap" / "realityscan")
+
+    assert result.num_images == 1
+    assert result.num_masks == 0
+    assert any("no masks" in w for w in result.warnings)
+
+
+# -- camera-priors CSV (RealityScan only) --------------------------------
+
+
+def _insert_view_for_projections_model(conn, root, frame_id, image_name):
+    """Mirrors test_export_for_postshot_copies_images_sparse_and_masks's
+    setup -- a real frames/views row whose image_path matches a real
+    COLMAP-registered image's own name exactly, for the "projections"
+    engine priors path."""
+    _write_dummy_image(root / "projections" / image_name)
+    conn.execute(
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
+        "VALUES (?, 's1', 0.0, '{}', 'x', 'y')",
+        (frame_id,),
+    )
+    conn.execute(
+        "INSERT INTO views (view_id, frame_id, projection_id, width, height, intrinsics, "
+        "fixed_rotation, image_path) VALUES (?, ?, 'p', 32, 32, '{}', '{}', ?)",
+        (f"{frame_id}:v", frame_id, f"projections/{image_name}"),
+    )
+
+
+def test_export_for_realityscan_camera_priors_default_off(project):
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-1", "front", with_mask=False)
+
+    result = export_for_realityscan(conn, root, root / "exports" / "cap" / "realityscan")
+
+    assert result.priors_path is None
+    assert result.num_priors == 0
+    assert not (result.output_dir / "CameraPriors.csv").exists()
+
+
+def test_export_for_realityscan_camera_priors_projections_engine(project):
+    root, conn = project
+    model_dir, image_names = _build_real_model(root)
+    for i, name in enumerate(image_names):
+        _insert_view_for_projections_model(conn, root, f"frame-{i}", name)
+    conn.commit()
+    _insert_sfm_run(conn, root, model_dir)
+
+    result = export_for_realityscan(
+        conn, root, root / "exports" / "cap" / "realityscan", include_camera_priors=True
+    )
+
+    assert result.priors_path == result.output_dir / "CameraPriors.csv"
+    assert result.num_priors == len(image_names)
+    lines = result.priors_path.read_text().strip().splitlines()
+    assert lines[0] == "#name,x,y,alt"
+    assert len(lines) - 1 == len(image_names)
+    exported_names = {p.name for p in result.images_dir.iterdir() if p.is_file()}
+    csv_names = {line.split(",")[0] for line in lines[1:]}
+    assert csv_names == exported_names
+
+
+def test_export_for_realityscan_camera_priors_frames_engine_shares_position_across_faces(project):
+    """The key regression: every cube face rendered from the same frame
+    shares the panorama's own optical center (fixed_rotation is
+    rotation-only), so two views under the same frame_id must get
+    byte-identical positions in the priors CSV -- no pose composition
+    should be needed or attempted."""
+    root, conn = project
+    model_dir, image_names = _build_real_model(root, num_frames=3)
+
+    reconstruction = pycolmap.Reconstruction(model_dir)
+    for i, image in enumerate(reconstruction.images.values()):
+        image.name = f"frame_{i:06d}.png"
+    reconstruction.write(model_dir)
+
+    num_frames = len(image_names)
+    for i in range(num_frames):
+        frame_id = f"s1:{i:06d}"
+        conn.execute(
+            "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
+            "VALUES (?, 's1', 0.0, '{}', ?, 'y')",
+            (frame_id, f"frames/s1/frame_{i:06d}.png"),
+        )
+        for face in ("front", "back"):
+            image_path = root / "projections" / frame_id / f"{face}.png"
+            _write_dummy_image(image_path)
+            conn.execute(
+                "INSERT INTO views (view_id, frame_id, projection_id, width, height, intrinsics, "
+                "fixed_rotation, image_path) VALUES (?, ?, 'p', 32, 32, '{}', '{}', ?)",
+                (f"{frame_id}:{face}", frame_id, f"projections/{frame_id}/{face}.png"),
+            )
+    conn.commit()
+    _insert_sfm_run(conn, root, model_dir, config={"image_source": "frames", "source_id": "s1"})
+
+    result = export_for_realityscan(
+        conn, root, root / "exports" / "cap" / "realityscan", include_camera_priors=True
+    )
+
+    assert result.num_priors == 2 * num_frames
+    priors_by_name = {}
+    for line in result.priors_path.read_text().strip().splitlines()[1:]:
+        name, x, y, alt = line.split(",")
+        priors_by_name[name] = (x, y, alt)
+    for i in range(num_frames):
+        front = priors_by_name[f"s1_{i:06d}__front.png"]
+        back = priors_by_name[f"s1_{i:06d}__back.png"]
+        assert front == back  # same frame -> same camera center regardless of face
+
+
+def test_export_for_realityscan_camera_priors_partial_overlap_warns(project):
+    root, conn = project
+    model_dir, image_names = _build_real_model(root, num_frames=3)
+    for i, name in enumerate(image_names):
+        _insert_view_for_projections_model(conn, root, f"frame-{i}", name)
+    _insert_view_with_image(conn, root, "frame-extra", "front", source_id="s1")  # no matching registered pose
+    conn.commit()
+    _insert_sfm_run(conn, root, model_dir)
+
+    result = export_for_realityscan(
+        conn, root, root / "exports" / "cap" / "realityscan", include_camera_priors=True
+    )
+
+    assert result.num_images == len(image_names) + 1
+    assert result.num_priors == len(image_names)
+    assert any("camera priors" in w and "wrote" in w for w in result.warnings)
+
+
+def test_export_for_realityscan_camera_priors_no_sfm_run_is_non_fatal(project):
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-1", "front", with_mask=False)
+
+    result = export_for_realityscan(
+        conn, root, root / "exports" / "cap" / "realityscan", include_camera_priors=True
+    )
+
+    assert result.num_images == 1
+    assert result.priors_path is None
+    assert any("no usable SfM run" in w for w in result.warnings)
+
+
+def test_export_for_realityscan_camera_priors_stale_model_missing_on_disk_warns(project):
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-1", "front", with_mask=False)
+    conn.execute(
+        "INSERT INTO sfm_runs (run_id, image_set_hash, engine_version, config, model_stats, selected_model, "
+        "created_at) VALUES ('sfm-missing', 'h', 'v', '{\"image_source\": \"projections\"}', '{}', "
+        "'sfm/sparse-missing', datetime('now'))"
+    )
+    conn.commit()
+
+    result = export_for_realityscan(
+        conn, root, root / "exports" / "cap" / "realityscan", include_camera_priors=True
+    )
+
+    assert result.num_images == 1
+    assert result.priors_path is None
+    assert any("missing on disk" in w for w in result.warnings)
+
+
+def test_select_priors_run_prefers_matching_frames_over_projections(project):
+    root, conn = project
+    _insert_sfm_run(conn, root, root / "sfm" / "m1", config={"image_source": "projections"}, run_id="proj-run")
+    conn.execute("UPDATE sfm_runs SET created_at = '2000-01-01T00:00:00' WHERE run_id = 'proj-run'")
+    _insert_sfm_run(
+        conn, root, root / "sfm" / "m2", config={"image_source": "frames", "source_id": "s1"}, run_id="frames-run"
+    )
+
+    selection = _select_priors_run(conn, source_id="s1")
+    assert selection[0] == "frames-run"
+
+
+def test_select_priors_run_falls_back_to_projections_when_no_matching_frames_run(project):
+    root, conn = project
+    _insert_sfm_run(conn, root, root / "sfm" / "m1", config={"image_source": "projections"}, run_id="proj-run")
+    _insert_sfm_run(
+        conn,
+        root,
+        root / "sfm" / "m2",
+        config={"image_source": "frames", "source_id": "other-source"},
+        run_id="frames-run",
+    )
+
+    selection = _select_priors_run(conn, source_id="s1")
+    assert selection[0] == "proj-run"
+
+
+def test_select_priors_run_returns_none_with_no_runs(project):
+    root, conn = project
+    assert _select_priors_run(conn, source_id=None) is None
+    assert _select_priors_run(conn, source_id="s1") is None
+
+
+def test_select_priors_run_all_sources_prefers_projections_but_falls_back(project):
+    root, conn = project
+    _insert_sfm_run(
+        conn, root, root / "sfm" / "m1", config={"image_source": "frames", "source_id": "s1"}, run_id="frames-run"
+    )
+    assert _select_priors_run(conn, source_id=None)[0] == "frames-run"  # only run available -- falls back to it
+
+    _insert_sfm_run(conn, root, root / "sfm" / "m2", config={"image_source": "projections"}, run_id="proj-run")
+    assert _select_priors_run(conn, source_id=None)[0] == "proj-run"  # now prefers projections over frames
+
+
+def test_realityscan_priors_available_reflects_selection_logic(project):
+    root, conn = project
+    assert realityscan_priors_available(conn, source_id="s1") is False
+    _insert_sfm_run(conn, root, root / "sfm" / "m1", config={"image_source": "projections"}, run_id="proj-run")
+    assert realityscan_priors_available(conn, source_id="s1") is True
+
+
+# -- legacy export-layout migration -------------------------------------
+
+
+def test_migrate_legacy_export_layout_infers_colmap_from_sparse_dir(tmp_path):
+    capture_dir = tmp_path / "cap"
+    (capture_dir / "sparse").mkdir(parents=True)
+    (capture_dir / "sparse" / "cameras.bin").write_bytes(b"x")
+    (capture_dir / "images").mkdir()
+    (capture_dir / "images" / "a.png").write_bytes(b"x")
+
+    _migrate_legacy_export_layout(capture_dir)
+
+    assert not (capture_dir / "sparse").exists()
+    assert not (capture_dir / "images").exists()
+    assert (capture_dir / "colmap" / "sparse" / "cameras.bin").exists()
+    assert (capture_dir / "colmap" / "images" / "a.png").exists()
+
+
+def test_migrate_legacy_export_layout_infers_postshot_when_no_sparse_dir(tmp_path):
+    capture_dir = tmp_path / "cap"
+    (capture_dir / "images").mkdir(parents=True)
+    (capture_dir / "images" / "a.png").write_bytes(b"x")
+    (capture_dir / "masks").mkdir()
+    (capture_dir / "masks" / "a.png").write_bytes(b"x")
+
+    _migrate_legacy_export_layout(capture_dir)
+
+    assert not (capture_dir / "images").exists()
+    assert not (capture_dir / "masks").exists()
+    assert (capture_dir / "postshot" / "images" / "a.png").exists()
+    assert (capture_dir / "postshot" / "masks" / "a.png").exists()
+
+
+def test_migrate_legacy_export_layout_is_a_noop_with_no_legacy_folder(tmp_path):
+    capture_dir = tmp_path / "cap"
+    capture_dir.mkdir()
+
+    _migrate_legacy_export_layout(capture_dir)  # must not raise
+
+    assert list(capture_dir.iterdir()) == []
+
+
+def test_migrate_legacy_export_layout_does_not_clobber_an_existing_target(tmp_path):
+    """Conservative, matching the project's "never guess under ambiguity"
+    precedent: if colmap/ already exists, leave the old flat folder
+    alone rather than merge or overwrite into it."""
+    capture_dir = tmp_path / "cap"
+    (capture_dir / "sparse").mkdir(parents=True)
+    (capture_dir / "sparse" / "cameras.bin").write_bytes(b"old")
+    (capture_dir / "colmap").mkdir()
+    (capture_dir / "colmap" / "marker.txt").write_bytes(b"already migrated")
+
+    _migrate_legacy_export_layout(capture_dir)
+
+    assert (capture_dir / "sparse" / "cameras.bin").exists()  # untouched
+    assert (capture_dir / "colmap" / "marker.txt").exists()  # untouched
+
+
+def test_migrate_legacy_export_layout_renames_old_all_sources_default(tmp_path):
+    """The old all-sources default was literally named "postshot" at the
+    exports/ root (every mode shared it, since per-source capture
+    folders didn't exist before ADR 0026). The new all-sources default
+    is "all" -- a legacy flat export bound for exports/all/<format>/ is
+    actually sitting at the sibling exports/postshot/ instead."""
+    exports_dir = tmp_path / "exports"
+    legacy = exports_dir / "postshot"
+    (legacy / "images").mkdir(parents=True)
+    (legacy / "images" / "a.png").write_bytes(b"x")
+
+    _migrate_legacy_export_layout(exports_dir / "all")
+
+    assert not legacy.exists()  # old exports/postshot/ folder cleaned up entirely
+    assert (exports_dir / "all" / "postshot" / "images" / "a.png").exists()
+
+
+def test_export_for_postshot_migrates_legacy_layout_before_writing(project):
+    """End-to-end: a real export function actually calls the migration
+    helper on the parent of its own output_dir before writing, not just
+    the helper in isolation."""
+    root, conn = project
+    model_dir, image_names = _build_real_model(root, num_frames=4)
+    for name in image_names:
+        _write_dummy_image(root / "projections" / name)
+    _insert_sfm_run(conn, root, model_dir)
+
+    capture_dir = root / "exports" / "cap"
+    legacy_sparse = capture_dir / "sparse"
+    legacy_sparse.mkdir(parents=True)
+    (legacy_sparse / "old.bin").write_bytes(b"legacy")
+
+    export_for_postshot(conn, root, capture_dir / "colmap")
+
+    # The legacy flat folder is gone from its old location -- migrated into
+    # capture_dir/colmap/, then immediately superseded there by the real
+    # export's own _reset_managed_subdirs + fresh write (correct: migration
+    # only promises "not left at the wrong path", not "old files preserved
+    # forever" -- same "never leaves stale files" invariant every export
+    # already guarantees).
+    assert not legacy_sparse.exists()
+    assert not (capture_dir / "sparse").exists()
+    assert (capture_dir / "colmap" / "sparse" / "cameras.bin").exists()
 
 
 def test_frames_and_masks_export_removes_stale_sparse_dir_from_a_prior_poses_export(project):

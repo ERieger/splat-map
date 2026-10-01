@@ -22,19 +22,35 @@ PROJECT_FILE = "project.yaml"
 INDEX_FILE = "index.sqlite"
 
 # Directories created for every new project. "sfm/database.db" is created
-# lazily by the COLMAP adapter in M4, not here.
+# lazily by the COLMAP adapter in M4, not here. "sources", "datasets" and
+# "cache" were dropped (docs/adr/0029) -- sources are recorded by
+# reference and never copied in (ADR 0003), datasets was reserved for
+# Training, which is out of scope (ADR 0025), and cache had no code
+# ever reading or writing it.
 LAYOUT_DIRS = [
-    "sources",
     "frames",
     "projections",
     "masks/classes",
     "masks/keep",
     "sfm/sparse",
-    "datasets",
     "runs",
     "exports",
-    "cache",
+    "models",
 ]
+
+
+def _ensure_layout_dirs(root: Path) -> None:
+    """Idempotent (mkdir(exist_ok=True) throughout) -- called both when a
+    project is created AND every time an existing one is opened, so a
+    project made before a LAYOUT_DIRS entry was added (e.g. before
+    "models" existed) gets it too, the same migrate-on-open philosophy
+    _ensure_schema/_ensure_column already use for the database. "models"
+    isn't written to or read from by any vine360 code -- it's where a
+    user drops the trained model output (e.g. .ply/.splat) that comes
+    back from Postshot or another external trainer after training on an
+    exports/ bundle (see docs/adr/0024)."""
+    for rel in LAYOUT_DIRS:
+        (root / rel).mkdir(parents=True, exist_ok=True)
 
 
 class ProjectError(Exception):
@@ -114,6 +130,21 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 selected_model TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS queue_jobs (
+                job_id TEXT PRIMARY KEY,
+                order_index INTEGER NOT NULL,
+                stage TEXT NOT NULL,
+                label TEXT NOT NULL,
+                target_source_id TEXT,
+                params TEXT NOT NULL,
+                depends_on TEXT NOT NULL,
+                status TEXT NOT NULL,
+                auto_added INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT
+            );
         """
     )
     conn.commit()
@@ -140,8 +171,7 @@ def create_project(root: Path, name: str, capture_mode: CaptureMode) -> Project:
         raise ProjectAlreadyExistsError(f"{root} already contains a project")
 
     root.mkdir(parents=True, exist_ok=True)
-    for rel in LAYOUT_DIRS:
-        (root / rel).mkdir(parents=True, exist_ok=True)
+    _ensure_layout_dirs(root)
 
     project = Project(
         schema_version=SCHEMA_VERSION,
@@ -184,6 +214,7 @@ def open_index_db(root: Path) -> sqlite3.Connection:
     path = index_db_path(root)
     if not path.exists():
         raise ProjectNotFoundError(f"no {INDEX_FILE} found under {root}")
+    _ensure_layout_dirs(Path(root))
     conn = sqlite3.connect(path)
     _ensure_schema(conn)
     return conn

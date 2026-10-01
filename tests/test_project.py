@@ -89,6 +89,25 @@ def test_opening_an_older_project_migrates_missing_tables(tmp_path):
         reopened.close()
 
 
+def test_opening_an_older_project_migrates_missing_layout_dirs(tmp_path):
+    """Regression test: a project created before a LAYOUT_DIRS entry
+    (e.g. models/) existed must get it retroactively on open, not only at
+    creation -- open_index_db recreates any missing layout directory
+    every time, mirroring the schema migration above (docs/adr/0024)."""
+    import shutil
+
+    root = tmp_path / "myproject"
+    create_project(root, "My Vineyard", CaptureMode.THREE_SIXTY)
+
+    # simulate a pre-upgrade project: remove a layout dir directly
+    shutil.rmtree(root / "models")
+    assert not (root / "models").exists()
+
+    reopened = open_index_db(root)
+    reopened.close()
+    assert (root / "models").is_dir()
+
+
 def test_opening_an_older_project_migrates_missing_columns(tmp_path):
     """Regression test: CREATE TABLE IF NOT EXISTS does nothing for a
     table that already exists without a newer column (e.g.

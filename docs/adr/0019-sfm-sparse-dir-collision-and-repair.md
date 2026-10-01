@@ -65,3 +65,15 @@ the *files it pointed to* were not.
 - This does not change `run_sfm_for_project`'s public signature or
   `sfm_runs` schema -- `selected_model`'s meaning (docs/adr/0018) is
   unchanged, just now reliably preserved across runs.
+- **Later removed from the GUI.** The "Repair runs from before this
+  feature (one-time)" button (`ExportPanel`) was removed at the user's
+  request once its one-time job was actually done: with only two real
+  projects, the repair was run for real against both (`/mnt/e/TEST` had
+  3 unrecoverable runs and 1 already-fine run, matching this ADR's
+  original finding exactly, nothing newly fixed; `/mnt/e/11-9-26_
+  EstoWines_Capture1/A1_InstaLow` had no `sfm_runs` rows at all yet), so
+  a standing UI affordance for a fix that's now fully applied wasn't
+  worth keeping. `vine360.sfm.repair_selected_model.repair_selected_model`
+  itself (and its tests) are untouched -- only the GUI button and its
+  handler code in `main_window.py` were removed; the function remains
+  callable directly if ever needed again.

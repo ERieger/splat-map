@@ -5,9 +5,10 @@ docs/status.md and memory).
 Project creation, source ingest, frame extraction, projection generation,
 mask building and SfM are all wired to real vine360 code, run on a
 background QThread with a determinate progress bar + ETA wherever the
-underlying function reports (current, total) counts. Training stays
-adapter-only (no backend installed, no run) -- an explicit standing
-decision, not an oversight; see docs/adr/0009.
+underlying function reports (current, total) counts. Training has no
+sidebar stage here -- removed from the app's scope (docs/adr/0025); the
+adapter-only library code (`vine360/training/`) still exists per ADR
+0009, it's just not surfaced in this GUI.
 
 Sidebar stage status (the colored dot next to each stage name) is derived
 directly from the project's index database each time it changes, not
@@ -19,6 +20,7 @@ Run with: python -m vine360.gui.main_window
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -30,9 +32,11 @@ from typing import Callable
 from PySide6.QtCore import QObject, QPoint, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDockWidget,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -87,10 +91,25 @@ from vine360.runners.probe import probe_dependencies
 from vine360.export.postshot import (
     PostshotExportError,
     export_for_postshot,
+    export_for_realityscan,
     export_frames_and_masks_for_postshot,
+    realityscan_priors_available,
 )
 from vine360.sfm.project_run import SfmRegistrationError, run_sfm_for_project
-from vine360.sfm.repair_selected_model import repair_selected_model
+from vine360.gui.queue_manager import (
+    BLOCKED,
+    DONE as JOB_DONE,
+    FAILED,
+    QUEUED,
+    RUNNING as JOB_RUNNING,
+    SKIPPED,
+    STAGE_EXPORT as QUEUE_STAGE_EXPORT,
+    STAGE_FRAMES as QUEUE_STAGE_FRAMES,
+    STAGE_MASKS as QUEUE_STAGE_MASKS,
+    STAGE_POSE as QUEUE_STAGE_POSE,
+    STAGE_PROJECTION as QUEUE_STAGE_PROJECTION,
+    QueueManager,
+)
 
 # Real sample capture location (see memory: project_capture_equipment_and_sample_data) --
 # used only as a file-dialog starting point, nothing here reads or processes it.
@@ -101,17 +120,32 @@ CAPTURE_GROUP_PRESETS = ["Insta360 (ground)", "Antigravity A1 (aerial)", "Other 
 DONE, ACTIVE, PENDING = "done", "active", "pending"
 STATUS_COLOR = {DONE: QColor(70, 150, 90), ACTIVE: QColor(200, 160, 50), PENDING: QColor(120, 120, 120)}
 
+# Job-status vocabulary (queue_manager.QUEUED/RUNNING/DONE/FAILED/BLOCKED/
+# SKIPPED) is deliberately separate from the stage-status vocabulary above
+# -- a job's lifecycle isn't the same question as a pipeline stage's
+# data-derived status -- but reuses the same dot-rendering idiom (see
+# _dot_pixmap) so the queue panel reads consistently with the sidebar.
+JOB_STATUS_COLOR = {
+    QUEUED: QColor(120, 120, 120),
+    JOB_RUNNING: QColor(200, 160, 50),
+    JOB_DONE: QColor(70, 150, 90),
+    FAILED: QColor(190, 60, 60),
+    BLOCKED: QColor(150, 90, 170),
+    SKIPPED: QColor(150, 150, 150),
+}
+
 # Sidebar row indices -- used both to build the QStackedWidget and to
-# address which dot compute_stage_statuses' result applies to.
+# address which dot compute_stage_statuses' result applies to. Training
+# was removed from the GUI (docs/adr/0025) -- the adapter-only library
+# code (vine360/training/) still exists, per ADR 0009, just isn't
+# surfaced as a sidebar stage.
 STAGE_PROJECT = 0
 STAGE_IMPORT = 1
 STAGE_FRAMES = 2
 STAGE_PROJECTION = 3
 STAGE_MASKS = 4
 STAGE_POSE = 5
-STAGE_TRAINING_PRESET = 6
-STAGE_TRAINING_MONITOR = 7
-STAGE_EXPORT = 8
+STAGE_EXPORT = 6
 
 
 @dataclass
@@ -123,6 +157,12 @@ class AppState:
     # panel can trigger a sidebar status refresh after it changes project
     # state, without each panel needing to know sidebar indices itself.
     notify_change: Callable[[], None] = field(default=lambda: None)
+    # Set once by Vine360MainWindow. Panels check queue_manager.is_running
+    # to disable their manual "Run now" button while the queue is actively
+    # advancing through jobs, so a manual run can't race a queued one on
+    # the same sqlite connection / output directories -- see
+    # docs/adr/0023-persisted-processing-queue.md.
+    queue_manager: "QueueManager | None" = None
 
 
 def compute_stage_statuses(conn: sqlite3.Connection | None) -> dict[int, str]:
@@ -304,16 +344,24 @@ class ProgressArea(QWidget):
         self._start_time = None
 
 
-def _status_dot(status: str) -> QPixmap:
+def _dot_pixmap(color: QColor) -> QPixmap:
     pixmap = QPixmap(12, 12)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
-    painter.setBrush(STATUS_COLOR[status])
+    painter.setBrush(color)
     painter.setPen(Qt.NoPen)
     painter.drawEllipse(1, 1, 10, 10)
     painter.end()
     return pixmap
+
+
+def _status_dot(status: str) -> QPixmap:
+    return _dot_pixmap(STATUS_COLOR[status])
+
+
+def _job_status_dot(status: str) -> QPixmap:
+    return _dot_pixmap(JOB_STATUS_COLOR[status])
 
 
 def _flag_icon(size: int = 14) -> QPixmap:
@@ -455,7 +503,14 @@ class PreviewGallery(QWidget):
 class TemporalFrameSelector(QWidget):
     """A slider for scrubbing through a source's extracted frames by time
     -- scales much better than a long dropdown once there are dozens or
-    hundreds of frames (a real capture easily has 100+)."""
+    hundreds of frames (a real capture easily has 100+). Also offers
+    Previous/Next single-step buttons, a bigger +/- BIG_JUMP-frame jump,
+    and a spin box to type a frame number directly. The slider stays the
+    single source of truth for "current frame"; every other control just
+    moves it (via `_step`/`_on_spin_changed`) or mirrors it (the spin box
+    on `_on_slider_changed`), so they can never drift out of sync."""
+
+    BIG_JUMP = 10
 
     frame_changed = Signal()
 
@@ -463,28 +518,92 @@ class TemporalFrameSelector(QWidget):
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setMinimum(0)
         self.slider.setMaximum(0)
+        self.slider.setPageStep(self.BIG_JUMP)
         self.slider.valueChanged.connect(self._on_slider_changed)
         layout.addWidget(self.slider)
+
+        nav_row = QHBoxLayout()
+        self.big_back_btn = QPushButton(f"«{self.BIG_JUMP}")
+        self.big_back_btn.setToolTip(f"Back {self.BIG_JUMP} frames")
+        self.big_back_btn.clicked.connect(lambda: self._step(-self.BIG_JUMP))
+        nav_row.addWidget(self.big_back_btn)
+        self.prev_btn = QPushButton("‹ Prev")
+        self.prev_btn.clicked.connect(lambda: self._step(-1))
+        nav_row.addWidget(self.prev_btn)
+
+        # 1-indexed to match the "Frame N/total" the label already showed
+        # -- typing a value outside [1, total] is impossible, QSpinBox
+        # clamps/refuses it natively, satisfying "constrain to valid
+        # values" without any extra validation code here.
+        self.frame_spin = QSpinBox()
+        self.frame_spin.setMinimum(1)
+        self.frame_spin.setMaximum(1)
+        self.frame_spin.setEnabled(False)
+        self.frame_spin.setToolTip("Type a frame number to jump to it.")
+        self.frame_spin.valueChanged.connect(self._on_spin_changed)
+        nav_row.addWidget(self.frame_spin)
+        self.total_label = QLabel("/ 0")
+        nav_row.addWidget(self.total_label)
+
+        self.next_btn = QPushButton("Next ›")
+        self.next_btn.clicked.connect(lambda: self._step(1))
+        nav_row.addWidget(self.next_btn)
+        self.big_forward_btn = QPushButton(f"{self.BIG_JUMP}»")
+        self.big_forward_btn.setToolTip(f"Forward {self.BIG_JUMP} frames")
+        self.big_forward_btn.clicked.connect(lambda: self._step(self.BIG_JUMP))
+        nav_row.addWidget(self.big_forward_btn)
+        nav_row.addStretch()
+        layout.addLayout(nav_row)
+
         self.label = QLabel("No frames.")
         self.label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.label)
         self._frames: list[tuple[str, float, int]] = []
+        self._nav_buttons = (self.big_back_btn, self.prev_btn, self.next_btn, self.big_forward_btn)
 
     def set_frames(self, frames: list[tuple[str, float, int]]) -> None:
         """frames: (frame_id, source_time, view_count), ordered by time."""
         self._frames = frames
+        has_frames = len(frames) > 0
+
         self.slider.blockSignals(True)
         self.slider.setMaximum(max(len(frames) - 1, 0))
         self.slider.setValue(0)
-        self.slider.setEnabled(len(frames) > 0)
+        self.slider.setEnabled(has_frames)
         self.slider.blockSignals(False)
+
+        self.frame_spin.blockSignals(True)
+        self.frame_spin.setMaximum(max(len(frames), 1))
+        self.frame_spin.setValue(1)
+        self.frame_spin.setEnabled(has_frames)
+        self.frame_spin.blockSignals(False)
+
+        self.total_label.setText(f"/ {len(frames)}")
+        for btn in self._nav_buttons:
+            btn.setEnabled(has_frames)
+
         self._update_label()
         self.frame_changed.emit()
 
-    def _on_slider_changed(self, _value: int) -> None:
+    def _step(self, delta: int) -> None:
+        if not self._frames:
+            return
+        new_index = max(0, min(len(self._frames) - 1, self.slider.value() + delta))
+        self.slider.setValue(new_index)  # no-op (and no signal) if already at that end
+
+    def _on_spin_changed(self, value: int) -> None:
+        if not self._frames:
+            return
+        self.slider.setValue(value - 1)  # spin box is 1-indexed, slider is 0-indexed
+
+    def _on_slider_changed(self, value: int) -> None:
+        self.frame_spin.blockSignals(True)
+        self.frame_spin.setValue(value + 1)
+        self.frame_spin.blockSignals(False)
         self._update_label()
         self.frame_changed.emit()
 
@@ -495,7 +614,7 @@ class TemporalFrameSelector(QWidget):
         index = self.slider.value()
         frame_id, source_time, view_count = self._frames[index]
         views_text = f"{view_count} views" if view_count else "no views"
-        self.label.setText(f"Frame {index + 1}/{len(self._frames)}  —  t={source_time:.2f}s  —  {views_text}")
+        self.label.setText(f"t={source_time:.2f}s  —  {views_text}")
 
     def current_frame_id(self) -> str | None:
         if not self._frames:
@@ -860,7 +979,15 @@ class ImportPanel(QWidget):
             QMessageBox.critical(self, "Unexpected error removing source", f"{type(exc).__name__}: {exc}")
 
 
-def _extract_frames_worker(project_root: Path, source_id: str, interval_seconds: float, progress_callback=None):
+def _extract_frames_worker(
+    project_root: Path,
+    source_id: str,
+    interval_seconds: float,
+    start_time: float | None,
+    end_time: float | None,
+    generate_thumbnails: bool,
+    progress_callback=None,
+):
     conn = open_index_db(project_root)
     try:
         return extract_frames(
@@ -869,6 +996,9 @@ def _extract_frames_worker(project_root: Path, source_id: str, interval_seconds:
             source_id,
             LocalRunner(),
             interval_seconds=interval_seconds,
+            start_time=start_time,
+            end_time=end_time,
+            generate_thumbnails=generate_thumbnails,
             progress_callback=progress_callback,
         )
     finally:
@@ -884,6 +1014,7 @@ class FramesPanel(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
+        self._source_durations: dict[str, float] = {}
         layout = QVBoxLayout(self)
         _panel_header("Frames", "Extract deterministic frames from a registered video source.", layout)
 
@@ -896,6 +1027,7 @@ class FramesPanel(QWidget):
 
         form = QFormLayout()
         self.source_combo = QComboBox()
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         form.addRow("Video source:", self.source_combo)
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(
@@ -914,18 +1046,53 @@ class FramesPanel(QWidget):
         form.addRow("Custom interval:", self.custom_interval_spin)
         controls_layout.addLayout(form)
 
+        range_row = QHBoxLayout()
+        self.time_range_check = QCheckBox("Limit to a time range")
+        self.time_range_check.toggled.connect(self._on_time_range_toggled)
+        range_row.addWidget(self.time_range_check)
+        range_row.addWidget(QLabel("Start (s):"))
+        self.start_time_spin = QDoubleSpinBox()
+        self.start_time_spin.setRange(0.0, 0.0)  # rebound in _on_source_changed once duration is known
+        self.start_time_spin.setDecimals(2)
+        self.start_time_spin.setEnabled(False)
+        range_row.addWidget(self.start_time_spin)
+        range_row.addWidget(QLabel("End (s):"))
+        self.end_time_spin = QDoubleSpinBox()
+        self.end_time_spin.setRange(0.0, 0.0)
+        self.end_time_spin.setDecimals(2)
+        self.end_time_spin.setEnabled(False)
+        range_row.addWidget(self.end_time_spin)
+        range_row.addStretch()
+        controls_layout.addLayout(range_row)
+
+        self.thumbnails_check = QCheckBox("Generate thumbnails")
+        self.thumbnails_check.setChecked(True)
+        self.thumbnails_check.setToolTip(
+            "Writes a small JPEG thumbnail per extracted frame into frames/<source>/thumbs/. Nothing "
+            "in the app currently reads these back -- unchecking skips that pass to save time on a "
+            "large or high-resolution source."
+        )
+        controls_layout.addWidget(self.thumbnails_check)
+
         intervals_note = QLabel(
             "Preset intervals (vine360.config.FRAME_PRESET_INTERVALS): "
             + ", ".join(f"{p.value}={FRAME_PRESET_INTERVALS[p]}s" for p in FRAME_PRESET_INTERVALS)
-            + ". Re-extracting a source replaces its previous frames."
+            + ". Re-extracting a source replaces its previous frames. A time range only limits which "
+            "part of the source is sampled; the interval/preset still applies within it."
         )
         intervals_note.setWordWrap(True)
         intervals_note.setStyleSheet("color: palette(mid);")
         controls_layout.addWidget(intervals_note)
 
+        btn_row = QHBoxLayout()
         self.extract_btn = QPushButton("Extract Frames")
         self.extract_btn.clicked.connect(self._on_extract)
-        controls_layout.addWidget(self.extract_btn)
+        btn_row.addWidget(self.extract_btn)
+        self.queue_btn = QPushButton("Add to Queue")
+        self.queue_btn.setToolTip("Adds this exact configuration as a queued job instead of running it now.")
+        self.queue_btn.clicked.connect(self._on_add_to_queue)
+        btn_row.addWidget(self.queue_btn)
+        controls_layout.addLayout(btn_row)
 
         self.progress_area = ProgressArea()
         controls_layout.addWidget(self.progress_area)
@@ -933,6 +1100,9 @@ class FramesPanel(QWidget):
         layout.addWidget(self.controls)
         self.controls.setVisible(False)
         layout.addStretch()
+
+        if self.state.queue_manager is not None:
+            self.state.queue_manager.queue_changed.connect(self._refresh_run_enabled)
 
     def on_project_changed(self) -> None:
         have_project = self.state.conn is not None
@@ -950,29 +1120,88 @@ class FramesPanel(QWidget):
         if self.state.conn is None:
             return
         rows = self.state.conn.execute(
-            "SELECT s.source_id, s.path, "
+            "SELECT s.source_id, s.path, s.timestamps, "
             "(SELECT COUNT(*) FROM frames WHERE frames.source_id = s.source_id) AS frame_count "
             "FROM sources s WHERE s.media_type = 'video' ORDER BY s.rowid"
         ).fetchall()
-        for source_id, path, frame_count in rows:
+        self._source_durations: dict[str, float] = {}
+        for source_id, path, timestamps_json, frame_count in rows:
+            duration = json.loads(timestamps_json).get("duration_seconds") if timestamps_json else None
+            if duration:
+                self._source_durations[source_id] = duration
             existing = f"{frame_count} frames already extracted" if frame_count else "no frames yet"
             self.source_combo.addItem(f"{Path(path).name} ({source_id[:8]}) — {existing}", userData=source_id)
         has_sources = self.source_combo.count() > 0
-        self.extract_btn.setEnabled(has_sources)
+        self._has_sources = has_sources
+        self.queue_btn.setEnabled(has_sources)
+        self._refresh_run_enabled()
+        self._on_source_changed()
         self.progress_area.label.setText("" if has_sources else "No video sources registered yet -- add one on Import.")
+
+    def _refresh_run_enabled(self) -> None:
+        busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
+        self.extract_btn.setEnabled(getattr(self, "_has_sources", False) and not busy)
 
     def _on_preset_changed(self, text: str) -> None:
         self.custom_interval_spin.setEnabled(FramePreset(text) == FramePreset.CUSTOM)
+
+    def _current_interval(self) -> float:
+        preset = FramePreset(self.preset_combo.currentText())
+        if preset == FramePreset.CUSTOM:
+            return self.custom_interval_spin.value()
+        return FRAME_PRESET_INTERVALS[preset]
+
+    def _on_source_changed(self, *_args) -> None:
+        source_id = self.source_combo.currentData()
+        duration = self._source_durations.get(source_id, 0.0) if source_id else 0.0
+        for spin in (self.start_time_spin, self.end_time_spin):
+            spin.setMaximum(duration)
+        self.start_time_spin.setValue(0.0)
+        self.end_time_spin.setValue(duration)
+
+    def _on_time_range_toggled(self, checked: bool) -> None:
+        self.start_time_spin.setEnabled(checked)
+        self.end_time_spin.setEnabled(checked)
+
+    def _current_time_range(self) -> tuple[float | None, float | None]:
+        if not self.time_range_check.isChecked():
+            return None, None
+        return self.start_time_spin.value(), self.end_time_spin.value()
+
+    def _on_add_to_queue(self) -> None:
+        source_id = self.source_combo.currentData()
+        if source_id is None:
+            return
+        interval = self._current_interval()
+        start_time, end_time = self._current_time_range()
+        if end_time is not None and end_time <= (start_time or 0.0):
+            QMessageBox.warning(self, "Invalid time range", "End time must be greater than start time.")
+            return
+        name = self.source_combo.currentText().split(" (")[0]
+        range_label = f", {start_time:.1f}s–{end_time:.1f}s" if end_time is not None else ""
+        generate_thumbnails = self.thumbnails_check.isChecked()
+        self.state.queue_manager.add_job(
+            QUEUE_STAGE_FRAMES,
+            source_id,
+            {
+                "interval_seconds": interval,
+                "start_time": start_time,
+                "end_time": end_time,
+                "generate_thumbnails": generate_thumbnails,
+            },
+            f"Frame extraction — {name} (every {interval}s{range_label}"
+            f"{'' if generate_thumbnails else ', no thumbnails'})",
+        )
 
     def _on_extract(self) -> None:
         source_id = self.source_combo.currentData()
         if source_id is None:
             return
-        preset = FramePreset(self.preset_combo.currentText())
-        if preset == FramePreset.CUSTOM:
-            interval = self.custom_interval_spin.value()
-        else:
-            interval = FRAME_PRESET_INTERVALS[preset]
+        interval = self._current_interval()
+        start_time, end_time = self._current_time_range()
+        if end_time is not None and end_time <= (start_time or 0.0):
+            QMessageBox.warning(self, "Invalid time range", "End time must be greater than start time.")
+            return
 
         self.extract_btn.setEnabled(False)
         self.progress_area.start(f"Extracting frames every {interval}s…")
@@ -982,18 +1211,21 @@ class FramesPanel(QWidget):
             self.state.project_root,
             source_id,
             interval,
+            start_time,
+            end_time,
+            self.thumbnails_check.isChecked(),
             on_success=self._on_extract_success,
             on_error=self._on_extract_error,
             on_progress=self.progress_area.update_progress,
         )
 
     def _on_extract_success(self, frames) -> None:
-        self.extract_btn.setEnabled(True)
+        self._refresh_run_enabled()
         self.progress_area.finish(f"Extracted {len(frames)} frames.")
         self.state.notify_change()
 
     def _on_extract_error(self, exc: Exception) -> None:
-        self.extract_btn.setEnabled(True)
+        self._refresh_run_enabled()
         self.progress_area.finish("")
         if isinstance(exc, FrameExtractionError):
             QMessageBox.warning(self, "Frame extraction failed", str(exc))
@@ -1001,8 +1233,18 @@ class FramesPanel(QWidget):
             QMessageBox.critical(self, "Unexpected error extracting frames", f"{type(exc).__name__}: {exc}")
 
 
+def _default_parallel_worker_count() -> int:
+    return min(os.cpu_count() or 1, 4)
+
+
 def _generate_views_worker(
-    project_root: Path, source_id: str, face_size: int, fov_degrees: float, face_names: list[str], progress_callback=None
+    project_root: Path,
+    source_id: str,
+    face_size: int,
+    fov_degrees: float,
+    face_names: list[str],
+    max_workers: int | None,
+    progress_callback=None,
 ):
     conn = open_index_db(project_root)
     try:
@@ -1013,6 +1255,7 @@ def _generate_views_worker(
             face_size=face_size,
             fov_degrees=fov_degrees,
             face_names=face_names,
+            max_workers=max_workers,
             progress_callback=progress_callback,
         )
     finally:
@@ -1027,6 +1270,7 @@ class ProjectionPanel(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
+        self._source_frame_counts: dict[str, int] = {}
         layout = QVBoxLayout(self)
         _panel_header(
             "Projection",
@@ -1045,6 +1289,7 @@ class ProjectionPanel(QWidget):
         form = QFormLayout()
         self.source_combo = QComboBox()
         self.source_combo.currentIndexChanged.connect(self._refresh_frame_list)
+        self.source_combo.currentIndexChanged.connect(self._refresh_run_enabled)
         form.addRow("Source (its extracted frames):", self.source_combo)
         self.face_size_spin = QSpinBox()
         self.face_size_spin.setRange(128, 4096)
@@ -1072,9 +1317,34 @@ class ProjectionPanel(QWidget):
         polar_note.setStyleSheet("color: palette(mid);")
         controls_layout.addWidget(polar_note)
 
+        parallel_row = QHBoxLayout()
+        self.parallel_check = QCheckBox("Speed up with parallel processing")
+        self.parallel_check.setChecked(True)
+        self.parallel_check.toggled.connect(self._on_parallel_toggled)
+        parallel_row.addWidget(self.parallel_check)
+        parallel_row.addWidget(QLabel("Workers:"))
+        self.worker_count_spin = QSpinBox()
+        self.worker_count_spin.setRange(1, max(os.cpu_count() or 1, 1))
+        self.worker_count_spin.setValue(_default_parallel_worker_count())
+        self.worker_count_spin.setToolTip(
+            "Each worker holds roughly a decoded copy of the full equirectangular frame in memory "
+            "(~1GB for an 8K source) -- more workers means proportionally more peak RAM, up to your "
+            f"CPU's thread count ({os.cpu_count() or 1}). Uncheck the box to fall back to the "
+            "original single-process behavior."
+        )
+        parallel_row.addWidget(self.worker_count_spin)
+        parallel_row.addStretch()
+        controls_layout.addLayout(parallel_row)
+
+        btn_row = QHBoxLayout()
         self.generate_btn = QPushButton("Generate Projections")
         self.generate_btn.clicked.connect(self._on_generate)
-        controls_layout.addWidget(self.generate_btn)
+        btn_row.addWidget(self.generate_btn)
+        self.queue_btn = QPushButton("Add to Queue")
+        self.queue_btn.setToolTip("Adds this exact configuration as a queued job instead of running it now.")
+        self.queue_btn.clicked.connect(self._on_add_to_queue)
+        btn_row.addWidget(self.queue_btn)
+        controls_layout.addLayout(btn_row)
 
         self.progress_area = ProgressArea()
         controls_layout.addWidget(self.progress_area)
@@ -1089,6 +1359,9 @@ class ProjectionPanel(QWidget):
         layout.addWidget(self.controls)
         self.controls.setVisible(False)
         layout.addStretch()
+
+        if self.state.queue_manager is not None:
+            self.state.queue_manager.queue_changed.connect(self._refresh_run_enabled)
 
     def on_project_changed(self) -> None:
         self.on_shown()
@@ -1107,19 +1380,36 @@ class ProjectionPanel(QWidget):
         rows = self.state.conn.execute(
             "SELECT s.source_id, s.path, "
             "COUNT(DISTINCT f.frame_id) AS frame_count, COUNT(v.view_id) AS view_count "
-            "FROM sources s JOIN frames f ON f.source_id = s.source_id "
+            "FROM sources s LEFT JOIN frames f ON f.source_id = s.source_id "
             "LEFT JOIN views v ON v.frame_id = f.frame_id "
+            "WHERE s.media_type = 'video' "
             "GROUP BY s.source_id ORDER BY s.rowid"
         ).fetchall()
+        self._source_frame_counts = {}
         for source_id, path, frame_count, view_count in rows:
+            self._source_frame_counts[source_id] = frame_count
             existing = f"{view_count} views already generated" if view_count else "no views yet"
             self.source_combo.addItem(
                 f"{Path(path).name} ({source_id[:8]}) — {frame_count} frames, {existing}", userData=source_id
             )
         has_sources = self.source_combo.count() > 0
-        self.generate_btn.setEnabled(has_sources)
-        self.progress_area.label.setText("" if has_sources else "No extracted frames yet -- extract frames first.")
+        self._has_sources = has_sources
+        self.queue_btn.setEnabled(has_sources)
+        self._refresh_run_enabled()
+        self.progress_area.label.setText("" if has_sources else "No video sources registered yet -- add one on Import.")
         self._refresh_frame_list()
+
+    def _refresh_run_enabled(self) -> None:
+        busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
+        source_id = self.source_combo.currentData()
+        has_frames = bool(source_id) and self._source_frame_counts.get(source_id, 0) > 0
+        self.generate_btn.setEnabled(has_frames and not busy)
+        self.generate_btn.setToolTip(
+            ""
+            if has_frames
+            else 'This source has no extracted frames yet -- use "Add to Queue" instead; it will queue '
+            "frame extraction automatically ahead of this projection job."
+        )
 
     def _refresh_frame_list(self) -> None:
         source_id = self.source_combo.currentData()
@@ -1150,6 +1440,34 @@ class ProjectionPanel(QWidget):
     def _selected_face_names(self) -> list[str]:
         return [name for name, cb in self.face_checks.items() if cb.isChecked()]
 
+    def _on_parallel_toggled(self, checked: bool) -> None:
+        self.worker_count_spin.setEnabled(checked)
+
+    def _current_max_workers(self) -> int | None:
+        return self.worker_count_spin.value() if self.parallel_check.isChecked() else None
+
+    def _on_add_to_queue(self) -> None:
+        source_id = self.source_combo.currentData()
+        if source_id is None:
+            return
+        face_names = self._selected_face_names()
+        if not face_names:
+            QMessageBox.warning(self, "No views selected", "Check at least one face to generate.")
+            return
+        name = self.source_combo.currentText().split(" (")[0]
+        max_workers = self._current_max_workers()
+        self.state.queue_manager.add_job(
+            QUEUE_STAGE_PROJECTION,
+            source_id,
+            {
+                "face_size": self.face_size_spin.value(),
+                "fov_degrees": self.fov_spin.value(),
+                "face_names": face_names,
+                "max_workers": max_workers,
+            },
+            f"Projection — {name} ({', '.join(face_names)})",
+        )
+
     def _on_generate(self) -> None:
         source_id = self.source_combo.currentData()
         if source_id is None:
@@ -1158,6 +1476,7 @@ class ProjectionPanel(QWidget):
         if not face_names:
             QMessageBox.warning(self, "No views selected", "Check at least one face to generate.")
             return
+        max_workers = self._current_max_workers()
         self.generate_btn.setEnabled(False)
         self.progress_area.start("Generating projections…")
         run_in_background(
@@ -1168,13 +1487,13 @@ class ProjectionPanel(QWidget):
             self.face_size_spin.value(),
             self.fov_spin.value(),
             face_names,
+            max_workers,
             on_success=self._on_generate_success,
             on_error=self._on_generate_error,
             on_progress=self.progress_area.update_progress,
         )
 
     def _on_generate_success(self, views) -> None:
-        self.generate_btn.setEnabled(True)
         self.progress_area.finish(f"Generated {len(views)} views.")
         current_frame_id = self.frame_selector.current_frame_id()
         self.refresh_sources()
@@ -1183,7 +1502,7 @@ class ProjectionPanel(QWidget):
         self.state.notify_change()
 
     def _on_generate_error(self, exc: Exception) -> None:
-        self.generate_btn.setEnabled(True)
+        self._refresh_run_enabled()
         self.progress_area.finish("")
         if isinstance(exc, ProjectionGenerationError):
             QMessageBox.warning(self, "Projection failed", str(exc))
@@ -1220,6 +1539,7 @@ class MasksPanel(QWidget):
         # torch/transformers to check availability is expensive (roughly
         # 140MB -> 700MB+ RSS observed) and shouldn't cost anything at app
         # startup for users who never open this panel.
+        self._source_view_counts: dict[str, int] = {}
         layout = QVBoxLayout(self)
         _panel_header("Masks", "Segment person/sky and build the keep-mask for each view.", layout)
 
@@ -1236,6 +1556,7 @@ class MasksPanel(QWidget):
         form = QFormLayout()
         self.source_combo = QComboBox()
         self.source_combo.currentIndexChanged.connect(self._refresh_frame_list)
+        self.source_combo.currentIndexChanged.connect(self._refresh_run_enabled)
         form.addRow("Source (its generated views):", self.source_combo)
         controls_layout.addLayout(form)
 
@@ -1257,9 +1578,15 @@ class MasksPanel(QWidget):
         self.sam3_note.setStyleSheet("color: palette(mid);")
         controls_layout.addWidget(self.sam3_note)
 
+        build_btn_row = QHBoxLayout()
         self.build_btn = QPushButton("Build Masks")
         self.build_btn.clicked.connect(self._on_build)
-        controls_layout.addWidget(self.build_btn)
+        build_btn_row.addWidget(self.build_btn)
+        self.queue_btn = QPushButton("Add to Queue")
+        self.queue_btn.setToolTip("Adds this exact configuration as a queued job instead of running it now.")
+        self.queue_btn.clicked.connect(self._on_add_to_queue)
+        build_btn_row.addWidget(self.queue_btn)
+        controls_layout.addLayout(build_btn_row)
 
         self.progress_area = ProgressArea()
         controls_layout.addWidget(self.progress_area)
@@ -1309,6 +1636,9 @@ class MasksPanel(QWidget):
         # previous/next-flagged navigation buttons.
         self._flat_views: list[tuple[str, str, float | None, bool]] = []
 
+        if self.state.queue_manager is not None:
+            self.state.queue_manager.queue_changed.connect(self._refresh_run_enabled)
+
     def on_project_changed(self) -> None:
         self.on_shown()
 
@@ -1339,19 +1669,36 @@ class MasksPanel(QWidget):
             return
         rows = self.state.conn.execute(
             "SELECT s.source_id, s.path, COUNT(DISTINCT v.view_id) AS view_count, COUNT(m.view_id) AS mask_count "
-            "FROM sources s JOIN frames f ON f.source_id = s.source_id "
-            "JOIN views v ON v.frame_id = f.frame_id LEFT JOIN masks m ON m.view_id = v.view_id "
+            "FROM sources s LEFT JOIN frames f ON f.source_id = s.source_id "
+            "LEFT JOIN views v ON v.frame_id = f.frame_id LEFT JOIN masks m ON m.view_id = v.view_id "
+            "WHERE s.media_type = 'video' "
             "GROUP BY s.source_id ORDER BY s.rowid"
         ).fetchall()
+        self._source_view_counts = {}
         for source_id, path, view_count, mask_count in rows:
+            self._source_view_counts[source_id] = view_count
             existing = f"{mask_count} masked already" if mask_count else "not masked yet"
             self.source_combo.addItem(
                 f"{Path(path).name} ({source_id[:8]}) — {view_count} views, {existing}", userData=source_id
             )
         has_sources = self.source_combo.count() > 0
-        self.build_btn.setEnabled(has_sources)
-        self.progress_area.label.setText("" if has_sources else "No projected views yet -- generate projections first.")
+        self._has_sources = has_sources
+        self.queue_btn.setEnabled(has_sources)
+        self._refresh_run_enabled()
+        self.progress_area.label.setText("" if has_sources else "No video sources registered yet -- add one on Import.")
         self._refresh_frame_list()
+
+    def _refresh_run_enabled(self) -> None:
+        busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
+        source_id = self.source_combo.currentData()
+        has_views = bool(source_id) and self._source_view_counts.get(source_id, 0) > 0
+        self.build_btn.setEnabled(has_views and not busy)
+        self.build_btn.setToolTip(
+            ""
+            if has_views
+            else 'This source has no projected views yet -- use "Add to Queue" instead; it will queue '
+            "projection automatically ahead of this masking job."
+        )
 
     def _refresh_frame_list(self) -> None:
         source_id = self.source_combo.currentData()
@@ -1471,6 +1818,20 @@ class MasksPanel(QWidget):
         if index >= 0:
             self.face_combo.setCurrentIndex(index)
 
+    def _on_add_to_queue(self) -> None:
+        source_id = self.source_combo.currentData()
+        if source_id is None:
+            return
+        name = self.source_combo.currentText().split(" (")[0]
+        use_person = self.sam3_person_check.isChecked()
+        use_sky = self.sam3_sky_check.isChecked()
+        self.state.queue_manager.add_job(
+            QUEUE_STAGE_MASKS,
+            source_id,
+            {"use_sam3_person": use_person, "use_sam3_sky": use_sky},
+            f"Masks — {name} (SAM 3 person={use_person}, sky={use_sky})",
+        )
+
     def _on_build(self) -> None:
         source_id = self.source_combo.currentData()
         if source_id is None:
@@ -1492,7 +1853,7 @@ class MasksPanel(QWidget):
         )
 
     def _on_build_success(self, masks) -> None:
-        self.build_btn.setEnabled(True)
+        self._refresh_run_enabled()
         self.progress_area.finish(f"Masked {len(masks)} views.")
 
         flagged = [
@@ -1536,7 +1897,7 @@ class MasksPanel(QWidget):
             self.face_combo.setCurrentIndex(index)
 
     def _on_build_error(self, exc: Exception) -> None:
-        self.build_btn.setEnabled(True)
+        self._refresh_run_enabled()
         self.progress_area.finish("")
         if isinstance(exc, MaskBuildError):
             QMessageBox.warning(self, "Masking failed", str(exc))
@@ -1588,6 +1949,7 @@ class PoseEstimationPanel(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
+        self._source_frame_counts: dict[str, int] = {}
         layout = QVBoxLayout(self)
         _panel_header("Pose estimation", "Run COLMAP feature extraction, matching and mapping.", layout)
 
@@ -1608,6 +1970,7 @@ class PoseEstimationPanel(QWidget):
         self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
         form.addRow("Engine:", self.engine_combo)
         self.source_combo = QComboBox()
+        self.source_combo.currentIndexChanged.connect(self._refresh_enabled)
         form.addRow("Source (equirectangular only):", self.source_combo)
         controls_layout.addLayout(form)
 
@@ -1616,9 +1979,15 @@ class PoseEstimationPanel(QWidget):
         self.engine_note.setStyleSheet("color: palette(mid);")
         controls_layout.addWidget(self.engine_note)
 
+        run_btn_row = QHBoxLayout()
         self.run_btn = QPushButton("Run SfM")
         self.run_btn.clicked.connect(self._on_run)
-        controls_layout.addWidget(self.run_btn)
+        run_btn_row.addWidget(self.run_btn)
+        self.queue_btn = QPushButton("Add to Queue")
+        self.queue_btn.setToolTip("Adds this exact configuration as a queued job instead of running it now.")
+        self.queue_btn.clicked.connect(self._on_add_to_queue)
+        run_btn_row.addWidget(self.queue_btn)
+        controls_layout.addLayout(run_btn_row)
 
         self.progress_area = ProgressArea()
         controls_layout.addWidget(self.progress_area)
@@ -1631,6 +2000,9 @@ class PoseEstimationPanel(QWidget):
         self.controls.setVisible(False)
         layout.addStretch()
         self._on_engine_changed()  # set initial note/visibility
+
+        if self.state.queue_manager is not None:
+            self.state.queue_manager.queue_changed.connect(self._refresh_enabled)
 
     def on_project_changed(self) -> None:
         self.on_shown()
@@ -1649,11 +2021,16 @@ class PoseEstimationPanel(QWidget):
         if self.state.conn is None:
             return
         rows = self.state.conn.execute(
-            "SELECT DISTINCT s.source_id, s.path FROM sources s JOIN frames f ON f.source_id = s.source_id "
-            "WHERE s.projection = 'equirectangular' ORDER BY s.rowid"
+            "SELECT s.source_id, s.path, "
+            "(SELECT COUNT(*) FROM frames WHERE frames.source_id = s.source_id) AS frame_count "
+            "FROM sources s WHERE s.projection = 'equirectangular' AND s.media_type = 'video' "
+            "ORDER BY s.rowid"
         ).fetchall()
-        for source_id, path in rows:
-            self.source_combo.addItem(f"{Path(path).name} ({source_id[:8]})", userData=source_id)
+        self._source_frame_counts = {}
+        for source_id, path, frame_count in rows:
+            self._source_frame_counts[source_id] = frame_count
+            existing = f"{frame_count} frames extracted" if frame_count else "no frames yet"
+            self.source_combo.addItem(f"{Path(path).name} ({source_id[:8]}) — {existing}", userData=source_id)
 
     def _on_engine_changed(self) -> None:
         engine = self.engine_combo.currentData()
@@ -1686,6 +2063,7 @@ class PoseEstimationPanel(QWidget):
         if self.state.conn is None:
             self.run_btn.setEnabled(False)
             return
+        busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
         engine = self.engine_combo.currentData()
         if engine == ENGINE_SPHERESFM:
             self.run_btn.setEnabled(False)
@@ -1693,10 +2071,17 @@ class PoseEstimationPanel(QWidget):
             return
         self.run_btn.setToolTip("")
         if engine == ENGINE_COLMAP_EQUIRECTANGULAR:
-            self.run_btn.setEnabled(self.source_combo.count() > 0)
+            source_id = self.source_combo.currentData()
+            has_frames = bool(source_id) and self._source_frame_counts.get(source_id, 0) > 0
+            self.run_btn.setEnabled(has_frames and not busy)
+            if not has_frames:
+                self.run_btn.setToolTip(
+                    'This source has no extracted frames yet -- use "Add to Queue" instead; it will '
+                    "queue frame extraction automatically first."
+                )
         else:
             n_views = self.state.conn.execute("SELECT COUNT(*) FROM views").fetchone()[0]
-            self.run_btn.setEnabled(n_views > 0)
+            self.run_btn.setEnabled(n_views > 0 and not busy)
 
     def _show_latest_run(self) -> None:
         row = self.state.conn.execute(
@@ -1712,12 +2097,32 @@ class PoseEstimationPanel(QWidget):
             f"{stats['num_connected_models']} connected model(s)."
         )
 
-    def _on_run(self) -> None:
+    def _current_sfm_args(self) -> tuple[str, str | None, str]:
         engine = self.engine_combo.currentData()
         if engine == ENGINE_COLMAP_EQUIRECTANGULAR:
-            image_source, source_id, camera_model = "frames", self.source_combo.currentData(), "EQUIRECTANGULAR"
-        else:
-            image_source, source_id, camera_model = "projections", None, "SIMPLE_RADIAL"
+            return "frames", self.source_combo.currentData(), "EQUIRECTANGULAR"
+        return "projections", None, "SIMPLE_RADIAL"
+
+    def _on_add_to_queue(self) -> None:
+        if self.engine_combo.currentData() == ENGINE_SPHERESFM:
+            QMessageBox.warning(self, "Not runnable", "SphereSfM needs a custom build; see the note above.")
+            return
+        image_source, source_id, camera_model = self._current_sfm_args()
+        if image_source == "frames" and source_id is None:
+            QMessageBox.warning(self, "No source selected", "Choose an equirectangular source first.")
+            return
+        engine_label = (
+            "COLMAP (equirectangular)" if image_source == "frames" else "COLMAP (six-face projections)"
+        )
+        self.state.queue_manager.add_job(
+            QUEUE_STAGE_POSE,
+            source_id,
+            {"image_source": image_source, "source_id": source_id, "camera_model": camera_model},
+            f"Pose estimation — {engine_label}",
+        )
+
+    def _on_run(self) -> None:
+        image_source, source_id, camera_model = self._current_sfm_args()
 
         self.run_btn.setEnabled(False)
         self.progress_area.start("Running SfM…")
@@ -1735,7 +2140,7 @@ class PoseEstimationPanel(QWidget):
 
     def _on_run_success(self, result) -> None:
         diagnostics, warnings = result
-        self.run_btn.setEnabled(True)
+        self._refresh_enabled()
         self.progress_area.finish("SfM complete.")
         text = (
             f"Registered {diagnostics.registered_images}/{diagnostics.total_images} "
@@ -1749,7 +2154,7 @@ class PoseEstimationPanel(QWidget):
         self.state.notify_change()
 
     def _on_run_error(self, exc: Exception) -> None:
-        self.run_btn.setEnabled(True)
+        self._refresh_enabled()
         self.progress_area.finish("")
         if isinstance(exc, SfmRegistrationError):
             QMessageBox.warning(
@@ -1762,30 +2167,144 @@ class PoseEstimationPanel(QWidget):
             QMessageBox.critical(self, "Unexpected error running SfM", f"{type(exc).__name__}: {exc}")
 
 
-def build_training_preset_panel() -> QWidget:
-    widget = QWidget()
-    layout = QVBoxLayout(widget)
-    _panel_header("Training preset", "Adapter exists (M5); no backend installed/run.", layout)
-    combo = QComboBox()
-    combo.addItems(["Preview", "Balanced", "Quality", "Custom"])
-    layout.addWidget(combo)
-    layout.addStretch()
-    return widget
+class QueuePanel(QWidget):
+    """The right-hand dock: an editable, persisted plan of queued jobs
+    (see vine360.gui.queue_manager) that runs unattended, one job at a
+    time, while every stage panel's own "Run now" button keeps working
+    for manual single-step use. Jobs are added from each stage panel's
+    "Add to Queue" button -- this panel only displays/reorders/starts the
+    plan, it never builds job params itself."""
 
+    def __init__(self, state: AppState):
+        super().__init__()
+        self.state = state
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
 
-def build_training_monitor_panel() -> QWidget:
-    widget = QWidget()
-    layout = QVBoxLayout(widget)
-    _panel_header("Training monitor", "Not wired up yet -- see docs/adr/0009.", layout)
-    progress = QProgressBar()
-    progress.setValue(0)
-    layout.addWidget(progress)
-    button = QPushButton("Start Training")
-    button.setEnabled(False)
-    button.setToolTip("Adapter-only by design (docs/adr/0009): no training backend is installed or run here.")
-    layout.addWidget(button)
-    layout.addStretch()
-    return widget
+        header = QLabel("Queue")
+        header.setStyleSheet("font-weight: 600; font-size: 13px;")
+        layout.addWidget(header)
+        subtitle = QLabel("Runs queued jobs in order. Failures block only their own dependents.")
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: palette(mid);")
+        layout.addWidget(subtitle)
+
+        button_row = QHBoxLayout()
+        self.start_btn = QPushButton("Start Queue")
+        self.start_btn.clicked.connect(self._on_start)
+        button_row.addWidget(self.start_btn)
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.clicked.connect(self._on_pause)
+        button_row.addWidget(self.pause_btn)
+        self.cancel_btn = QPushButton("Cancel All")
+        self.cancel_btn.clicked.connect(self._on_cancel_all)
+        button_row.addWidget(self.cancel_btn)
+        layout.addLayout(button_row)
+
+        self.progress_area = ProgressArea()
+        layout.addWidget(self.progress_area)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setDragDropMode(QAbstractItemView.InternalMove)
+        self.list_widget.setDefaultDropAction(Qt.MoveAction)
+        self.list_widget.model().rowsMoved.connect(self._on_rows_moved)
+        layout.addWidget(self.list_widget, stretch=1)
+
+        self._manager: QueueManager | None = None
+
+    def bind_manager(self, manager: QueueManager) -> None:
+        self._manager = manager
+        manager.queue_changed.connect(self.refresh)
+        manager.job_started.connect(lambda _job_id: self.progress_area.start("Running…"))
+        manager.job_progress.connect(self.progress_area.update_progress)
+        manager.job_finished.connect(lambda _job_id: self.progress_area.finish(""))
+        manager.job_failed.connect(lambda _job_id, msg: self.progress_area.finish(""))
+        manager.queue_idle.connect(self._on_idle)
+        self.refresh()
+
+    def refresh(self) -> None:
+        if self._manager is None:
+            return
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for job in self._manager.jobs:
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, job.job_id)
+            widget = self._row_widget(job)
+            item.setSizeHint(widget.sizeHint())
+            self.list_widget.addItem(item)
+            self.list_widget.setItemWidget(item, widget)
+        self.list_widget.blockSignals(False)
+        self.start_btn.setEnabled(not self._manager.is_running)
+        self.pause_btn.setEnabled(self._manager.is_running)
+        self.cancel_btn.setEnabled(any(j.status in (QUEUED, BLOCKED, JOB_RUNNING) for j in self._manager.jobs))
+
+    def _row_widget(self, job) -> QWidget:
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(2, 2, 2, 2)
+
+        dot = QLabel()
+        dot.setPixmap(_job_status_dot(job.status))
+        row_layout.addWidget(dot)
+
+        # job.label is already self-describing (stage, source, and the
+        # relevant settings -- see each panel's _on_add_to_queue), so it's
+        # shown as-is rather than re-prefixed with the stage name and a
+        # raw source_id fragment, which would just repeat it less clearly.
+        text = job.label
+        if job.auto_added:
+            text += "  (auto)"
+        label = QLabel(text)
+        label.setWordWrap(True)
+        if job.error_message:
+            label.setToolTip(job.error_message)
+        row_layout.addWidget(label, stretch=1)
+
+        if job.status == FAILED:
+            retry_btn = QPushButton("Retry")
+            retry_btn.clicked.connect(lambda: self._manager.retry_job(job.job_id))
+            row_layout.addWidget(retry_btn)
+        if job.status in (QUEUED, FAILED, BLOCKED):
+            skip_btn = QPushButton("Skip")
+            skip_btn.clicked.connect(lambda: self._manager.skip_job(job.job_id))
+            row_layout.addWidget(skip_btn)
+        remove_btn = QPushButton("✕")
+        remove_btn.setEnabled(job.status != JOB_RUNNING)
+        remove_btn.setFixedWidth(24)
+        remove_btn.clicked.connect(lambda: self._manager.remove_job(job.job_id))
+        row_layout.addWidget(remove_btn)
+        return row
+
+    def _on_rows_moved(self, *_args) -> None:
+        if self._manager is None:
+            return
+        job_ids = [
+            self.list_widget.item(i).data(Qt.UserRole) for i in range(self.list_widget.count())
+        ]
+        self._manager.reorder(job_ids)
+
+    def _on_start(self) -> None:
+        if self._manager is not None:
+            self._manager.start(self)
+
+    def _on_pause(self) -> None:
+        if self._manager is not None:
+            self._manager.pause()
+            self.refresh()
+
+    def _on_cancel_all(self) -> None:
+        if self._manager is None:
+            return
+        if self._manager.is_running:
+            self.progress_area.label.setText(
+                "Clearing queue — the job currently running can't be interrupted and will finish first."
+            )
+        self._manager.cancel_all()
+
+    def _on_idle(self) -> None:
+        self.progress_area.finish("")
+        self.refresh()
 
 
 def _export_postshot_worker(project_root: Path, output_dir: Path, run_id: str | None, progress_callback=None):
@@ -1798,40 +2317,68 @@ def _export_postshot_worker(project_root: Path, output_dir: Path, run_id: str | 
         conn.close()
 
 
-def _export_frames_and_masks_worker(project_root: Path, output_dir: Path, progress_callback=None):
+def _export_frames_and_masks_worker(
+    project_root: Path, output_dir: Path, source_id: str | None, progress_callback=None
+):
     conn = open_index_db(project_root)
     try:
         return export_frames_and_masks_for_postshot(
-            conn, project_root, output_dir, progress_callback=progress_callback
+            conn, project_root, output_dir, source_id=source_id, progress_callback=progress_callback
         )
     finally:
         conn.close()
 
 
-def _repair_selected_model_worker(project_root: Path, progress_callback=None):
+def _export_realityscan_worker(
+    project_root: Path,
+    output_dir: Path,
+    source_id: str | None,
+    include_camera_priors: bool = False,
+    progress_callback=None,
+):
     conn = open_index_db(project_root)
     try:
-        return repair_selected_model(conn, project_root)
+        return export_for_realityscan(
+            conn,
+            project_root,
+            output_dir,
+            source_id=source_id,
+            include_camera_priors=include_camera_priors,
+            progress_callback=progress_callback,
+        )
     finally:
         conn.close()
 
 
+# exports/<capture>/<format>/ -- see docs/adr/0028. Keyed by mode_combo's
+# userData; ExportPanel._default_output_dir is the only place this is used.
+_EXPORT_FORMAT_TAGS = {"poses": "colmap", "frames_masks": "postshot", "realityscan": "realityscan"}
+_EXPORT_BUTTON_LABELS = {
+    "poses": "Export for Postshot",
+    "frames_masks": "Export for Postshot",
+    "realityscan": "Export for RealityScan",
+}
+
+
 class ExportPanel(QWidget):
-    """Bundles a completed SfM run's poses/images/masks for import into
-    Postshot (or any other COLMAP-based external trainer) -- see
-    vine360.export.postshot's module docstring and docs/adr/0018 for
-    exactly what's copied/renamed and why, and what's still unverified
-    (no real Postshot install is available here)."""
+    """Bundles a completed SfM run's poses/images/masks (or, for the two
+    images-only modes, just images+masks) for import into Postshot,
+    RealityScan, or any other COLMAP-based/images-only external trainer
+    -- see vine360.export.postshot's module docstring and docs/adr/0018/
+    0028 for exactly what's copied/renamed and why, and what's still
+    unverified (no real Postshot or RealityScan install is available
+    here)."""
 
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
+        self._source_view_counts: dict[str, int] = {}
         layout = QVBoxLayout(self)
         _panel_header(
             "Export",
-            "Bundle a Pose estimation run's poses, images and masks for Postshot (or another "
-            "COLMAP-based external trainer). Verified against Postshot's published docs, not against "
-            "a real install -- see docs/adr/0018.",
+            "Bundle a Pose estimation run's poses, images and masks for Postshot, RealityScan, or "
+            "another COLMAP-based/images-only external trainer. Verified against each tool's "
+            "published docs, not against a real install -- see docs/adr/0018 and docs/adr/0028.",
             layout,
         )
 
@@ -1852,10 +2399,24 @@ class ExportPanel(QWidget):
         self.mode_combo.addItem(
             "Images + masks only (let Postshot run its own pose estimation)", userData="frames_masks"
         )
+        self.mode_combo.addItem(
+            "RealityScan images + masks (let RealityScan run its own pose estimation)",
+            userData="realityscan",
+        )
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow("Export:", self.mode_combo)
         self.run_combo = QComboBox()
         form.addRow("SfM run:", self.run_combo)
+        self.source_combo = QComboBox()
+        self.source_combo.setToolTip(
+            "Only applies to \"Images + masks only\" -- the poses mode always exports whatever "
+            "the chosen SfM run covers, with no per-source filter."
+        )
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        form.addRow("Source:", self.source_combo)
+        self.priors_checkbox = QCheckBox("Include camera priors CSV (from vine360's own SfM run)")
+        self.priors_checkbox.toggled.connect(self._on_priors_toggled)
+        form.addRow("Priors:", self.priors_checkbox)
         controls_layout.addLayout(form)
 
         self.mode_note = QLabel("")
@@ -1864,6 +2425,11 @@ class ExportPanel(QWidget):
         controls_layout.addWidget(self.mode_note)
 
         self.output_dir: Path | None = None
+        # Whether the output folder is a manually-chosen pin (stays put
+        # across mode/source changes) or a live suggested default (which
+        # _update_output_dir keeps recomputing as mode/source change) --
+        # see _on_choose_output_dir.
+        self._output_dir_user_chosen = False
         output_row = QHBoxLayout()
         self.output_label = QLabel("No output folder chosen.")
         self.output_label.setWordWrap(True)
@@ -1873,19 +2439,15 @@ class ExportPanel(QWidget):
         output_row.addWidget(choose_btn)
         controls_layout.addLayout(output_row)
 
+        export_btn_row = QHBoxLayout()
         self.export_btn = QPushButton("Export for Postshot")
         self.export_btn.clicked.connect(self._on_export)
-        controls_layout.addWidget(self.export_btn)
-
-        self.repair_btn = QPushButton("Repair runs from before this feature (one-time)")
-        self.repair_btn.setToolTip(
-            "Some SfM runs made before the Export feature was added recorded the wrong model "
-            "directory. This looks for the real one on disk and fixes the record where it can -- "
-            "see docs/adr/0019. A run whose files were later overwritten by a newer run can't be "
-            "recovered this way; re-run Pose estimation for that one instead."
-        )
-        self.repair_btn.clicked.connect(self._on_repair)
-        controls_layout.addWidget(self.repair_btn)
+        export_btn_row.addWidget(self.export_btn)
+        self.queue_btn = QPushButton("Add to Queue")
+        self.queue_btn.setToolTip("Adds this exact configuration as a queued job instead of running it now.")
+        self.queue_btn.clicked.connect(self._on_add_to_queue)
+        export_btn_row.addWidget(self.queue_btn)
+        controls_layout.addLayout(export_btn_row)
 
         self.progress_area = ProgressArea()
         controls_layout.addWidget(self.progress_area)
@@ -1899,6 +2461,9 @@ class ExportPanel(QWidget):
         layout.addStretch()
         self._on_mode_changed()  # set initial note text
 
+        if self.state.queue_manager is not None:
+            self.state.queue_manager.queue_changed.connect(self._refresh_enabled)
+
     def on_project_changed(self) -> None:
         self.on_shown()
 
@@ -1908,10 +2473,8 @@ class ExportPanel(QWidget):
         self.controls.setVisible(have_project)
         if have_project:
             self._refresh_runs()
-            if self.output_dir is None:
-                self.output_dir = self.state.project_root / "exports" / "postshot"
-                self.output_label.setText(str(self.output_dir))
-            self._on_mode_changed()
+            self._refresh_sources()
+            self._on_mode_changed()  # also updates output_dir as a side effect
 
     def _refresh_runs(self) -> None:
         self.run_combo.clear()
@@ -1927,13 +2490,64 @@ class ExportPanel(QWidget):
             self.run_combo.addItem(label, userData=run_id)
         self._refresh_enabled()
 
+    def _refresh_sources(self) -> None:
+        """"All sources" (the default, matching this panel's original
+        behavior) plus every video source, whether or not it has
+        projected views yet -- broadened from an INNER JOIN so a
+        not-yet-projected source is still selectable (so it can be added
+        to the queue, which auto-inserts the missing Projection job
+        ahead of it); _refresh_enabled, not this method, is what actually
+        gates "Export for Postshot"/"Export for RealityScan" on the
+        selected source's view count."""
+        current = self.source_combo.currentData()
+        self.source_combo.blockSignals(True)
+        self.source_combo.clear()
+        self.source_combo.addItem("All sources", userData=None)
+        rows = self.state.conn.execute(
+            "SELECT s.source_id, s.path, COUNT(DISTINCT v.view_id) AS view_count "
+            "FROM sources s LEFT JOIN frames f ON f.source_id = s.source_id "
+            "LEFT JOIN views v ON v.frame_id = f.frame_id "
+            "WHERE s.media_type = 'video' GROUP BY s.source_id ORDER BY s.rowid"
+        ).fetchall()
+        self._source_view_counts = {}
+        for source_id, path, view_count in rows:
+            self._source_view_counts[source_id] = view_count
+            existing = f"{view_count} views" if view_count else "no views yet"
+            self.source_combo.addItem(f"{Path(path).name} ({source_id[:8]}) — {existing}", userData=source_id)
+        index = self.source_combo.findData(current)
+        self.source_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.source_combo.blockSignals(False)
+
+    def _on_source_changed(self) -> None:
+        self._exported = False  # a source change means the last export no longer matches this configuration
+        self._update_output_dir()
+        self._refresh_enabled()
+
+    def _on_priors_toggled(self) -> None:
+        self._exported = False  # a priors toggle means the last export no longer matches this configuration
+        self._refresh_enabled()
+
     def _on_mode_changed(self) -> None:
         mode = self.mode_combo.currentData()
         poses_mode = mode == "poses"
         self.run_combo.setEnabled(poses_mode)
+        self.source_combo.setEnabled(not poses_mode)
+        self.export_btn.setText(_EXPORT_BUTTON_LABELS[mode])
         if poses_mode:
             self.mode_note.setText(
-                "Imports vine360's own already-computed COLMAP reconstruction into Postshot."
+                "Imports vine360's own already-computed COLMAP reconstruction into Postshot. Always "
+                "exports whatever the chosen SfM run covers -- the Source selector above doesn't "
+                "filter this mode (see docs/adr/0026)."
+            )
+        elif mode == "realityscan":
+            self.mode_note.setText(
+                "No pose data is exported -- RealityScan runs its own pose estimation on these "
+                "images instead. Only the six-face projection images are used, with masks written "
+                "next to each image using RealityScan's own naming convention (not Postshot's). "
+                "Unverified against a real RealityScan install -- see docs/adr/0028. If vine360's own "
+                "SfM has already run, the \"Include camera priors\" option below can also write a "
+                "position-only CSV to help RealityScan's alignment on repetitive/self-similar scenes "
+                "(e.g. vineyard rows) -- see docs/adr/0033."
             )
         else:
             self.mode_note.setText(
@@ -1943,15 +2557,96 @@ class ExportPanel(QWidget):
                 "for this mode."
             )
         self._exported = False  # a mode change means the last export no longer matches this configuration
+        self._update_output_dir()
         self._refresh_enabled()
 
+    def _update_output_dir(self) -> None:
+        """Keeps output_dir following the mode/source selection as a live
+        suggested default, unless the user has manually pinned a folder
+        via "Choose output folder…" (see _on_choose_output_dir). A no-op
+        before a project is open -- _on_mode_changed (which calls this)
+        runs once unconditionally from __init__, before state.project_root
+        is set."""
+        if self._output_dir_user_chosen or self.state.project_root is None:
+            return
+        self.output_dir = self._default_output_dir()
+        self.output_label.setText(str(self.output_dir))
+
+    def _default_output_dir(self) -> Path:
+        mode = self.mode_combo.currentData()
+        return self.state.project_root / "exports" / self._capture_folder_name(mode) / _EXPORT_FORMAT_TAGS[mode]
+
+    def _capture_folder_name(self, mode: str) -> str:
+        """The <capture> half of exports/<capture>/<format>/ (docs/adr/
+        0028). The two images-only modes are source-filterable (ADR
+        0026): a chosen source gets its own folder, "All sources" gets
+        "all". Poses mode has no source filter of its own, but if the
+        selected run was scoped to one source anyway (the native-
+        equirectangular engine records its source_id in the run's
+        config, the same field export_for_postshot itself reads), default
+        to that source's folder too -- a nicer default path only, not a
+        new filter; still "all" for a project-wide six-face-projections
+        run or when no run is selected yet."""
+        if mode == "poses":
+            run_id = self.run_combo.currentData()
+            if run_id and self.state.conn is not None:
+                row = self.state.conn.execute(
+                    "SELECT config FROM sfm_runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if row:
+                    config = json.loads(row[0])
+                    if config.get("image_source") == "frames" and config.get("source_id"):
+                        return self._source_folder_name(config["source_id"])
+            return "all"
+        source_id = self.source_combo.currentData()
+        return self._source_folder_name(source_id) if source_id else "all"
+
+    def _source_folder_name(self, source_id: str) -> str:
+        """A filesystem-safe folder name for a per-source export default
+        -- the source's own file stem where available (more useful than a
+        bare id at a glance), falling back to the id if sanitizing leaves
+        nothing usable."""
+        row = self.state.conn.execute("SELECT path FROM sources WHERE source_id = ?", (source_id,)).fetchone()
+        stem = Path(row[0]).stem if row else ""
+        safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in stem)
+        return safe or source_id[:8]
+
     def _refresh_enabled(self) -> None:
+        busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
         mode = self.mode_combo.currentData()
         if mode == "poses":
             configured = self.run_combo.count() > 0 and self.output_dir is not None
+            has_prereq = True
         else:
-            configured = self.output_dir is not None
-        self.export_btn.setEnabled(configured)
+            source_id = self.source_combo.currentData()
+            has_prereq = source_id is None or self._source_view_counts.get(source_id, 0) > 0
+            configured = self.output_dir is not None and has_prereq
+        self.export_btn.setEnabled(configured and not busy)
+        self.export_btn.setToolTip(
+            ""
+            if has_prereq
+            else 'This source has no projected views yet -- use "Add to Queue" instead; it will queue '
+            "projection automatically ahead of this export job."
+        )
+        self.queue_btn.setEnabled(self.output_dir is not None)
+
+        if mode == "realityscan":
+            priors_available = self.state.conn is not None and realityscan_priors_available(
+                self.state.conn, source_id=self.source_combo.currentData()
+            )
+            self.priors_checkbox.setEnabled(priors_available and not busy)
+            if not priors_available and self.priors_checkbox.isChecked():
+                self.priors_checkbox.setChecked(False)
+            self.priors_checkbox.setToolTip(
+                ""
+                if priors_available
+                else "No usable vine360 SfM run found for this source selection -- run Pose estimation first."
+            )
+        else:
+            self.priors_checkbox.setEnabled(False)
+            if self.priors_checkbox.isChecked():
+                self.priors_checkbox.setChecked(False)
+
         self.stage_indicator.set_stages(
             [
                 DONE if configured else ACTIVE,
@@ -1964,14 +2659,34 @@ class ExportPanel(QWidget):
         directory = QFileDialog.getExistingDirectory(self, "Choose a folder to export into", default)
         if directory:
             self.output_dir = Path(directory)
+            self._output_dir_user_chosen = True  # pin it -- stop following mode/source changes
             self.output_label.setText(str(self.output_dir))
             self._exported = False  # a new output folder means the last export no longer matches it
             self._refresh_enabled()
 
+    def _on_add_to_queue(self) -> None:
+        if self.output_dir is None:
+            QMessageBox.warning(self, "No output folder", "Choose an output folder first.")
+            return
+        mode = self.mode_combo.currentData()
+        source_id = self.source_combo.currentData() if mode != "poses" else None
+        params = {"mode": mode, "output_dir": str(self.output_dir), "source_id": source_id}
+        if mode == "realityscan":
+            params["include_camera_priors"] = self.priors_checkbox.isChecked()
+        if mode == "poses":
+            params["run_id"] = self.run_combo.currentData()  # None -> resolved lazily at run time
+            label = f"Export — poses + images + masks → {self.output_dir.name}"
+        else:
+            source_text = self.source_combo.currentText() if source_id else "all sources"
+            mode_text = "RealityScan images + masks" if mode == "realityscan" else "images + masks only"
+            label = f"Export — {mode_text} ({source_text}) → {self.output_dir.name}"
+        self.state.queue_manager.add_job(QUEUE_STAGE_EXPORT, None, params, label)
+
     def _on_export(self) -> None:
         self.export_btn.setEnabled(False)
         self.progress_area.start("Exporting…")
-        if self.mode_combo.currentData() == "poses":
+        mode = self.mode_combo.currentData()
+        if mode == "poses":
             run_in_background(
                 self,
                 _export_postshot_worker,
@@ -1982,19 +2697,31 @@ class ExportPanel(QWidget):
                 on_error=self._on_export_error,
                 on_progress=self.progress_area.update_progress,
             )
+        elif mode == "realityscan":
+            run_in_background(
+                self,
+                _export_realityscan_worker,
+                self.state.project_root,
+                self.output_dir,
+                self.source_combo.currentData(),
+                self.priors_checkbox.isChecked(),
+                on_success=self._on_export_success,
+                on_error=self._on_export_error,
+                on_progress=self.progress_area.update_progress,
+            )
         else:
             run_in_background(
                 self,
                 _export_frames_and_masks_worker,
                 self.state.project_root,
                 self.output_dir,
+                self.source_combo.currentData(),
                 on_success=self._on_export_success,
                 on_error=self._on_export_error,
                 on_progress=self.progress_area.update_progress,
             )
 
     def _on_export_success(self, result) -> None:
-        self.export_btn.setEnabled(True)
         self._exported = True
         self._refresh_enabled()
         self.progress_area.finish("Export complete.")
@@ -2010,53 +2737,23 @@ class ExportPanel(QWidget):
             text += f", then drop the files under {result.masks_dir} into the Image Masks list."
         else:
             text += " (no masks were built)."
+        if result.priors_path is not None:
+            text += (
+                f"\nCamera priors: {result.num_priors} position(s) written to {result.priors_path} -- "
+                "in RealityScan: WORKFLOW tab → Import Metadata → Trajectory."
+            )
         if result.warnings:
             text += "\n⚠ " + "; ".join(result.warnings)
         self.result_label.setText(text)
         self.state.notify_change()
 
     def _on_export_error(self, exc: Exception) -> None:
-        self.export_btn.setEnabled(True)
+        self._refresh_enabled()
         self.progress_area.finish("")
         if isinstance(exc, PostshotExportError):
             QMessageBox.warning(self, "Export failed", str(exc))
         else:
             QMessageBox.critical(self, "Unexpected error exporting", f"{type(exc).__name__}: {exc}")
-
-    def _on_repair(self) -> None:
-        self.repair_btn.setEnabled(False)
-        self.progress_area.start("Checking past runs…")
-        run_in_background(
-            self,
-            _repair_selected_model_worker,
-            self.state.project_root,
-            on_success=self._on_repair_success,
-            on_error=self._on_repair_error,
-        )
-
-    def _on_repair_success(self, result) -> None:
-        self.repair_btn.setEnabled(True)
-        self.progress_area.finish("Done.")
-        lines = []
-        if result.fixed:
-            lines.append(f"Fixed {len(result.fixed)} run(s): {', '.join(result.fixed)}.")
-        if result.already_fine:
-            lines.append(f"{len(result.already_fine)} run(s) were already fine.")
-        if result.unrecoverable:
-            lines.append(
-                f"{len(result.unrecoverable)} run(s) couldn't be recovered (their files were "
-                "overwritten by a later run) -- re-run Pose estimation for those."
-            )
-        if not lines:
-            lines.append("No SfM runs found.")
-        QMessageBox.information(self, "Repair complete", "\n".join(lines))
-        self._refresh_runs()
-
-    def _on_repair_error(self, exc: Exception) -> None:
-        self.repair_btn.setEnabled(True)
-        self.progress_area.finish("")
-        QMessageBox.critical(self, "Unexpected error repairing", f"{type(exc).__name__}: {exc}")
-
 
 class Vine360MainWindow(QMainWindow):
     def __init__(self):
@@ -2064,6 +2761,8 @@ class Vine360MainWindow(QMainWindow):
         self.setWindowTitle("Vineyard 360 3DGS")
         self.resize(920, 660)
         self.state = AppState()
+        self.queue_manager = QueueManager(self.state)
+        self.state.queue_manager = self.queue_manager
 
         self.sidebar = QListWidget()
         self.sidebar.setFixedWidth(200)
@@ -2083,6 +2782,7 @@ class Vine360MainWindow(QMainWindow):
         project_panel.project_changed.connect(masks_panel.on_project_changed)
         project_panel.project_changed.connect(pose_panel.on_project_changed)
         project_panel.project_changed.connect(export_panel.on_project_changed)
+        project_panel.project_changed.connect(self._on_project_changed_for_queue)
 
         self._panels = [
             project_panel,
@@ -2091,8 +2791,6 @@ class Vine360MainWindow(QMainWindow):
             projection_panel,
             masks_panel,
             pose_panel,
-            build_training_preset_panel(),
-            build_training_monitor_panel(),
             export_panel,
         ]
         labels = [
@@ -2102,8 +2800,6 @@ class Vine360MainWindow(QMainWindow):
             "Projection",
             "Masks",
             "Pose estimation",
-            "Training preset",
-            "Training monitor",
             "Export",
         ]
         self._sidebar_items: list[QListWidgetItem] = []
@@ -2123,8 +2819,18 @@ class Vine360MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         self.setCentralWidget(splitter)
 
+        self.queue_panel = QueuePanel(self.state)
+        self.queue_panel.bind_manager(self.queue_manager)
+        queue_dock = QDockWidget("Queue", self)
+        queue_dock.setWidget(self.queue_panel)
+        queue_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
+        self.addDockWidget(Qt.RightDockWidgetArea, queue_dock)
+
         self.state.notify_change = self.refresh_stage_statuses
         self.refresh_stage_statuses()
+
+    def _on_project_changed_for_queue(self) -> None:
+        self.queue_manager.load()
 
     def refresh_stage_statuses(self) -> None:
         self._sidebar_items[STAGE_PROJECT].setIcon(

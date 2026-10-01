@@ -15,6 +15,7 @@ import json
 import shutil
 import sqlite3
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 from vine360.config import ExtractionSettings
@@ -29,18 +30,22 @@ class FrameExtractionError(Exception):
     pass
 
 
-def build_frame_extraction_command(source: Path, output_pattern: Path, interval_seconds: float) -> list[str]:
-    return [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(source),
-        "-vf",
-        f"fps=1/{interval_seconds}",
-        "-vsync",
-        "0",
-        str(output_pattern),
-    ]
+def build_frame_extraction_command(
+    source: Path,
+    output_pattern: Path,
+    interval_seconds: float,
+    *,
+    start_time: float | None = None,
+    duration_limit: float | None = None,
+) -> list[str]:
+    command = ["ffmpeg", "-y"]
+    if start_time:
+        command += ["-ss", str(start_time)]
+    command += ["-i", str(source)]
+    if duration_limit is not None:
+        command += ["-t", str(duration_limit)]
+    command += ["-vf", f"fps=1/{interval_seconds}", "-vsync", "0", str(output_pattern)]
+    return command
 
 
 def build_thumbnail_command(frame: Path, thumbnail: Path, width: int = THUMBNAIL_WIDTH) -> list[str]:
@@ -72,6 +77,40 @@ def resolve_interval_seconds(
             mode="count", interval_seconds=interval, requested_count=target_count
         )
     raise ValueError("one of interval_seconds or target_count is required")
+
+
+def resolve_time_range(
+    duration_seconds: float, *, start_time: float | None, end_time: float | None
+) -> tuple[float, float | None]:
+    """Validates user-facing absolute start/end (seconds from the start of
+    the source file, either/both may be None meaning "from the start"/"to
+    the end") and converts them into ffmpeg-shaped (effective_start,
+    duration_limit) -- duration_limit is None when end_time is None
+    (extract to EOF). Maps onto ffmpeg's own -ss <start> (input option) +
+    -t <duration> (output option); -to is deliberately avoided since its
+    meaning becomes range-relative, not absolute, once -ss has already
+    been given as an input option (the output timeline resets to 0) --
+    confusing to reason about and to test.
+
+    end_time beyond the real duration is clamped, not rejected -- ffmpeg
+    would just run to EOF anyway, and erroring on "asked for slightly
+    more than exists" would be unfriendly UX for a value a caller derived
+    from a slightly-stale duration estimate.
+    """
+    start = start_time if start_time is not None else 0.0
+    if start < 0:
+        raise ValueError("start_time must be >= 0")
+    if start >= duration_seconds:
+        raise ValueError(f"start_time ({start}) must be less than the source duration ({duration_seconds})")
+
+    if end_time is None:
+        return start, None
+
+    end = min(end_time, duration_seconds)
+    if end <= start:
+        raise ValueError(f"end_time ({end_time}) must be greater than start_time ({start})")
+
+    return start, end - start
 
 
 def clear_frames_for_source(conn: sqlite3.Connection, project_root: Path, source_id: str) -> None:
@@ -142,6 +181,9 @@ def extract_frames(
     *,
     interval_seconds: float | None = None,
     target_count: int | None = None,
+    start_time: float | None = None,
+    end_time: float | None = None,
+    generate_thumbnails: bool = True,
     progress_callback=None,
     poll_interval_seconds: float = 0.5,
 ) -> list[Frame]:
@@ -158,7 +200,22 @@ def extract_frames(
     implemented; a re-run still clears and starts over via
     clear_frames_for_source. poll_interval_seconds is a constructor knob
     mainly so tests can shrink it well below a real ffmpeg call's
-    duration."""
+    duration.
+
+    start_time/end_time optionally restrict extraction to a sub-range of
+    the source (seconds from the start of the file; see
+    resolve_time_range). source_time on returned Frames is always
+    absolute -- offset by start_time -- never range-relative, since every
+    downstream consumer relies on it meaning "seconds from the start of
+    the original source file".
+
+    generate_thumbnails, when False, skips the per-frame thumbnail pass
+    entirely -- it's currently the slow part of this function (see above)
+    for no benefit right now, since nothing in the app reads
+    frames/<source_id>/thumbs/ back; PreviewGallery loads full-resolution
+    view/mask images directly and lets Qt scale them in-memory instead.
+    Defaults to True to keep existing behavior unchanged for any caller
+    that doesn't pass it."""
     notify = progress_callback or (lambda *a: None)
 
     source = get_source(conn, source_id)
@@ -171,21 +228,28 @@ def extract_frames(
     if not duration:
         raise FrameExtractionError(f"source {source_id} has no known duration; cannot extract frames")
 
+    range_start, duration_limit = resolve_time_range(duration, start_time=start_time, end_time=end_time)
+    range_duration = duration_limit if duration_limit is not None else duration - range_start
+
     interval, extraction_settings = resolve_interval_seconds(
-        duration, interval_seconds=interval_seconds, target_count=target_count
+        range_duration, interval_seconds=interval_seconds, target_count=target_count
     )
+    extraction_settings = replace(extraction_settings, start_time_seconds=start_time, end_time_seconds=end_time)
 
     clear_frames_for_source(conn, project_root, source_id)
     output_dir = Path(project_root) / "frames" / source_id
     output_dir.mkdir(parents=True, exist_ok=True)
     thumbs_dir = output_dir / "thumbs"
-    thumbs_dir.mkdir(parents=True, exist_ok=True)
+    if generate_thumbnails:
+        thumbs_dir.mkdir(parents=True, exist_ok=True)
 
     notify("Extracting raw frames via ffmpeg…", None, None)
     pattern = output_dir / "frame_%06d.png"
-    command = build_frame_extraction_command(Path(source.path), pattern, interval)
+    command = build_frame_extraction_command(
+        Path(source.path), pattern, interval, start_time=range_start, duration_limit=duration_limit
+    )
 
-    expected_frame_count = max(1, round(duration / interval))
+    expected_frame_count = max(1, round(range_duration / interval))
     stop_polling = threading.Event()
     poller = threading.Thread(
         target=_poll_output_frame_count,
@@ -208,18 +272,21 @@ def extract_frames(
 
     frames: list[Frame] = []
     for index, frame_path in enumerate(frame_files):
-        notify(f"Generating thumbnails ({index + 1}/{len(frame_files)})…", index + 1, len(frame_files))
-        thumb_path = thumbs_dir / f"{frame_path.stem}.jpg"
-        thumb_result = runner.run(build_thumbnail_command(frame_path, thumb_path))
-        if not thumb_result.ok:
-            raise FrameExtractionError(
-                f"ffmpeg failed generating thumbnail for {frame_path}: {thumb_result.stderr.strip()}"
-            )
+        if generate_thumbnails:
+            notify(f"Generating thumbnails ({index + 1}/{len(frame_files)})…", index + 1, len(frame_files))
+            thumb_path = thumbs_dir / f"{frame_path.stem}.jpg"
+            thumb_result = runner.run(build_thumbnail_command(frame_path, thumb_path))
+            if not thumb_result.ok:
+                raise FrameExtractionError(
+                    f"ffmpeg failed generating thumbnail for {frame_path}: {thumb_result.stderr.strip()}"
+                )
+        else:
+            notify(f"Recording frames ({index + 1}/{len(frame_files)})…", index + 1, len(frame_files))
 
         frame = Frame(
             frame_id=f"{source_id}:{index:06d}",
             source_id=source_id,
-            source_time=index * interval,
+            source_time=range_start + index * interval,
             extraction_settings=extraction_settings.to_dict(),
             path=str(frame_path.relative_to(project_root)),
             checksum=sha256_file(frame_path),

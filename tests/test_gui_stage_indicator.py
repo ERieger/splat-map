@@ -17,7 +17,18 @@ pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
 
 from vine360.config import CaptureMode
-from vine360.gui.main_window import ACTIVE, DONE, PENDING, AppState, ExportPanel, MasksPanel, StageIndicator
+from vine360.gui.main_window import (
+    ACTIVE,
+    DONE,
+    ENGINE_COLMAP_EQUIRECTANGULAR,
+    PENDING,
+    AppState,
+    ExportPanel,
+    MasksPanel,
+    PoseEstimationPanel,
+    ProjectionPanel,
+    StageIndicator,
+)
 from vine360.masking.build import build_mask_for_view, set_view_flagged
 from vine360.project import create_project, open_index_db
 
@@ -61,6 +72,25 @@ def _insert_view(conn, root, view_id, frame_id):
         "INSERT INTO views (view_id, frame_id, projection_id, width, height, intrinsics, "
         "fixed_rotation, image_path) VALUES (?, ?, 'p', 64, 64, '{}', '{}', ?)",
         (view_id, frame_id, str(image_path.relative_to(root))),
+    )
+    conn.commit()
+
+
+def _insert_source_only(conn, source_id: str) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO sources (source_id, path, checksum, media_type, projection, width, height, "
+        "timestamps, capture_group) VALUES (?, ?, 'deadbeef', 'video', 'equirectangular', 64, 32, '{}', NULL)",
+        (source_id, f"/{source_id}.mp4"),
+    )
+    conn.commit()
+
+
+def _insert_frames_only(conn, source_id: str, frame_id: str) -> None:
+    _insert_source_only(conn, source_id)
+    conn.execute(
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
+        "VALUES (?, ?, 0.0, '{}', 'x', 'y')",
+        (frame_id, source_id),
     )
     conn.commit()
 
@@ -130,3 +160,112 @@ def test_export_panel_stage_indicator_progression(qapp, project):
     panel._exported = False
     panel._refresh_enabled()
     assert panel.stage_indicator.statuses[1] == ACTIVE, "changing configuration should un-mark Export as done"
+
+
+def test_export_panel_button_label_follows_the_selected_mode(qapp, project):
+    """Real bug: export_btn's text was set once at construction
+    ("Export for Postshot") and never updated -- switching to RealityScan
+    mode still showed "Export for Postshot"."""
+    root, conn = project
+    state = AppState()
+    state.project_root = root
+    state.conn = conn
+    state.notify_change = lambda: None
+    panel = ExportPanel(state)
+    panel.on_shown()
+
+    assert panel.export_btn.text() == "Export for Postshot"  # poses mode, index 0
+    panel.mode_combo.setCurrentIndex(1)  # frames_masks
+    assert panel.export_btn.text() == "Export for Postshot"
+    panel.mode_combo.setCurrentIndex(2)  # realityscan
+    assert panel.export_btn.text() == "Export for RealityScan"
+
+
+def test_projection_panel_lists_a_source_with_no_frames_and_disables_run_now(qapp, project):
+    """Real bug: refresh_sources used an INNER JOIN on frames, so a
+    source with zero frames never appeared in the combo at all -- making
+    it impossible to select it and use "Add to Queue" to auto-queue
+    frame extraction ahead of a projection job."""
+    root, conn = project
+    _insert_source_only(conn, "s1")
+    state = AppState()
+    state.project_root = root
+    state.conn = conn
+    state.notify_change = lambda: None
+    panel = ProjectionPanel(state)
+    panel.on_shown()
+
+    assert panel.source_combo.count() == 1
+    assert panel.generate_btn.isEnabled() is False
+    assert panel.queue_btn.isEnabled() is True
+
+
+def test_projection_panel_enables_run_now_once_the_selected_source_has_frames(qapp, project):
+    root, conn = project
+    _insert_frames_only(conn, "s1", "frame-1")
+    state = AppState()
+    state.project_root = root
+    state.conn = conn
+    state.notify_change = lambda: None
+    panel = ProjectionPanel(state)
+    panel.on_shown()
+
+    assert panel.source_combo.count() == 1
+    assert panel.generate_btn.isEnabled() is True
+
+
+def test_masks_panel_lists_a_source_with_frames_but_no_views_and_disables_build(qapp, project):
+    """Same bug as Projection's, one stage later: MasksPanel's combo used
+    a double INNER JOIN (frames, views), hiding a source that has frames
+    but no projected views yet."""
+    root, conn = project
+    _insert_frames_only(conn, "s1", "frame-1")
+    state = AppState()
+    state.project_root = root
+    state.conn = conn
+    state.notify_change = lambda: None
+    panel = MasksPanel(state)
+    panel.on_shown()
+
+    assert panel.source_combo.count() == 1
+    assert panel.build_btn.isEnabled() is False
+    assert panel.queue_btn.isEnabled() is True
+
+
+def test_pose_estimation_panel_disables_run_for_a_selected_source_with_no_frames(qapp, project):
+    root, conn = project
+    _insert_source_only(conn, "s1")
+    state = AppState()
+    state.project_root = root
+    state.conn = conn
+    state.notify_change = lambda: None
+    panel = PoseEstimationPanel(state)
+    panel.on_shown()
+    index = panel.engine_combo.findData(ENGINE_COLMAP_EQUIRECTANGULAR)
+    panel.engine_combo.setCurrentIndex(index)
+
+    assert panel.source_combo.count() == 1
+    assert panel.run_btn.isEnabled() is False
+
+
+def test_export_panel_frames_masks_mode_disables_export_for_a_selected_source_with_no_views(qapp, project):
+    root, conn = project
+    _insert_frames_only(conn, "s1", "frame-1")
+    state = AppState()
+    state.project_root = root
+    state.conn = conn
+    state.notify_change = lambda: None
+    panel = ExportPanel(state)
+    panel.mode_combo.setCurrentIndex(1)  # frames_masks
+    panel.on_shown()
+
+    assert panel.export_btn.isEnabled() is True, "default 'All sources' selection stays allowed"
+
+    index = panel.source_combo.findData("s1")
+    assert index >= 0, "the zero-view source must still be selectable"
+    panel.source_combo.setCurrentIndex(index)
+
+    assert panel.export_btn.isEnabled() is False
+    assert panel.queue_btn.isEnabled() is True
+
+

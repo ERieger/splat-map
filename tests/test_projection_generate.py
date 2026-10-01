@@ -6,8 +6,10 @@ from PIL import Image
 
 from vine360.config import CaptureMode
 from vine360.project import create_project, open_index_db
+from vine360.projection.cubemap import six_face_preset
 from vine360.projection.generate import (
     ProjectionGenerationError,
+    _render_and_save_frame_views,
     generate_views_for_frame,
     generate_views_for_source,
 )
@@ -132,3 +134,58 @@ def test_generate_views_for_source_no_frames_raises(project):
     conn.commit()
     with pytest.raises(ProjectionGenerationError):
         generate_views_for_source(conn, root, "s1")
+
+
+def test_render_and_save_frame_views_writes_files_and_returns_views(project):
+    """Direct test of the pure, connection-free function that runs inside
+    a ProcessPoolExecutor worker for the parallel path -- no conn, no
+    process pool, just the render+save logic itself."""
+    root, conn = project
+    _source_id, frame_id = _insert_fake_source_and_frame(conn, root)
+    equirect_relpath = conn.execute("SELECT path FROM frames WHERE frame_id = ?", (frame_id,)).fetchone()[0]
+    faces = six_face_preset(face_size=64, face_names=["front", "up"])
+
+    views = _render_and_save_frame_views(root, frame_id, equirect_relpath, faces)
+
+    assert {v.view_id for v in views} == {f"{frame_id}:front", f"{frame_id}:up"}
+    for view in views:
+        assert (root / view.image_path).exists()
+        assert view.frame_id == frame_id
+        assert view.projection_id == "six-face"
+
+
+def test_generate_views_for_source_parallel_matches_sequential(project):
+    root, conn = project
+    source_id, _frame_id_1 = _insert_fake_source_and_frame(conn, root, frame_id="frame-1", source_id="source-1")
+    conn.execute(
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
+        "VALUES ('frame-2', ?, 1.0, '{}', ?, 'aa11bb22')",
+        (source_id, f"frames/{source_id}/frame_000001.png"),
+    )
+    conn.commit()
+
+    views = generate_views_for_source(conn, root, source_id, face_size=64, max_workers=2)
+
+    assert len(views) == 8  # 2 frames x 4 faces
+    expected_view_ids = {f"frame-1:{name}" for name in ("front", "right", "back", "left")} | {
+        f"frame-2:{name}" for name in ("front", "right", "back", "left")
+    }
+    assert {v.view_id for v in views} == expected_view_ids
+    for view in views:
+        assert (root / view.image_path).exists()
+
+    row_count = conn.execute("SELECT COUNT(*) FROM views WHERE frame_id IN ('frame-1', 'frame-2')").fetchone()[0]
+    assert row_count == 8
+
+
+def test_generate_views_for_source_single_frame_ignores_max_workers(project):
+    """A 1-frame source should transparently stay on the sequential path
+    even when max_workers is requested -- no benefit to a process pool
+    for a single unit of work."""
+    root, conn = project
+    source_id, frame_id = _insert_fake_source_and_frame(conn, root)
+
+    views = generate_views_for_source(conn, root, source_id, face_size=64, max_workers=4)
+
+    assert len(views) == 4  # 1 frame x 4 default faces
+    assert {v.view_id for v in views} == {f"{frame_id}:{name}" for name in ("front", "right", "back", "left")}

@@ -14,8 +14,15 @@ and its extracted frames, never the original file),
 `ingest extract-frames` (deterministic ffmpeg extraction + thumbnails +
 source-frame map; now clears a source's prior frames before re-extracting
 -- see ADR 0011, this was a real "UNIQUE constraint failed" bug found via
-use), `ingest manifest`. The real end-to-end integration test now
-actually runs (previously skipped for lack of ffmpeg) against
+use), `ingest manifest`. `ingest extract-frames` now also accepts
+`--start-time`/`--end-time` (GUI: a "Limit to a time range" checkbox on
+the Frames panel) to sample only a sub-range of a source instead of the
+whole file -- see ADR 0031. It also accepts `--skip-thumbnails` (GUI: a
+"Generate thumbnails" checkbox, on by default) to skip the per-frame
+thumbnail pass -- nothing in the app currently reads
+`frames/<source_id>/thumbs/` back, so this is a real time saver on a
+large source with no loss of function today. The real end-to-end
+integration test now actually runs (previously skipped for lack of ffmpeg) against
 `static-ffmpeg`'s bundled real binaries.
 
 **M2 -- Projection (`vine360/projection/`), fully implemented as library
@@ -39,6 +46,12 @@ code, not yet CLI-wired.**
   tolerance to account for marker-block quantization under bilinear
   resampling, not transform error (see the comment in
   `test_projection_render.py`).
+- `generate_views_for_source` can now render frames in parallel across a
+  capped number of worker processes (`max_workers`, GUI: a "Speed up with
+  parallel processing" checkbox on the Projection panel, on by default) --
+  the first use of `multiprocessing` anywhere in this codebase. Verified
+  for real: 16.3s sequential vs. 9.0s with 4 workers on a 12-frame, 4K
+  synthetic benchmark. See ADR 0032.
 
 **M3 -- Masking (`vine360/masking/`), fully implemented, not yet
 CLI-wired.**
@@ -93,10 +106,12 @@ app going forward: its Project and Import panels are genuinely wired to
 disk, register a real source with ffprobe metadata + checksum + a
 capture-group tag), verified end-to-end with an offscreen smoke test
 (mocked file dialogs, a real synthetic clip, a real add_source call).
-Frames/Projection/Masks/Pose/Training panels show real preset
+Frames/Projection/Masks/Pose panels show real preset
 enums/computed values (e.g. the actual cubemap face count) but their
 action buttons are disabled with an explanatory tooltip -- wiring those
 to actually execute is intentionally deferred (see "Exact next task").
+(Training's two placeholder panels were later removed from the sidebar
+entirely rather than wired up -- see docs/adr/0025.)
 The GUI calls the same typed library functions the CLI calls (not
 CLI-as-subprocess) -- this still satisfies the doc's "every UI action
 maps to a reproducible command" intent, since the action is backed by one
@@ -119,6 +134,32 @@ confirmed for real on `/mnt/e/TEST` (3 of 4 historical runs
 unrecoverable). Fixed going forward (each run gets `sfm/sparse/<run_id>/`
 now) and added `vine360/sfm/repair_selected_model.py` (+ an Export-panel
 button) to recover what's still recoverable from before the fix.
+
+**Queue fixes (ADR 0030).** Three real bugs found using the persisted
+processing queue (ADR 0023) on a live project: Cancel All only relabeled
+pending jobs `SKIPPED` in place instead of actually clearing them, and
+left a running job untouched with no user-visible explanation; and four
+stage panels (Projection, Masks, Pose estimation, Export) populated their
+source dropdowns with an INNER JOIN against the upstream table, silently
+hiding any source that didn't have the prerequisite yet -- so the queue's
+own prerequisite auto-insertion (queuing Masks on a source with no
+projected views yet, auto-queuing Projection ahead of it) was unreachable
+from the GUI. Both fixed; see ADR 0030 for the full design.
+
+**RealityScan camera-priors export (ADR 0033).** While diagnosing a real
+RealityScan export's ground-level vineyard-row footage completely
+failing to register (0/1200 images, vs. 1118/1200 for the same project's
+aerial pass), confirmed against each tool's real published docs that
+RealityScan has a genuine "Camera Priors" pre-alignment feature (no
+Postshot equivalent exists). `export_for_realityscan` can now optionally
+also write a position-only `CameraPriors.csv` alongside the images,
+drawn from vine360's own already-completed SfM run when one exists (GUI:
+an "Include camera priors CSV" checkbox on the Export panel, RealityScan
+mode only) -- for import via RealityScan's own WORKFLOW -> Import
+Metadata -> Trajectory. No pose-composition math needed even for the
+native-equirectangular SfM engine: verified for real that every cube
+face shares its frame's own optical center, so a face's position is
+identical to its frame's registered position.
 
 ## Environment notes (this dev machine)
 
@@ -203,9 +244,11 @@ button) to recover what's still recoverable from before the fix.
   sample data exists (see above); every test and smoke-test run so far
   uses synthetic clips/images, per the standing preference not to run
   multi-GB real files without it being explicitly asked for.
-- Training (preset selection UI, monitor UI) remains untouched --
-  adapter-only, per the explicit standing decision in ADR 0009. Not a gap;
-  the boundary of "wire up to training" was intentional.
+- Training has no GUI presence at all now -- its two placeholder panels
+  (preset selection UI, monitor UI) were removed from the sidebar (ADR
+  0025) rather than left disabled. The library code stays adapter-only,
+  per the standing decision in ADR 0009; wiring a real backend remains
+  future work, not a gap in what shipped here.
 
 ## Exact next task
 
@@ -216,9 +259,10 @@ directions (none started):
    offscreen smoke tests (create -> import -> frames -> projection ->
    masks -> SfM, plus the remove-source/custom-interval/re-extraction
    paths) as real pytest tests instead of ad hoc scripts.
-2. Wire Training for real (backend install + execution), which was
-   explicitly deferred, not attempted, in this pass -- would need to
-   revisit ADR 0009's "adapter only" decision first.
+2. Training is out of the app's scope for now (ADR 0025 removed its GUI
+   panels entirely). Wiring it for real would mean both revisiting ADR
+   0009's "adapter only" decision and re-adding a GUI stage informed by
+   whatever the real backend's actual UI needs turn out to be.
 3. Georeferencing (M8): a GPX-sidecar reader (see ADR 0010) is a better
    first step than the still-unimplemented EXIF/GPS parsing, given real
    sample data already has `.gpx` files.

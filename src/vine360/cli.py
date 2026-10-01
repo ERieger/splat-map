@@ -122,6 +122,9 @@ def cmd_ingest_extract_frames(args: argparse.Namespace) -> int:
             LocalRunner(),
             interval_seconds=args.interval,
             target_count=args.count,
+            start_time=args.start_time,
+            end_time=args.end_time,
+            generate_thumbnails=not args.skip_thumbnails,
         )
     except (FrameExtractionError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -200,6 +203,17 @@ def build_parser() -> argparse.ArgumentParser:
     group = p_extract.add_mutually_exclusive_group(required=True)
     group.add_argument("--interval", type=float, help="seconds between extracted frames")
     group.add_argument("--count", type=int, help="target number of frames")
+    p_extract.add_argument(
+        "--start-time", type=float, default=None, help="seconds from the start of the source to begin extraction at"
+    )
+    p_extract.add_argument(
+        "--end-time", type=float, default=None, help="seconds from the start of the source to stop extraction at"
+    )
+    p_extract.add_argument(
+        "--skip-thumbnails",
+        action="store_true",
+        help="skip generating a thumbnail per extracted frame (currently unused elsewhere in the app)",
+    )
     p_extract.set_defaults(func=cmd_ingest_extract_frames)
 
     p_manifest = ingest_sub.add_parser("manifest", help="write the ingest manifest for a project")

@@ -59,10 +59,14 @@ class ExtractionSettings:
     mode: str  # "interval" or "count"
     interval_seconds: float
     requested_count: int | None = None
+    start_time_seconds: float | None = None
+    end_time_seconds: float | None = None
 
     def to_dict(self) -> dict:
         return {
             "mode": self.mode,
             "interval_seconds": self.interval_seconds,
             "requested_count": self.requested_count,
+            "start_time_seconds": self.start_time_seconds,
+            "end_time_seconds": self.end_time_seconds,
         }
