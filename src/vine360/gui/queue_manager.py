@@ -713,7 +713,7 @@ class QueueManager(QObject):
         elif job.stage == STAGE_POSE:
             fn, args = mw._run_sfm_worker, (
                 project_root, params["image_source"], _params_frame_set_id(params), params["camera_model"],
-                params.get("engine", "pycolmap"),
+                params.get("engine", "pycolmap"), params.get("options"),
             )
         elif job.stage == STAGE_EXPORT:
             output_dir = Path(params["output_dir"])

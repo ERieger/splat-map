@@ -28,6 +28,14 @@ from pathlib import Path
 
 import pycolmap
 
+from vine360.sfm.options import (
+    MAPPER_GLOBAL,
+    MATCHER_EXHAUSTIVE,
+    MATCHER_SEQUENTIAL,
+    MATCHER_VOCAB_TREE,
+    SfmConfig,
+)
+
 
 class SfmError(Exception):
     pass
@@ -36,12 +44,6 @@ class SfmError(Exception):
 class SfmRegistrationError(SfmError):
     """No reconstruction was produced at all (handover doc, section 4, step
     6 "Validate": "Reject or warn on ... disconnected models")."""
-
-
-@dataclass(frozen=True)
-class SfmConfig:
-    camera_model: str = "SIMPLE_RADIAL"
-    sequential_overlap: int = 10  # images matched forward/back in sequence
 
 
 @dataclass
@@ -107,8 +109,9 @@ def extract_and_match(
     image_names: list[str] | None = None,
     progress_callback=None,
 ) -> None:
-    """Feature extraction (masked, if mask_dir is given) plus sequential
-    matching ("match temporally near frames first" -- section 4, step 5).
+    """Feature extraction (masked, if mask_dir is given) plus matching
+    (sequential by default -- "match temporally near frames first",
+    section 4, step 5 -- or exhaustive / vocabulary-tree, config.matcher).
     Separated from mapping so it's independently testable: extraction and
     matching are meaningful (and were tested against real overlapping
     renders, including the masking integration) even for an image set that
@@ -117,20 +120,21 @@ def extract_and_match(
     image_names, if given, restricts extraction to those paths (relative
     to image_dir) instead of every image under it -- pycolmap's own
     `extract_features(image_names=...)`, confirmed against the installed
-    pycolmap 4.x signature. Mapping then only sees what was extracted."""
+    pycolmap 4.x signature. Mapping then only sees what was extracted.
+
+    Every SfmConfig field maps onto a pycolmap 4.2 option object here; the
+    attribute names were read off the installed classes (`.todict()`),
+    not assumed (docs/adr/0040)."""
     database_path = Path(database_path)
     database_path.parent.mkdir(parents=True, exist_ok=True)
 
-    reader_options = pycolmap.ImageReaderOptions(camera_model=config.camera_model)
-    if mask_dir is not None:
-        reader_options.mask_path = Path(mask_dir)
-
     notify = progress_callback or (lambda *a: None)
-    device = "GPU" if pycolmap.has_cuda else "CPU"
     total = len(image_names) if image_names else None
+    extract_device, match_device = devices(config)
 
     # Progress: pycolmap's extractor/matcher have no Python callback, but
-    # COLMAP logs "Processed file [i/N]" / "Processing image [i/N]" to the
+    # COLMAP logs "Processed file [i/N]" / "Processing image [i/N]" (or
+    # "Processing block [i/N, j/M]" for exhaustive matching) to the
     # process's stderr -- captured and parsed for the duration of each call
     # (native_log_lines). Two approaches that DON'T work, both tried for
     # real: polling the database from another connection aborts the whole
@@ -141,31 +145,139 @@ def extract_and_match(
     def on_extract_line(line: str) -> None:
         if match := _PROCESSED_FILE.search(line):
             i, n = int(match.group(1)), int(match.group(2))
-            notify(f"COLMAP step 1/3 (features, {device}): frame {i}/{n}", i, n)
+            notify(f"COLMAP step 1/3 (features, {extract_device}): frame {i}/{n}", i, n)
 
     def on_match_line(line: str) -> None:
         if match := _PROCESSING_IMAGE.search(line):
             i, n = int(match.group(1)), int(match.group(2))
-            notify(f"COLMAP step 2/3 (matching, {device}): frame {i}/{n}", i, n)
+            notify(f"COLMAP step 2/3 (matching, {match_device}): frame {i}/{n}", i, n)
+        elif match := _PROCESSING_BLOCK.search(line):
+            a, rows, b, cols = (int(g) for g in match.groups())
+            done, blocks = (a - 1) * cols + b, rows * cols
+            notify(f"COLMAP step 2/3 (matching, {match_device}): block {done}/{blocks}", done, blocks)
 
-    notify(f"COLMAP step 1/3 (features, {device}): starting on {total or 'all'} frames…", 0 if total else None, total)
+    notify(
+        f"COLMAP step 1/3 (features, {extract_device}): starting on {total or 'all'} frames…",
+        0 if total else None,
+        total,
+    )
     with native_log_lines(on_extract_line if progress_callback else None):
         pycolmap.extract_features(
             database_path=database_path,
             image_path=image_dir,
             image_names=list(image_names or []),
-            reader_options=reader_options,
+            camera_mode=_CAMERA_MODES[config.camera_mode],
+            reader_options=reader_options(config, mask_dir),
+            extraction_options=extraction_options(config),
+            device=pycolmap.Device.auto if extract_device == "GPU" else pycolmap.Device.cpu,
         )
-    notify(f"COLMAP step 2/3 (matching, {device}): sequential, overlap {config.sequential_overlap}…", None, None)
+
+    pairing_name, match_fn, pairing = pairing_options(config)
+    notify(f"COLMAP step 2/3 (matching, {match_device}): {pairing_name}…", None, None)
     with native_log_lines(on_match_line if progress_callback else None):
-        pycolmap.match_sequential(
+        match_fn(
             database_path=database_path,
-            pairing_options=pycolmap.SequentialPairingOptions(overlap=config.sequential_overlap),
+            matching_options=matching_options(config),
+            pairing_options=pairing,
+            verification_options=verification_options(config),
+            device=pycolmap.Device.auto if match_device == "GPU" else pycolmap.Device.cpu,
         )
+
+
+_CAMERA_MODES = {
+    "auto": pycolmap.CameraMode.AUTO,
+    "single": pycolmap.CameraMode.SINGLE,
+    "per_folder": pycolmap.CameraMode.PER_FOLDER,
+    "per_image": pycolmap.CameraMode.PER_IMAGE,
+}
+
+
+def devices(config: SfmConfig) -> tuple[str, str]:
+    """("GPU"|"CPU" for extraction, same for matching). Affine-shape and
+    domain-size-pooling SIFT exist only on the CPU -- COLMAP switches to a
+    "Covariant SIFT CPU feature extractor" by itself (seen in its log), so
+    say so rather than report GPU."""
+    gpu = config.use_gpu and pycolmap.has_cuda
+    cpu_only_sift = config.estimate_affine_shape or config.domain_size_pooling
+    return ("GPU" if gpu and not cpu_only_sift else "CPU"), ("GPU" if gpu else "CPU")
+
+
+def reader_options(config: SfmConfig, mask_dir: Path | None = None) -> pycolmap.ImageReaderOptions:
+    options = pycolmap.ImageReaderOptions(camera_model=config.camera_model)
+    if mask_dir is not None:
+        options.mask_path = Path(mask_dir)
+    return options
+
+
+def extraction_options(config: SfmConfig) -> pycolmap.FeatureExtractionOptions:
+    options = pycolmap.FeatureExtractionOptions()
+    options.use_gpu = devices(config)[0] == "GPU"
+    if config.max_image_size > 0:
+        options.max_image_size = config.max_image_size
+    sift = options.sift
+    sift.max_num_features = config.max_num_features
+    sift.peak_threshold = config.peak_threshold
+    sift.edge_threshold = config.edge_threshold
+    sift.upright = config.upright
+    sift.estimate_affine_shape = config.estimate_affine_shape
+    sift.domain_size_pooling = config.domain_size_pooling
+    return options
+
+
+def matching_options(config: SfmConfig) -> pycolmap.FeatureMatchingOptions:
+    options = pycolmap.FeatureMatchingOptions()
+    options.use_gpu = devices(config)[1] == "GPU"
+    options.guided_matching = config.guided_matching
+    if config.max_num_matches > 0:
+        options.max_num_matches = config.max_num_matches
+    options.sift.max_ratio = config.max_ratio
+    options.sift.max_distance = config.max_distance
+    options.sift.cross_check = config.cross_check
+    return options
+
+
+def verification_options(config: SfmConfig) -> pycolmap.TwoViewGeometryOptions:
+    options = pycolmap.TwoViewGeometryOptions()
+    options.min_num_inliers = config.min_num_inliers
+    options.ransac.max_error = config.max_error
+    options.ransac.min_inlier_ratio = config.min_inlier_ratio
+    if config.random_seed >= 0:
+        options.ransac.random_seed = config.random_seed
+    return options
+
+
+def pairing_options(config: SfmConfig):
+    """(description, pycolmap match function, its pairing options)."""
+    tree = Path(config.vocab_tree_path).expanduser() if config.vocab_tree_path else None
+    if config.matcher == MATCHER_EXHAUSTIVE:
+        return (
+            f"exhaustive, block size {config.exhaustive_block_size}",
+            pycolmap.match_exhaustive,
+            pycolmap.ExhaustivePairingOptions(block_size=config.exhaustive_block_size),
+        )
+    if config.matcher == MATCHER_VOCAB_TREE:
+        options = pycolmap.VocabTreePairingOptions()
+        options.num_images = config.vocab_tree_num_images
+        if tree is not None:
+            options.vocab_tree_path = tree
+        return f"vocabulary tree, {config.vocab_tree_num_images} candidates", pycolmap.match_vocabtree, options
+    if config.matcher != MATCHER_SEQUENTIAL:
+        raise SfmError(f"unknown matcher: {config.matcher!r}")
+    options = pycolmap.SequentialPairingOptions(overlap=config.sequential_overlap)
+    options.quadratic_overlap = config.quadratic_overlap
+    options.loop_detection = config.loop_detection
+    if config.loop_detection:
+        options.loop_detection_period = config.loop_detection_period
+        options.loop_detection_num_images = config.loop_detection_num_images
+        if tree is not None:
+            options.vocab_tree_path = tree
+    loop = ", loop detection" if config.loop_detection else ""
+    return f"sequential, overlap {config.sequential_overlap}{loop}", pycolmap.match_sequential, options
 
 
 _PROCESSED_FILE = re.compile(r"Processed file \[(\d+)/(\d+)\]")
 _PROCESSING_IMAGE = re.compile(r"Processing image \[(\d+)/(\d+)\]")
+_PROCESSING_BLOCK = re.compile(r"Processing block \[(\d+)/(\d+), (\d+)/(\d+)\]")
 _NATIVE_LOG_LOCK = threading.Lock()
 
 
@@ -213,9 +325,11 @@ def map_and_diagnose(
     sparse_output_dir: Path,
     *,
     total_images: int | None = None,
+    config: SfmConfig = SfmConfig(),
     progress_callback=None,
 ) -> tuple[pycolmap.Reconstruction, SfmDiagnostics, Path]:
-    """Incremental mapping against an already-populated database (from
+    """Incremental mapping (or GLOMAP global mapping, config.mapper)
+    against an already-populated database (from
     `extract_and_match`, or any other source of keypoints/matches -- e.g. a
     pre-populated database for testing). Returns the largest reconstruction
     (by registered image count), its diagnostics, and the directory it was
@@ -262,14 +376,18 @@ def map_and_diagnose(
         registered += 1
         report("registering")
 
-    report("finding an initial pair")
-    reconstructions = pycolmap.incremental_mapping(
-        database_path=database_path,
-        image_path=image_dir,
-        output_path=sparse_output_dir,
-        initial_image_pair_callback=on_initial_pair,
-        next_image_callback=on_next_image,
-    )
+    if config.mapper == MAPPER_GLOBAL:
+        reconstructions = _global_mapping(database_path, image_dir, sparse_output_dir, config, notify, progress_callback)
+    else:
+        report("finding an initial pair")
+        reconstructions = pycolmap.incremental_mapping(
+            database_path=database_path,
+            image_path=image_dir,
+            output_path=sparse_output_dir,
+            options=incremental_options(config),
+            initial_image_pair_callback=on_initial_pair,
+            next_image_callback=on_next_image,
+        )
 
     if total_images is None:
         total_images = len(list(Path(image_dir).iterdir()))
@@ -301,6 +419,85 @@ def map_and_diagnose(
     return selected, diagnostics, model_dir
 
 
+def incremental_options(config: SfmConfig) -> pycolmap.IncrementalPipelineOptions:
+    options = pycolmap.IncrementalPipelineOptions()
+    options.min_num_matches = config.min_num_matches
+    options.multiple_models = config.multiple_models
+    if config.min_model_size > 0:
+        options.min_model_size = config.min_model_size
+    options.ba_refine_focal_length = config.refine_focal_length
+    options.ba_refine_principal_point = config.refine_principal_point
+    options.ba_refine_extra_params = config.refine_extra_params
+    mapper = options.mapper
+    mapper.init_min_num_inliers = config.init_min_num_inliers
+    mapper.init_min_tri_angle = config.init_min_tri_angle
+    mapper.init_max_forward_motion = config.init_max_forward_motion
+    mapper.abs_pose_min_num_inliers = config.abs_pose_min_num_inliers
+    mapper.abs_pose_min_inlier_ratio = config.abs_pose_min_inlier_ratio
+    mapper.abs_pose_refine_focal_length = config.refine_focal_length
+    mapper.abs_pose_refine_extra_params = config.refine_extra_params
+    mapper.filter_max_reproj_error = config.filter_max_reproj_error
+    mapper.filter_min_tri_angle = config.filter_min_tri_angle
+    if config.random_seed >= 0:
+        options.random_seed = mapper.random_seed = options.triangulation.random_seed = config.random_seed
+    return options
+
+
+def global_options(config: SfmConfig) -> pycolmap.GlobalPipelineOptions:
+    options = pycolmap.GlobalPipelineOptions()
+    options.min_num_matches = config.min_num_matches
+    options.multiple_models = config.multiple_models
+    if config.min_model_size > 0:
+        options.min_model_size = config.min_model_size
+    adjustment = options.mapper.bundle_adjustment
+    adjustment.refine_focal_length = config.refine_focal_length
+    adjustment.refine_principal_point = config.refine_principal_point
+    adjustment.refine_extra_params = config.refine_extra_params
+    if config.random_seed >= 0:
+        options.random_seed = options.mapper.random_seed = config.random_seed
+    return options
+
+
+# GLOMAP's stages, in order, as its log announces them ("=== Running
+# rotation averaging ===" ...) -- read off a real pycolmap 4.2 run.
+_GLOBAL_STAGES = (
+    "rotation averaging",
+    "track establishment",
+    "global positioning",
+    "iterative bundle adjustment",
+    "iterative retriangulation and refinement",
+)
+_GLOBAL_STAGE_LINE = re.compile(r"=== Running (.+?) ===")
+_GLOBAL_COMPONENT_LINE = re.compile(r"=== Reconstructing component (\d+) / (\d+) with (\d+) images ===")
+
+
+def _global_mapping(database_path, image_dir, sparse_output_dir, config, notify, progress_callback):
+    """pycolmap.global_mapping has no Python callback, so progress comes
+    from its log: one count per GLOMAP stage (of len(_GLOBAL_STAGES)) per
+    connected component."""
+    n = len(_GLOBAL_STAGES)
+    component = ""
+
+    def on_line(line: str) -> None:
+        nonlocal component
+        if match := _GLOBAL_COMPONENT_LINE.search(line):
+            component = f"component {match.group(1)}/{match.group(2)}, {match.group(3)} images, " if match.group(2) != "1" else ""
+        elif (match := _GLOBAL_STAGE_LINE.search(line)) and match.group(1) in _GLOBAL_STAGES:
+            stage = _GLOBAL_STAGES.index(match.group(1)) + 1
+            notify(f"COLMAP step 3/3 (global mapping): {component}stage {stage}/{n} ({match.group(1)})", stage - 1, n)
+
+    notify(f"COLMAP step 3/3 (global mapping): starting ({n} stages)…", 0, n)
+    with native_log_lines(on_line if progress_callback else None):
+        reconstructions = pycolmap.global_mapping(
+            database_path=database_path,
+            image_path=image_dir,
+            output_path=sparse_output_dir,
+            options=global_options(config),
+        )
+    notify(f"COLMAP step 3/3 (global mapping): stage {n}/{n} done", n, n)
+    return reconstructions
+
+
 def run_sfm(
     image_dir: Path,
     database_path: Path,
@@ -319,7 +516,8 @@ def run_sfm(
     )
     total_images = len(image_names) if image_names else len(list(Path(image_dir).iterdir()))
     return map_and_diagnose(
-        database_path, image_dir, sparse_output_dir, total_images=total_images, progress_callback=progress_callback
+        database_path, image_dir, sparse_output_dir, total_images=total_images, config=config,
+        progress_callback=progress_callback,
     )
 
 

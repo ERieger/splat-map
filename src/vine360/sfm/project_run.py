@@ -37,6 +37,7 @@ from vine360.sfm.colmap_adapter import (
     run_sfm,
     validate_installation,
 )
+from vine360.sfm.options import VARIANT_EQUIRECT, VARIANT_PROJECTIONS, VARIANT_SPHERESFM
 
 __all__ = ["ENGINE_PYCOLMAP", "ENGINE_SPHERESFM", "SfmRegistrationError", "run_sfm_for_project"]
 
@@ -59,6 +60,14 @@ def _image_set_hash(image_names: list[str]) -> str:
     unchanged path. Revisit if that distinction matters before this is
     relied on for real provenance decisions."""
     return hashlib.sha256("\n".join(sorted(image_names)).encode("utf-8")).hexdigest()
+
+
+def _quality_warnings(diagnostics: SfmDiagnostics, config: SfmConfig) -> list[str]:
+    return evaluate_registration_quality(
+        diagnostics,
+        min_registered_ratio=config.min_registered_ratio,
+        max_mean_reprojection_error=config.max_mean_reprojection_error,
+    )
 
 
 def run_sfm_for_project(
@@ -98,9 +107,19 @@ def run_sfm_for_project(
     Raises SfmRegistrationError if COLMAP produces no usable
     reconstruction (a real, correct outcome for e.g. single-panorama,
     zero-parallax view sets -- see docs/adr/0007). Records an sfm_runs row
-    on success only."""
+    on success only, with every option in config["options"] (docs/adr/0040).
+
+    Raises ValueError up front, before any work, if config can't run as
+    configured on this engine (SfmConfig.validate -- e.g. a missing
+    vocabulary tree file, or the global mapper with SphereSfM)."""
     notify = progress_callback or (lambda *a: None)
     project_root = Path(project_root)
+    variant = (
+        VARIANT_SPHERESFM if engine == ENGINE_SPHERESFM else VARIANT_EQUIRECT if image_source == "frames" else VARIANT_PROJECTIONS
+    )
+    problems = config.validate(variant)
+    if problems:
+        raise ValueError("SfM options can't run as configured: " + "; ".join(problems))
 
     source_id = None
     if frame_set_id is not None:
@@ -171,7 +190,7 @@ def run_sfm_for_project(
         diagnostics.total_images,
     )
 
-    warnings = evaluate_registration_quality(diagnostics)
+    warnings = _quality_warnings(diagnostics, config)
 
     conn.execute(
         """
@@ -189,6 +208,7 @@ def run_sfm_for_project(
                     "camera_model": config.camera_model,
                     "sequential_overlap": config.sequential_overlap,
                     "image_source": image_source,
+                    "options": config.to_dict(),
                     "frame_set_id": frame_set_id,
                     "source_id": source_id,
                 }
@@ -230,6 +250,9 @@ def _run_spheresfm(
         )
     runner = runner or LocalRunner()
     use_gpu = sph.has_cuda(sph.validate_installation()["version"])  # GPU SIFT only on a CUDA build
+    match_gpu = use_gpu and config.use_gpu
+    extract_gpu = match_gpu and not (config.estimate_affine_shape or config.domain_size_pooling)  # CPU-only SIFT
+    matcher_command = sph.MATCHER_COMMANDS[config.matcher]  # also names its log file
     with Image.open(image_dir / image_names[0]) as first:
         width, height = first.size
 
@@ -240,34 +263,36 @@ def _run_spheresfm(
     image_list_path = run_dir / "image_list.txt"
     image_list_path.write_text("\n".join(image_names) + "\n")
 
-    device = "GPU" if use_gpu else "CPU"
+    extract_device = "GPU" if extract_gpu else "CPU"
+    device = "GPU" if match_gpu else "CPU"
     n = len(image_names)
 
     def parser(step: int, label: str) -> sph.ProgressParser:
         return sph.ProgressParser(f"SphereSfM step {step}/4 ({label}): ", n, notify)
 
-    notify(f"SphereSfM step 1/4 (features, {device}): starting on {n} frames…", 0, n)
+    notify(f"SphereSfM step 1/4 (features, {extract_device}): starting on {n} frames…", 0, n)
     sph.run_command(
         runner,
         sph.build_feature_extraction_command(
-            binary, database_path, image_dir, image_list_path, width=width, height=height, use_gpu=use_gpu
+            binary, database_path, image_dir, image_list_path, width=width, height=height, use_gpu=use_gpu,
+            config=config,
         ),
         "feature extraction",
-        on_line=parser(1, f"features, {device}").feed,
+        on_line=parser(1, f"features, {extract_device}").feed,
         log_path=run_dir / "1_feature_extractor.log",
     )
-    notify(f"SphereSfM step 2/4 (matching, {device}): starting…", 0, n)
+    notify(f"SphereSfM step 2/4 (matching, {device}): {config.matcher}, starting…", 0, n)
     sph.run_command(
         runner,
-        sph.build_matcher_command(binary, database_path, overlap=config.sequential_overlap, use_gpu=use_gpu),
+        sph.build_matcher_command(binary, database_path, use_gpu=use_gpu, config=config),
         "matching",
         on_line=parser(2, f"matching, {device}").feed,
-        log_path=run_dir / "2_sequential_matcher.log",
+        log_path=run_dir / f"2_{matcher_command}.log",
     )
     notify("SphereSfM step 3/4 (mapping, CPU): starting…", 0, n)
     sph.run_command(
         runner,
-        sph.build_mapper_command(binary, database_path, image_dir, run_dir),
+        sph.build_mapper_command(binary, database_path, image_dir, run_dir, config=config),
         "mapping",
         on_line=parser(3, "mapping, CPU").feed,
         log_path=run_dir / "3_mapper.log",
@@ -304,7 +329,7 @@ def _run_spheresfm(
         registered,
         n,
     )
-    warnings = evaluate_registration_quality(diagnostics)
+    warnings = _quality_warnings(diagnostics, config)
 
     conn.execute(
         """
@@ -322,6 +347,7 @@ def _run_spheresfm(
                     "camera_model": "SPHERE",
                     "sequential_overlap": config.sequential_overlap,
                     "image_source": "frames",
+                    "options": config.to_dict(),
                     "frame_set_id": frame_set_id,
                     "source_id": source_id,
                 }
