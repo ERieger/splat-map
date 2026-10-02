@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -693,6 +694,203 @@ class PreviewGallery(QWidget):
         for path, caption in items:
             self._content_layout.addWidget(_thumbnail_widget(path, caption))
         self._content_layout.addStretch()
+
+
+class _ImageScrollArea(QScrollArea):
+    """The scrolling half of ZoomableImageView: Ctrl+wheel zooms about the
+    cursor, left-drag pans, double-click toggles Fit/100%, and a resize
+    re-fits while in Fit mode."""
+
+    def __init__(self, view: "ZoomableImageView"):
+        super().__init__()
+        self._view = view
+        self._drag_origin: QPoint | None = None
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._view.is_fit():
+            self._view._apply_zoom()
+
+    def wheelEvent(self, event) -> None:
+        if event.modifiers() & Qt.ControlModifier and self._view.has_image():
+            step = 1.25 if event.angleDelta().y() > 0 else 1 / 1.25
+            self._view.zoom_by(step, anchor=event.position().toPoint())
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and not self._view.is_fit():
+            self._drag_origin = event.position().toPoint()
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_origin is not None:
+            pos = event.position().toPoint()
+            delta = pos - self._drag_origin
+            self._drag_origin = pos
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_origin = None
+        self.viewport().unsetCursor()
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if self._view.has_image():
+            if self._view.is_fit():
+                self._view.set_zoom(1.0)
+            else:
+                self._view.fit()
+        super().mouseDoubleClickEvent(event)
+
+
+class ZoomableImageView(QWidget):
+    """A large image preview that shrinks to fit whatever space its layout
+    gives it (never forcing the panel taller than the window) and can be
+    zoomed (Ctrl+wheel or the buttons) and panned (drag) for detail. Holds
+    the full-resolution pixmap and rescales from it, so zooming in never
+    shows an upscaled thumbnail."""
+
+    MIN_ZOOM = 0.05
+    MAX_ZOOM = 8.0
+
+    def __init__(self, empty_text: str = "Nothing to preview yet."):
+        super().__init__()
+        self._source = QPixmap()
+        self._zoom: float | None = None  # None = fit to the available space
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        toolbar = QHBoxLayout()
+        toolbar.addStretch()
+        self.zoom_label = QLabel("")
+        self.zoom_label.setStyleSheet("color: palette(mid);")
+        toolbar.addWidget(self.zoom_label)
+        self.zoom_out_btn = QPushButton("−")
+        self.zoom_out_btn.setToolTip("Zoom out (Ctrl+wheel)")
+        self.zoom_out_btn.clicked.connect(lambda: self.zoom_by(1 / 1.25))
+        self.zoom_in_btn = QPushButton("+")
+        self.zoom_in_btn.setToolTip("Zoom in (Ctrl+wheel)")
+        self.zoom_in_btn.clicked.connect(lambda: self.zoom_by(1.25))
+        self.fit_btn = QPushButton("Fit")
+        self.fit_btn.setToolTip("Shrink the image to fit (double-click the image to toggle Fit/100%)")
+        self.fit_btn.clicked.connect(self.fit)
+        self.actual_btn = QPushButton("100%")
+        self.actual_btn.setToolTip("Show the image at its actual size; drag to pan")
+        self.actual_btn.clicked.connect(lambda: self.set_zoom(1.0))
+        for btn in (self.zoom_out_btn, self.zoom_in_btn, self.fit_btn, self.actual_btn):
+            btn.setMaximumWidth(56)
+            toolbar.addWidget(btn)
+        outer.addLayout(toolbar)
+
+        self.scroll_area = _ImageScrollArea(self)
+        self.scroll_area.setAlignment(Qt.AlignCenter)
+        self.scroll_area.setMinimumHeight(160)
+        self.image_label = QLabel(empty_text)
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.scroll_area.setWidget(self.image_label)
+        self.scroll_area.setWidgetResizable(True)
+        outer.addWidget(self.scroll_area, 1)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._update_controls()
+
+    # -- public API ----------------------------------------------------------
+
+    def has_image(self) -> bool:
+        return not self._source.isNull()
+
+    def is_fit(self) -> bool:
+        return self._zoom is None
+
+    def pixmap(self) -> QPixmap:
+        """The full-resolution image currently shown (null if none)."""
+        return self._source
+
+    def set_text(self, text: str) -> None:
+        self._source = QPixmap()
+        self.image_label.setPixmap(QPixmap())
+        self.image_label.setText(text)
+        self.scroll_area.setWidgetResizable(True)
+        self._update_controls()
+
+    def set_pixmap(self, pixmap: QPixmap) -> None:
+        """Show a new image, keeping the current zoom (so scrubbing frames
+        at 200% stays at 200%)."""
+        self._source = pixmap
+        self.image_label.setText("")
+        self._apply_zoom()
+
+    def fit(self) -> None:
+        self._zoom = None
+        self._apply_zoom()
+
+    def set_zoom(self, zoom: float, anchor: QPoint | None = None) -> None:
+        if not self.has_image():
+            return
+        zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, zoom))
+        viewport = self.scroll_area.viewport()
+        anchor = anchor if anchor is not None else viewport.rect().center()
+        h_bar, v_bar = self.scroll_area.horizontalScrollBar(), self.scroll_area.verticalScrollBar()
+        old_size = self.image_label.size()
+        # The image point under the anchor, as a fraction of the image, so
+        # it stays under the cursor after rescaling.
+        fx = (h_bar.value() + anchor.x() - max(0, (viewport.width() - old_size.width()) // 2)) / max(1, old_size.width())
+        fy = (v_bar.value() + anchor.y() - max(0, (viewport.height() - old_size.height()) // 2)) / max(1, old_size.height())
+        self._zoom = zoom
+        self._apply_zoom()
+        new_size = self.image_label.size()
+        h_bar.setValue(round(fx * new_size.width() - anchor.x()))
+        v_bar.setValue(round(fy * new_size.height() - anchor.y()))
+
+    def zoom_by(self, factor: float, anchor: QPoint | None = None) -> None:
+        self.set_zoom(self.current_zoom() * factor, anchor)
+
+    def current_zoom(self) -> float:
+        if self._zoom is not None:
+            return self._zoom
+        return self._fit_zoom()
+
+    # -- internals -----------------------------------------------------------
+
+    def _fit_zoom(self) -> float:
+        if not self.has_image():
+            return 1.0
+        viewport = self.scroll_area.viewport().size()
+        return max(
+            self.MIN_ZOOM,
+            min(viewport.width() / self._source.width(), viewport.height() / self._source.height()),
+        )
+
+    def _apply_zoom(self) -> None:
+        if not self.has_image():
+            self._update_controls()
+            return
+        zoom = self.current_zoom()
+        scaled = self._source.scaled(
+            max(1, round(self._source.width() * zoom)),
+            max(1, round(self._source.height() * zoom)),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        policy = Qt.ScrollBarAlwaysOff if self.is_fit() else Qt.ScrollBarAsNeeded
+        self.scroll_area.setHorizontalScrollBarPolicy(policy)
+        self.scroll_area.setVerticalScrollBarPolicy(policy)
+        self.scroll_area.setWidgetResizable(False)
+        self.image_label.setPixmap(scaled)
+        self.image_label.resize(scaled.size())
+        self._update_controls()
+
+    def _update_controls(self) -> None:
+        has_image = self.has_image()
+        for btn in (self.zoom_out_btn, self.zoom_in_btn, self.fit_btn, self.actual_btn):
+            btn.setEnabled(has_image)
+        self.zoom_label.setText(
+            (f"{self.current_zoom():.0%}" + (" (fit)" if self.is_fit() else "")) if has_image else ""
+        )
 
 
 class TemporalFrameSelector(QWidget):
@@ -1923,14 +2121,17 @@ def _build_mask_layer_worker(
         conn.close()
 
 
-def _numpy_to_pixmap(image: np.ndarray, max_size: int) -> QPixmap:
+def _numpy_to_pixmap(image: np.ndarray, max_size: int | None = None) -> QPixmap:
     image = np.ascontiguousarray(image)
     height, width = image.shape[:2]
     if image.ndim == 2:
         qimage = QImage(image.data, width, height, width, QImage.Format_Grayscale8).copy()
     else:
         qimage = QImage(image.data, width, height, 3 * width, QImage.Format_RGB888).copy()
-    return QPixmap.fromImage(qimage).scaled(max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    pixmap = QPixmap.fromImage(qimage)
+    if max_size is None:
+        return pixmap
+    return pixmap.scaled(max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
 class _LayerRow:
@@ -1970,7 +2171,6 @@ class MasksPanel(QWidget):
     on/off per view or for the whole set without rebuilding. Builds run off
     the GUI thread; SAM 3, if requested, loads once per batch."""
 
-    PREVIEW_SIZE = 560
     PREVIEW_MODES = ("Overlay", "Original", "Keep mask")
 
     def __init__(self, state: AppState):
@@ -2124,10 +2324,10 @@ class MasksPanel(QWidget):
         self.view_layers_row.addStretch()
         review_layout.addLayout(self.view_layers_row)
 
-        self.preview_label = QLabel("No views generated yet.")
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(240)
-        review_layout.addWidget(self.preview_label)
+        # Fits whatever height is left rather than a fixed size, so the
+        # panel never grows past the window; Ctrl+wheel/buttons zoom in.
+        self.preview_view = ZoomableImageView("No views generated yet.")
+        review_layout.addWidget(self.preview_view, 1)
         self.preview_caption = QLabel("")
         self.preview_caption.setAlignment(Qt.AlignCenter)
         self.preview_caption.setStyleSheet("color: palette(mid);")
@@ -2150,9 +2350,9 @@ class MasksPanel(QWidget):
         self.suspicious_list.setMaximumHeight(110)
         self.suspicious_list.itemDoubleClicked.connect(self._on_suspicious_double_clicked)
         review_layout.addWidget(self.suspicious_list)
-        controls_layout.addWidget(review_box)
+        controls_layout.addWidget(review_box, 1)
 
-        layout.addWidget(self.controls)
+        layout.addWidget(self.controls, 1)
         self.controls.setVisible(False)
         layout.addStretch()
         # (frame_id, view_id, keep_fraction) across the selected frame set,
@@ -2401,8 +2601,7 @@ class MasksPanel(QWidget):
         self.view_layers_label.setText("Layers in this view:" if by_name else "No mask layers built for this view.")
 
         if conn is None or view_id is None:
-            self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("No views generated yet.")
+            self.preview_view.set_text("No views generated yet.")
             self.preview_caption.setText("")
             return
         mode = self.preview_mode_combo.currentText()
@@ -2419,12 +2618,10 @@ class MasksPanel(QWidget):
                 with Image.open(self.state.project_root / row[0]) as img:
                     image = np.asarray(img.convert("RGB"))
         except (OSError, MaskLayerError) as exc:
-            self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText(f"Can't show {mode.lower()}: {exc}")
+            self.preview_view.set_text(f"Can't show {mode.lower()}: {exc}")
             self.preview_caption.setText("")
             return
-        self.preview_label.setText("")
-        self.preview_label.setPixmap(_numpy_to_pixmap(image, self.PREVIEW_SIZE))
+        self.preview_view.set_pixmap(_numpy_to_pixmap(image))
         legend = ", ".join(
             f"{LAYER_SPECS[r['layer']].label} = {_COLOR_NAMES.get(r['layer'], '')}"
             for r in layers
