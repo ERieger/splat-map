@@ -40,6 +40,9 @@ def clear_views_for_frame(conn: sqlite3.Connection, project_root: Path, frame_id
     conn.execute(
         "DELETE FROM masks WHERE view_id IN (SELECT view_id FROM views WHERE frame_id = ?)", (frame_id,)
     )
+    conn.execute(
+        "DELETE FROM mask_layers WHERE view_id IN (SELECT view_id FROM views WHERE frame_id = ?)", (frame_id,)
+    )
     conn.execute("DELETE FROM views WHERE frame_id = ?", (frame_id,))
     conn.commit()
     remove_view_files(project_root, frame_id, view_ids)

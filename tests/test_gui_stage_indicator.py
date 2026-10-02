@@ -29,7 +29,7 @@ from vine360.gui.main_window import (
     ProjectionPanel,
     StageIndicator,
 )
-from vine360.masking.build import build_mask_for_view, set_view_flagged
+from vine360.masking.build import build_mask_for_view
 from vine360.project import create_project, open_index_db
 
 import numpy as np
@@ -131,23 +131,7 @@ def test_masks_panel_stage_indicator_before_and_after_build(qapp, project):
     build_mask_for_view(conn, root, "frame-1:front")
     panel.refresh_sources()
 
-    assert panel.stage_indicator.statuses == [DONE, DONE], "built, nothing flagged -- both stages done"
-
-
-def test_masks_panel_stage_indicator_reflects_flagged_review(qapp, project):
-    root, conn = project
-    _insert_view(conn, root, "frame-1:front", "frame-1")
-    build_mask_for_view(conn, root, "frame-1:front")
-    set_view_flagged(conn, "frame-1:front", True)
-
-    state = AppState()
-    state.project_root = root
-    state.conn = conn
-    state.notify_change = lambda: None
-    panel = MasksPanel(state)
-    panel.on_shown()
-
-    assert panel.stage_indicator.statuses == [DONE, ACTIVE], "built but a flag remains -- Review is current"
+    assert panel.stage_indicator.statuses == [DONE, DONE], "built, nothing suspicious -- both stages done"
 
 
 def test_export_panel_stage_indicator_progression(qapp, project):

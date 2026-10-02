@@ -266,6 +266,7 @@ def test_re_extracting_frames_cascades_to_views_and_masks(tmp_path):
     remaining = {r[0] for r in conn.execute("SELECT view_id FROM views")}
     assert remaining == {v.view_id for v in sibling_views}  # the sibling frame set's views survive
     assert conn.execute("SELECT COUNT(*) FROM masks").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM mask_layers").fetchone()[0] == 0
     assert not old_projections_dir.exists()
     assert not old_keep_dir.exists()
     assert not old_classes_dir.exists()

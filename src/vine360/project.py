@@ -129,6 +129,18 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 edited INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS mask_layers (
+                view_id TEXT NOT NULL REFERENCES views(view_id),
+                layer TEXT NOT NULL,
+                method TEXT NOT NULL,
+                method_version TEXT NOT NULL,
+                params TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                edited INTEGER NOT NULL DEFAULT 0,
+                coverage REAL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (view_id, layer)
+            );
             CREATE TABLE IF NOT EXISTS sfm_runs (
                 run_id TEXT PRIMARY KEY,
                 image_set_hash TEXT NOT NULL,

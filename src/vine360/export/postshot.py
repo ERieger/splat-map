@@ -125,6 +125,7 @@ from pathlib import Path
 
 import pycolmap
 
+from vine360.masking.layers import ensure_composites_current
 from vine360.masking.semantics import colmap_mask_path
 from vine360.project import PROJECT_FILE
 
@@ -529,6 +530,9 @@ def export_for_postshot(
     masks_out: Path | None = None
     num_masks = 0
     # Every export is of projected views now (see above), so masks always apply.
+    # Layers merge into masks/keep here too, in case one was edited on disk
+    # since its last compose (docs/adr/0038).
+    ensure_composites_current(conn, project_root)
     keep_root = project_root / "masks" / "keep"
     if keep_root.exists() and any(keep_root.rglob("*.png")):
         masks_out = output_dir / "masks"
@@ -604,6 +608,7 @@ def export_frames_and_masks_for_postshot(
         if not rows:
             raise PostshotExportError("no projected views found -- generate projections first")
 
+    ensure_composites_current(conn, project_root, frame_set_id)  # merge layers (docs/adr/0038)
     keep_root = project_root / "masks" / "keep"
     has_masks = keep_root.exists() and any(keep_root.rglob("*.png"))
 
@@ -713,6 +718,7 @@ def export_for_realityscan(
         if not rows:
             raise PostshotExportError("no projected views found -- generate projections first")
 
+    ensure_composites_current(conn, project_root, frame_set_id)  # merge layers (docs/adr/0038)
     keep_root = project_root / "masks" / "keep"
     has_masks = keep_root.exists() and any(keep_root.rglob("*.png"))
 

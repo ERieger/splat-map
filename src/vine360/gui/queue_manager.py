@@ -703,8 +703,12 @@ class QueueManager(QObject):
                 params["face_names"], params.get("max_workers"),
             )
         elif job.stage == STAGE_MASKS:
+            # .get(): jobs queued before mask layers (docs/adr/0038) only
+            # carry the two SAM 3 flags -- they keep their old meaning.
             fn, args = mw._build_masks_worker, (
                 project_root, job.target_frame_set_id, params["use_sam3_person"], params["use_sam3_sky"],
+                params.get("mask_sky", True), params.get("mask_overexposure", False),
+                params.get("overexposure_clip", 250), params.get("overexposure_bloom_radius", 40),
             )
         elif job.stage == STAGE_POSE:
             fn, args = mw._run_sfm_worker, (
