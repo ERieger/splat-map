@@ -14,6 +14,7 @@ from vine360.activity_log import (
     STATUS_RUNNING,
     finish_entry,
     list_entries,
+    log_action,
     logged_operation,
     mark_interrupted,
     start_entry,
@@ -109,3 +110,23 @@ def test_real_gui_workers_are_logged(project):
     assert entry.operation == "data.delete" and entry.status == STATUS_DONE
     assert entry.params == {"action": "export", "target": "exports/all/postshot"}
     assert entry.origin == "manual"
+
+
+def test_log_action_records_one_finished_entry(project):
+    _root, conn = project
+    entry_id = log_action(
+        conn, "masks.view_layer", "Mask layer merge (one view)", target="sky off @ s1:000000:front",
+        params={"view_id": "s1:000000:front", "layer": "sky", "enabled": False}, result="sky layer removed",
+    )
+    (entry,) = list_entries(conn)
+    assert entry.entry_id == entry_id
+    assert entry.status == STATUS_DONE
+    assert entry.params == {"view_id": "s1:000000:front", "layer": "sky", "enabled": False}
+    assert entry.result == "sky layer removed"
+    assert entry.finished_at is not None
+
+
+def test_log_action_never_breaks_the_action(project):
+    _root, conn = project
+    conn.execute("DROP TABLE activity_log")
+    assert log_action(conn, "masks.view_layer", "x") is None

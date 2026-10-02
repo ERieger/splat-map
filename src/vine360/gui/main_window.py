@@ -76,6 +76,7 @@ from vine360.activity_log import (
     STATUS_DONE,
     finish_entry,
     list_entries,
+    log_action,
     logged_operation,
     mark_interrupted,
     start_entry,
@@ -2124,24 +2125,30 @@ def _build_mask_layer_worker(
         conn.close()
 
 
+def _merge_summary(layer: str, enabled: bool, changed: int) -> str:
+    label = LAYER_SPECS[layer].label.lower() if layer in LAYER_SPECS else layer
+    return f"{label} layer {'merged into' if enabled else 'removed from'} the keep-mask of {changed} view(s)"
+
+
 @logged_operation(
     "masks.merge",
-    "Mask layer merge",
-    target=lambda p: f"{p.get('layer')} @ {p.get('frame_set_id')}",
-    summarize=lambda changed, _conn: f"{changed} views recomposed",
+    "Mask layer merge (whole frame set)",
+    target=lambda p: f"{p.get('layer')} {'on' if p.get('enabled') else 'off'} @ {p.get('frame_set_id')}",
+    summarize=lambda summary, _conn: summary,
 )
 def _set_layer_merged_worker(
     project_root: Path, frame_set_id: str, layer: str, enabled: bool, progress_callback=None
-) -> int:
+) -> str:
     """Switches a layer into/out of every keep-mask in a frame set. No layer
     is rebuilt, but every view is recomposed (PNG reads/writes), which is
     far too slow for the GUI thread on a full frame set."""
     conn = open_index_db(project_root)
     try:
-        return set_layer_enabled(
+        changed = set_layer_enabled(
             conn, project_root, frame_set_view_ids(conn, frame_set_id), layer, enabled,
             progress_callback=progress_callback,
         )
+        return _merge_summary(layer, enabled, changed)
     finally:
         conn.close()
 
@@ -2672,14 +2679,34 @@ class MasksPanel(QWidget):
         view_id = self._current_view_id()
         if self.state.conn is None or view_id is None:
             return
-        set_view_excluded(self.state.conn, self.state.project_root, view_id, checked)
+        keep_fraction = set_view_excluded(self.state.conn, self.state.project_root, view_id, checked)
+        log_action(
+            self.state.conn,
+            "masks.exclude_view",
+            "Exclude view" if checked else "Restore excluded view",
+            target=view_id,
+            params={"view_id": view_id, "excluded": checked},
+            result=(
+                "view dropped from pose estimation/export (all-excluded keep-mask)"
+                if checked
+                else "view restored" + (f"; keeps {keep_fraction:.0%}" if keep_fraction is not None else "")
+            ),
+        )
         self._after_view_change(view_id)
 
     def _on_view_layer_toggled(self, layer: str, enabled: bool) -> None:
         view_id = self._current_view_id()
         if self.state.conn is None or view_id is None:
             return
-        set_layer_enabled(self.state.conn, self.state.project_root, [view_id], layer, enabled)
+        changed = set_layer_enabled(self.state.conn, self.state.project_root, [view_id], layer, enabled)
+        log_action(
+            self.state.conn,
+            "masks.view_layer",
+            "Mask layer merge (one view)",
+            target=f"{layer} {'on' if enabled else 'off'} @ {view_id}",
+            params={"view_id": view_id, "layer": layer, "enabled": enabled},
+            result=_merge_summary(layer, enabled, changed),
+        )
         self._after_view_change(view_id)
 
     def _on_layer_merged_clicked(self, layer: str) -> None:
@@ -2823,9 +2850,9 @@ class MasksPanel(QWidget):
             overwrite_edited,
         )
 
-    def _on_merge_success(self, changed: int) -> None:
+    def _on_merge_success(self, summary: str) -> None:
         self._job_running = False
-        self.progress_area.finish(f"{changed} views recomposed.")
+        self.progress_area.finish(summary[:1].upper() + summary[1:] + ".")
         self._refresh_run_enabled()
         self._refresh_frame_list()
         self.state.notify_change()

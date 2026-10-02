@@ -102,6 +102,28 @@ def finish_entry(
     conn.commit()
 
 
+def log_action(
+    conn: sqlite3.Connection,
+    operation: str,
+    label: str,
+    *,
+    target: str | None = None,
+    params: dict | None = None,
+    result: str | None = None,
+    origin: str = "manual",
+) -> int | None:
+    """Records an instant action (a checkbox or button that changes project
+    data without a worker, e.g. un-merging one view's sky layer) as one
+    already-finished entry, on the caller's own connection. Like
+    logged_operation, a failure to write the log never breaks the action."""
+    try:
+        entry_id = start_entry(conn, operation, label, target=target, params=params, origin=origin)
+        finish_entry(conn, entry_id, status=STATUS_DONE, duration_seconds=0.0, result=result)
+        return entry_id
+    except Exception:
+        return None
+
+
 def list_entries(conn: sqlite3.Connection, *, limit: int | None = None) -> list[LogEntry]:
     """Oldest first -- the order things were run in."""
     sql = (

@@ -66,6 +66,12 @@ optionally), refreshes every few seconds while visible, shows the full parameter
 the selected entry, and exports to CSV. Runs from before this ADR aren't listed, since nothing
 recorded them.
 
+**Instant actions** (added later): a click that changes project data without a worker, such as
+switching one view's mask layer into or out of its keep-mask or excluding a view, is recorded
+with `activity_log.log_action`. That writes one already-finished entry on the caller's own
+connection, with the same "never break the action" rule. The set-wide "merged" toggle is a
+`logged_operation` background run (`masks.merge`), because it recomposes every view.
+
 ## Consequences
 
 - Test expectations on the tiny synthetic 360 scene are sized from what actually registered
