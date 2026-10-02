@@ -50,7 +50,7 @@ def test_generate_views_for_frame_writes_files_and_rows(project):
 
     views = generate_views_for_frame(conn, root, frame_id, face_size=64)
 
-    assert {v.projection_id for v in views} == {"six-face"}
+    assert {v.projection_id for v in views} == {"directions"}
     assert {v.view_id for v in views} == {f"{frame_id}:{name}" for name in ("front", "right", "back", "left")}
     for view in views:
         assert (root / view.image_path).exists()
@@ -151,7 +151,7 @@ def test_render_and_save_frame_views_writes_files_and_returns_views(project):
     for view in views:
         assert (root / view.image_path).exists()
         assert view.frame_id == frame_id
-        assert view.projection_id == "six-face"
+        assert view.projection_id == "directions"
 
 
 def test_generate_views_for_frame_set_parallel_matches_sequential(project):

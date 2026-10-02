@@ -221,6 +221,20 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
 - Options are stored with each run and in queued jobs, and the panel starts from the latest run's
   options.
 
+**View directions and the direction picker (ADR 0041).**
+- Projection can render any of 26 named directions: yaw every 45° on a horizon ring, a
+  tilted-down ring and a tilted-up ring (tilt adjustable, 45° by default), plus the two poles.
+  The six original faces keep their exact rotations.
+- The Projection panel's checkboxes are replaced by a picker drawn on the current frame's
+  panorama:
+  - clickable markers, with each selected view's footprint outlined;
+  - a live hover preview of the view;
+  - presets, including a vine-row tunnel preset (diagonal tilted-down views that see a row wall
+    and the floor together);
+  - a views × frames image count.
+- Not yet tried on a real tunnel capture through SfM -- whether the tunnel preset actually
+  registers better than the cardinal faces is still to be measured.
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -296,6 +310,8 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
       rebuilt on change), clipping-based overexposure layer, review that acts.
 0040: SfM advanced options -- one stdlib SfmConfig for both engines, GUI form
       generated from OPTION_SPECS, defaults == each engine's own defaults.
+0041: 26-direction view catalog (45° yaw steps, tilted rings, legacy six unchanged) and a
+      graphical direction picker drawn over the frame's own panorama.
 
 ## Blockers / known gaps
 

@@ -33,7 +33,7 @@ from typing import Callable
 from PySide6.QtCore import QObject, Signal
 
 from vine360.config import FRAME_PRESET_INTERVALS, FramePreset
-from vine360.projection.cubemap import ALL_FACE_NAMES
+from vine360.projection.cubemap import CARDINAL_NAMES, DEFAULT_RING_TILT_DEGREES
 
 # Job status vocabulary. Deliberately separate from main_window's
 # DONE/ACTIVE/PENDING stage-status vocabulary (a job's lifecycle -- has it
@@ -202,7 +202,8 @@ def _default_params_for_prerequisite(stage: str) -> dict:
         return {
             "face_size": 1024,
             "fov_degrees": 90.0,
-            "face_names": [name for name in ALL_FACE_NAMES if name not in ("up", "down")],
+            "face_names": list(CARDINAL_NAMES),
+            "ring_tilt_degrees": DEFAULT_RING_TILT_DEGREES,
         }
     raise ValueError(f"no default prerequisite params for stage {stage!r}")
 
@@ -701,6 +702,9 @@ class QueueManager(QObject):
             fn, args = mw._generate_views_worker, (
                 project_root, job.target_frame_set_id, params["face_size"], params["fov_degrees"],
                 params["face_names"], params.get("max_workers"),
+                # .get(): jobs queued before view directions (docs/adr/0041)
+                # carry no tilt -- they only ever named level/polar faces.
+                params.get("ring_tilt_degrees", DEFAULT_RING_TILT_DEGREES),
             )
         elif job.stage == STAGE_MASKS:
             # .get(): jobs queued before mask layers (docs/adr/0038) only

@@ -135,7 +135,13 @@ from vine360.project import (
     load_project,
     open_index_db,
 )
-from vine360.projection.cubemap import ALL_FACE_NAMES
+from vine360.projection.cubemap import (
+    DEFAULT_RING_TILT_DEGREES,
+    DIRECTIONS_BY_NAME,
+    RING_LOWER,
+    RING_UPPER,
+    direction_sort_key,
+)
 from vine360.recent_projects import load_recent_projects, record_recent_project, remove_recent_project
 from vine360.projection.generate import ProjectionGenerationError, generate_views_for_frame_set
 from vine360.runners.local import LocalRunner
@@ -150,6 +156,7 @@ from vine360.export.postshot import (
 from vine360.sfm.options import VARIANT_EQUIRECT, VARIANT_PROJECTIONS, VARIANT_SPHERESFM, SfmConfig
 from vine360.sfm.options import describe as describe_sfm_options
 from vine360.sfm.project_run import SfmRegistrationError, run_sfm_for_project
+from vine360.gui.direction_picker import DirectionPicker
 from vine360.gui.sfm_options import SfmOptionsEditor
 from vine360.gui.queue_manager import (
     BLOCKED,
@@ -1802,6 +1809,7 @@ def _generate_views_worker(
     fov_degrees: float,
     face_names: list[str],
     max_workers: int | None,
+    ring_tilt_degrees: float = DEFAULT_RING_TILT_DEGREES,
     progress_callback=None,
 ):
     conn = open_index_db(project_root)
@@ -1813,11 +1821,18 @@ def _generate_views_worker(
             face_size=face_size,
             fov_degrees=fov_degrees,
             face_names=face_names,
+            ring_tilt_degrees=ring_tilt_degrees,
             max_workers=max_workers,
             progress_callback=progress_callback,
         )
     finally:
         conn.close()
+
+
+def _describe_directions(names: list[str]) -> str:
+    """A queue label for a direction selection -- the full list once it
+    gets long would swamp the queue view."""
+    return ", ".join(names) if len(names) <= 6 else f"{len(names)} directions"
 
 
 class ProjectionPanel(QWidget):
@@ -1829,6 +1844,7 @@ class ProjectionPanel(QWidget):
         super().__init__()
         self.state = state
         self._choices: dict[str, FrameSetChoice] = {}
+        self._picker_frame_set_id: str | None = None
         layout = QVBoxLayout(self)
         _panel_header(
             "Projection",
@@ -1862,18 +1878,16 @@ class ProjectionPanel(QWidget):
         controls_layout.addLayout(form)
 
         controls_layout.addWidget(QLabel("Views to generate per frame:"))
-        faces_row = QHBoxLayout()
-        self.face_checks: dict[str, QCheckBox] = {}
-        for name in ALL_FACE_NAMES:
-            cb = QCheckBox(name)
-            cb.setChecked(name not in ("up", "down"))  # polar faces off by default -- little use, terrestrial capture
-            self.face_checks[name] = cb
-            faces_row.addWidget(cb)
-        controls_layout.addLayout(faces_row)
-        polar_note = QLabel("up/down (polar) are off by default: pointed at sky/ground, little use for a terrestrial vineyard capture.")
-        polar_note.setWordWrap(True)
-        polar_note.setStyleSheet("color: palette(mid);")
-        controls_layout.addWidget(polar_note)
+        self.direction_picker = DirectionPicker()
+        self.fov_spin.valueChanged.connect(self.direction_picker.set_fov)
+        controls_layout.addWidget(self.direction_picker)
+        picker_note = QLabel(
+            "Straight up/down are off by default (sky/ground, little use for a terrestrial capture). "
+            "In a tight row, the tilted-down diagonals see a wall and the floor in the same image."
+        )
+        picker_note.setWordWrap(True)
+        picker_note.setStyleSheet("color: palette(mid);")
+        controls_layout.addWidget(picker_note)
 
         parallel_row = QHBoxLayout()
         self.parallel_check = QCheckBox("Speed up with parallel processing")
@@ -1976,24 +1990,65 @@ class ProjectionPanel(QWidget):
                 "WHERE f.frame_set_id = ? GROUP BY f.frame_id ORDER BY f.source_time",
                 (frame_set_id,),
             ).fetchall()
+        self.direction_picker.set_frame_count(len(frames))
+        if frame_set_id != self._picker_frame_set_id:
+            self._picker_frame_set_id = frame_set_id
+            self._adopt_existing_directions(frame_set_id)
         self.frame_selector.set_frames(frames)  # emits frame_changed -> _refresh_preview
+
+    def _adopt_existing_directions(self, frame_set_id: str | None) -> None:
+        """When a frame set already has views, preselect the directions (and
+        recover the ring tilt) it was last generated with, so regenerating
+        starts from what's there rather than from the defaults."""
+        if self.state.conn is None or frame_set_id is None:
+            return
+        row = self.state.conn.execute(
+            "SELECT v.frame_id FROM views v JOIN frames f ON f.frame_id = v.frame_id "
+            "WHERE f.frame_set_id = ? ORDER BY f.source_time LIMIT 1",
+            (frame_set_id,),
+        ).fetchone()
+        if row is None:
+            return
+        rows = self.state.conn.execute(
+            "SELECT view_id, fixed_rotation FROM views WHERE frame_id = ?", (row[0],)
+        ).fetchall()
+        names = [view_id.split(":")[-1] for view_id, _ in rows]
+        if not names or any(name not in DIRECTIONS_BY_NAME for name in names):
+            return
+        for view_id, fixed_rotation in rows:
+            spec = DIRECTIONS_BY_NAME[view_id.split(":")[-1]]
+            if spec.ring in (RING_LOWER, RING_UPPER):
+                # The view's optical axis is R @ (0, 0, 1); its y component is sin(pitch).
+                try:
+                    axis_y = float(np.asarray(json.loads(fixed_rotation)["matrix"])[1, 2])
+                except (ValueError, KeyError, IndexError, TypeError):
+                    break
+                self.direction_picker.set_ring_tilt(round(abs(float(np.degrees(np.arcsin(np.clip(axis_y, -1.0, 1.0)))))))
+                break
+        self.direction_picker.set_selected(names)
 
     def _refresh_preview(self) -> None:
         frame_id = self.frame_selector.current_frame_id()
         if self.state.conn is None or frame_id is None:
             self.preview.set_items([])
+            self.direction_picker.set_background(None)
             return
+        frame_row = self.state.conn.execute("SELECT path FROM frames WHERE frame_id = ?", (frame_id,)).fetchone()
+        if frame_row is not None:
+            frame_path = self.state.project_root / frame_row[0]
+            thumb = frame_path.parent / "thumbs" / f"{frame_path.stem}.jpg"
+            self.direction_picker.set_background(thumb if thumb.exists() else frame_path)
         rows = self.state.conn.execute(
-            "SELECT projection_id, image_path FROM views WHERE frame_id = ? ORDER BY view_id", (frame_id,)
+            "SELECT projection_id, image_path FROM views WHERE frame_id = ?", (frame_id,)
         ).fetchall()
         items = [
             (self.state.project_root / image_path, Path(image_path).stem)
-            for _projection_id, image_path in rows
+            for _projection_id, image_path in sorted(rows, key=lambda r: direction_sort_key(Path(r[1]).stem))
         ]
         self.preview.set_items(items)
 
     def _selected_face_names(self) -> list[str]:
-        return [name for name, cb in self.face_checks.items() if cb.isChecked()]
+        return self.direction_picker.selected_names()
 
     def _on_parallel_toggled(self, checked: bool) -> None:
         self.worker_count_spin.setEnabled(checked)
@@ -2007,7 +2062,7 @@ class ProjectionPanel(QWidget):
             return
         face_names = self._selected_face_names()
         if not face_names:
-            QMessageBox.warning(self, "No views selected", "Check at least one face to generate.")
+            QMessageBox.warning(self, "No views selected", "Select at least one view direction to generate.")
             return
         name = choice.name
         max_workers = self._current_max_workers()
@@ -2018,9 +2073,10 @@ class ProjectionPanel(QWidget):
                 "face_size": self.face_size_spin.value(),
                 "fov_degrees": self.fov_spin.value(),
                 "face_names": face_names,
+                "ring_tilt_degrees": self.direction_picker.ring_tilt(),
                 "max_workers": max_workers,
             },
-            f"Projection — {name} ({', '.join(face_names)})",
+            f"Projection — {name} ({_describe_directions(face_names)})",
             target_frame_set_id=choice.frame_set_id,
         )
 
@@ -2030,7 +2086,7 @@ class ProjectionPanel(QWidget):
             return
         face_names = self._selected_face_names()
         if not face_names:
-            QMessageBox.warning(self, "No views selected", "Check at least one face to generate.")
+            QMessageBox.warning(self, "No views selected", "Select at least one view direction to generate.")
             return
         max_workers = self._current_max_workers()
         self.generate_btn.setEnabled(False)
@@ -2044,6 +2100,7 @@ class ProjectionPanel(QWidget):
             self.fov_spin.value(),
             face_names,
             max_workers,
+            self.direction_picker.ring_tilt(),
             on_success=self._on_generate_success,
             on_error=self._on_generate_error,
             on_progress=self.progress_area.update_progress,
@@ -2570,9 +2627,11 @@ class MasksPanel(QWidget):
         self.face_combo.clear()
         frame_id = self.frame_selector.current_frame_id()
         excluded = self._excluded_view_ids()
-        for f_id, view_id, keep_fraction in self._flat_views:
-            if f_id != frame_id:
-                continue
+        frame_views = sorted(
+            (row for row in self._flat_views if row[0] == frame_id),
+            key=lambda row: direction_sort_key(row[1].split(":")[-1]),
+        )
+        for _f_id, view_id, keep_fraction in frame_views:
             face_name = view_id.split(":")[-1]
             if view_id in excluded:
                 status = "excluded"
@@ -2942,7 +3001,7 @@ class PoseEstimationPanel(QWidget):
 
         form = QFormLayout()
         self.engine_combo = QComboBox()
-        self.engine_combo.addItem("COLMAP (six-face projections)", userData=ENGINE_COLMAP_PROJECTIONS)
+        self.engine_combo.addItem("COLMAP (perspective projections)", userData=ENGINE_COLMAP_PROJECTIONS)
         self.engine_combo.addItem(
             "COLMAP native equirectangular (raw frames)", userData=ENGINE_COLMAP_EQUIRECTANGULAR
         )
@@ -3170,7 +3229,7 @@ class PoseEstimationPanel(QWidget):
         engine_label = {
             ENGINE_SPHERESFM: "SphereSfM",
             ENGINE_COLMAP_EQUIRECTANGULAR: "COLMAP (equirectangular)",
-        }.get(self.engine_combo.currentData(), "COLMAP (six-face projections)")
+        }.get(self.engine_combo.currentData(), "COLMAP (perspective projections)")
         choice = self._choices.get(frame_set_id)
         scope = choice.name if choice else "all frame sets"
         changed = describe_sfm_options(SfmConfig.from_dict(options))
@@ -3590,7 +3649,7 @@ class ExportPanel(QWidget):
                 engine = "SphereSfM" if config.get("engine") == "spheresfm" else "COLMAP equirectangular"
                 self._run_frame_sets[run_id] = config.get("frame_set_id") or config.get("source_id")
             else:
-                engine = "COLMAP six-face"
+                engine = "COLMAP perspective"
             label = (
                 f"{created_at} -- {engine}, {stats['registered_images']}/{stats['total_images']} registered "
                 f"({run_id[:12]})"
@@ -3665,7 +3724,7 @@ class ExportPanel(QWidget):
         elif mode == "realityscan":
             self.mode_note.setText(
                 "No pose data is exported -- RealityScan runs its own pose estimation on these "
-                "images instead. Only the six-face projection images are used, with masks written "
+                "images instead. Only the perspective projection images are used, with masks written "
                 "next to each image using RealityScan's own naming convention (not Postshot's). "
                 "Unverified against a real RealityScan install -- see docs/adr/0028. If vine360's own "
                 "SfM has already run, the \"Include camera priors\" option below can also write a "
@@ -3675,7 +3734,7 @@ class ExportPanel(QWidget):
         else:
             self.mode_note.setText(
                 "No pose data is exported -- Postshot runs its own COLMAP-based pose estimation on "
-                "these images instead. Only the six-face projection images are used (masks aren't "
+                "these images instead. Only the perspective projection images are used (masks aren't "
                 "built against raw equirectangular frames yet); no SfM run is required in vine360 "
                 "for this mode."
             )

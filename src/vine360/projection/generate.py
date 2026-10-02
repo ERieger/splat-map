@@ -2,7 +2,7 @@
 (handover doc, section 4, step 3 "Project"). Bridges the pure projection
 library (geometry.py, cubemap.py, render.py -- which know nothing about
 sqlite or the project layout) to the project's index database and
-`project/projections/<frame_id>/<face>.png` filesystem layout.
+`project/projections/<frame_id>/<direction>.png` filesystem layout.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from PIL import Image
 
 from vine360.cleanup import remove_view_files
 from vine360.models import View
-from vine360.projection.cubemap import FaceSpec, six_face_preset
+from vine360.projection.cubemap import DEFAULT_RING_TILT_DEGREES, FaceSpec, six_face_preset
 from vine360.projection.render import project_equirect_to_face
 
 
@@ -76,7 +76,7 @@ def _render_and_save_frame_views(
             View(
                 view_id=f"{frame_id}:{face.name}",
                 frame_id=frame_id,
-                projection_id="six-face",
+                projection_id="directions",
                 width=face.intrinsics.width,
                 height=face.intrinsics.height,
                 intrinsics=face.intrinsics.to_dict(),
@@ -119,10 +119,12 @@ def generate_views_for_frame(
     fov_degrees: float = 90.0,
     include_polar_faces: bool = False,
     face_names: list[str] | None = None,
+    ring_tilt_degrees: float = DEFAULT_RING_TILT_DEGREES,
 ) -> list[View]:
-    """face_names, if given, selects an explicit subset of faces to
-    generate (overrides include_polar_faces) -- see
-    vine360.projection.cubemap.six_face_preset."""
+    """face_names, if given, selects an explicit set of view directions
+    to generate (any catalog name, overrides include_polar_faces);
+    ring_tilt_degrees is the pitch of the -down/-up rings -- see
+    vine360.projection.cubemap."""
     project_root = Path(project_root)
     row = conn.execute("SELECT path FROM frames WHERE frame_id = ?", (frame_id,)).fetchone()
     if row is None:
@@ -131,7 +133,11 @@ def generate_views_for_frame(
     clear_views_for_frame(conn, project_root, frame_id)
 
     faces = six_face_preset(
-        face_size=face_size, fov_degrees=fov_degrees, include_polar_faces=include_polar_faces, face_names=face_names
+        face_size=face_size,
+        fov_degrees=fov_degrees,
+        include_polar_faces=include_polar_faces,
+        face_names=face_names,
+        ring_tilt_degrees=ring_tilt_degrees,
     )
     views = _render_and_save_frame_views(project_root, frame_id, row[0], faces)
     _insert_view_rows(conn, views)
@@ -147,11 +153,13 @@ def generate_views_for_frame_set(
     fov_degrees: float = 90.0,
     include_polar_faces: bool = False,
     face_names: list[str] | None = None,
+    ring_tilt_degrees: float = DEFAULT_RING_TILT_DEGREES,
     progress_callback=None,
     max_workers: int | None = None,
 ) -> list[View]:
     """progress_callback(message, current, total), current/total counted in
-    frames processed (not individual face images).
+    frames processed (not individual face images). face_names /
+    ring_tilt_degrees: as generate_views_for_frame.
 
     max_workers, when >= 2 and the frame set has more than one frame, renders
     frames concurrently across that many worker processes
@@ -177,7 +185,11 @@ def generate_views_for_frame_set(
         raise ProjectionGenerationError(f"no frames found for frame set {frame_set_id}; extract frames first")
 
     faces = six_face_preset(
-        face_size=face_size, fov_degrees=fov_degrees, include_polar_faces=include_polar_faces, face_names=face_names
+        face_size=face_size,
+        fov_degrees=fov_degrees,
+        include_polar_faces=include_polar_faces,
+        face_names=face_names,
+        ring_tilt_degrees=ring_tilt_degrees,
     )
 
     # Clear every frame's stale views/masks up front, before any frame's
@@ -210,5 +222,5 @@ def generate_views_for_frame_set(
                 completed += 1
                 notify(f"Projecting frame {completed}/{total}…", completed, total)
 
-    notify(f"Projected {total} frames ({len(all_views)} views).", total, total)
+    notify(f"Projected {total} frames ({len(all_views)} views, {len(faces)} per frame).", total, total)
     return all_views

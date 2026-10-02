@@ -79,7 +79,7 @@ class SfmRunInfo:
     def engine_label(self) -> str:
         if self.engine == "spheresfm":
             return "SphereSfM (raw 360 frames)"
-        return "COLMAP equirectangular (raw frames)" if self.image_source == "frames" else "COLMAP six-face projections"
+        return "COLMAP equirectangular (raw frames)" if self.image_source == "frames" else "COLMAP perspective projections"
 
 
 @dataclass
