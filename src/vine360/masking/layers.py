@@ -363,12 +363,24 @@ def build_layers_for_frame_set(
 
 
 def set_layer_enabled(
-    conn: sqlite3.Connection, project_root: Path, view_ids: list[str], layer: str, enabled: bool
+    conn: sqlite3.Connection,
+    project_root: Path,
+    view_ids: list[str],
+    layer: str,
+    enabled: bool,
+    progress_callback=None,
 ) -> int:
     """Switches an existing layer on/off for the given views (without
-    rebuilding it) and recomposes them. Returns how many views changed."""
+    rebuilding it) and recomposes them. Returns how many views changed.
+    Recomposing reads and writes every view's PNGs, so a whole frame set
+    takes a while -- progress is reported per view."""
+    notify = progress_callback or (lambda *a: None)
+    action = "Merging" if enabled else "Unmerging"
+    label = LAYER_SPECS[layer].label.lower() if layer in LAYER_SPECS else layer
+    total = len(view_ids)
     changed = 0
-    for view_id in view_ids:
+    for index, view_id in enumerate(view_ids):
+        notify(f"{action} {label} layer, recomposing keep-masks (CPU): view {index + 1}/{total}", index, total)
         cursor = conn.execute(
             "UPDATE mask_layers SET enabled = ? WHERE view_id = ? AND layer = ? AND enabled != ?",
             (int(enabled), view_id, layer, int(enabled)),
@@ -376,7 +388,14 @@ def set_layer_enabled(
         if cursor.rowcount:
             changed += 1
             compose_view(conn, project_root, view_id, commit=False)
+            conn.commit()  # per view, so an interrupted run leaves each view consistent
     conn.commit()
+    notify(
+        f"{label.capitalize()} layer {'merged into' if enabled else 'removed from'} the keep-mask of "
+        f"{changed}/{total} views.",
+        total,
+        total,
+    )
     return changed
 
 

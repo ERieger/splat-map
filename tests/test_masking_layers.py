@@ -140,6 +140,24 @@ def test_disabling_a_layer_recomposes_and_makes_the_composite_newer(project):
     assert _keep(root, view_id)[10, 50] == 0
 
 
+def test_set_layer_enabled_reports_counted_progress(project):
+    # The GUI's set-wide "merged" toggle runs this on a background thread;
+    # without per-view progress the app looked frozen for the whole set.
+    root, conn = project
+    view_ids = [_add_view(conn, root, i) for i in range(3)]
+    build_layers_for_frame_set(conn, root, "s1", {LAYER_SKY: None})
+    calls = []
+
+    changed = set_layer_enabled(
+        conn, root, view_ids, LAYER_SKY, False, progress_callback=lambda *a: calls.append(a)
+    )
+
+    assert changed == 3
+    assert [(c[1], c[2]) for c in calls] == [(0, 3), (1, 3), (2, 3), (3, 3)]
+    assert "view 1/3" in calls[0][0]
+    assert "3/3 views" in calls[-1][0]
+
+
 def test_rebuilding_keeps_a_layer_disabled(project):
     root, conn = project
     view_id = _add_view(conn, root, 0)

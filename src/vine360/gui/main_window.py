@@ -2121,6 +2121,28 @@ def _build_mask_layer_worker(
         conn.close()
 
 
+@logged_operation(
+    "masks.merge",
+    "Mask layer merge",
+    target=lambda p: f"{p.get('layer')} @ {p.get('frame_set_id')}",
+    summarize=lambda changed, _conn: f"{changed} views recomposed",
+)
+def _set_layer_merged_worker(
+    project_root: Path, frame_set_id: str, layer: str, enabled: bool, progress_callback=None
+) -> int:
+    """Switches a layer into/out of every keep-mask in a frame set. No layer
+    is rebuilt, but every view is recomposed (PNG reads/writes), which is
+    far too slow for the GUI thread on a full frame set."""
+    conn = open_index_db(project_root)
+    try:
+        return set_layer_enabled(
+            conn, project_root, frame_set_view_ids(conn, frame_set_id), layer, enabled,
+            progress_callback=progress_callback,
+        )
+    finally:
+        conn.close()
+
+
 def _numpy_to_pixmap(image: np.ndarray, max_size: int | None = None) -> QPixmap:
     image = np.ascontiguousarray(image)
     height, width = image.shape[:2]
@@ -2185,6 +2207,7 @@ class MasksPanel(QWidget):
         # The face being reviewed ("front", "left", ...) -- kept across frame
         # changes so one perspective can be scrubbed through time.
         self._sticky_face: str | None = None
+        self._job_running = False  # a Build/Regenerate/merge worker of this panel's own
         layout = QVBoxLayout(self)
         _panel_header(
             "Masks",
@@ -2424,7 +2447,7 @@ class MasksPanel(QWidget):
         self._refresh_frame_list()
 
     def _busy(self) -> bool:
-        return bool(self.state.queue_manager and self.state.queue_manager.is_running)
+        return self._job_running or bool(self.state.queue_manager and self.state.queue_manager.is_running)
 
     def _refresh_run_enabled(self) -> None:
         choice = self._choices.get(self.source_combo.currentData())
@@ -2488,7 +2511,7 @@ class MasksPanel(QWidget):
             else:
                 edited = f", {info['edited']} hand-edited" if info["edited"] else ""
                 row.coverage.setText(f"built for {info['views']}/{total} views, present in {info['nonempty']}{edited}")
-                row.merged.setEnabled(True)
+                row.merged.setEnabled(not self._job_running)
                 if info["enabled"] == info["views"]:
                     row.merged.setCheckState(Qt.Checked)
                 elif info["enabled"] == 0:
@@ -2664,11 +2687,15 @@ class MasksPanel(QWidget):
         # A click on a partial/unchecked box turns the layer on everywhere;
         # on a fully checked box, off everywhere.
         enable = row.merged.checkState() != Qt.Unchecked
-        set_layer_enabled(
-            self.state.conn, self.state.project_root, frame_set_view_ids(self.state.conn, frame_set_id), layer, enable
+        label = LAYER_SPECS[layer].label.lower()
+        self._start(
+            f"{'Merging' if enable else 'Unmerging'} the {label} layer across the frame set…",
+            _set_layer_merged_worker,
+            frame_set_id,
+            layer,
+            enable,
+            on_success=self._on_merge_success,
         )
-        self._refresh_frame_list()
-        self.state.notify_change()
 
     def _jump_to_view(self, frame_id: str, view_id: str) -> None:
         self._sticky_face = view_id.split(":")[-1]
@@ -2740,17 +2767,19 @@ class MasksPanel(QWidget):
             target_frame_set_id=choice.frame_set_id,
         )
 
-    def _start(self, message: str, worker, *args) -> None:
+    def _start(self, message: str, worker, *args, on_success=None) -> None:
+        self._job_running = True
         self.build_btn.setEnabled(False)
         for row in self.layer_rows.values():
             row.regenerate.setEnabled(False)
+            row.merged.setEnabled(False)
         self.progress_area.start(message)
         run_in_background(
             self,
             worker,
             self.state.project_root,
             *args,
-            on_success=self._on_build_success,
+            on_success=on_success or self._on_build_success,
             on_error=self._on_build_error,
             on_progress=self.progress_area.update_progress,
         )
@@ -2791,14 +2820,24 @@ class MasksPanel(QWidget):
             overwrite_edited,
         )
 
+    def _on_merge_success(self, changed: int) -> None:
+        self._job_running = False
+        self.progress_area.finish(f"{changed} views recomposed.")
+        self._refresh_run_enabled()
+        self._refresh_frame_list()
+        self.state.notify_change()
+
     def _on_build_success(self, summary) -> None:
+        self._job_running = False
         self._refresh_run_enabled()
         self.progress_area.finish(_summarize_mask_build(summary, None))
         self.refresh_sources()
         self.state.notify_change()
 
     def _on_build_error(self, exc: Exception) -> None:
+        self._job_running = False
         self._refresh_run_enabled()
+        self._refresh_frame_list()  # re-enables the merged checkboxes
         self.progress_area.finish("")
         if isinstance(exc, MaskLayerError):
             QMessageBox.warning(self, "Masking failed", str(exc))
