@@ -94,9 +94,9 @@ def test_remove_source_also_clears_its_frames(tmp_path):
     frames_dir.mkdir(parents=True)
     (frames_dir / "frame_000001.png").write_bytes(b"fake")
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES (?, ?, 0.0, '{}', 'frames/x/frame_000001.png', 'deadbeef')",
-        (f"{source.source_id}:000000", source.source_id),
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES (?, ?, 0.0, '{}', 'frames/x/frame_000001.png', 'deadbeef', ?)",
+        (f"{source.source_id}:000000", source.source_id, source.source_id),
     )
     conn.commit()
 

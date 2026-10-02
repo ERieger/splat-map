@@ -174,3 +174,50 @@ def test_poll_output_frame_count_reports_files_as_they_appear(tmp_path):
         stop_event.set()
         poller.join(timeout=1.0)
     assert not poller.is_alive()
+
+
+def test_frame_set_tag_and_label():
+    from vine360.ingest.frames import frame_set_label, frame_set_tag
+
+    plain = {"mode": "interval", "interval_seconds": 0.5}
+    assert frame_set_tag(plain) == "i0.5"
+    assert frame_set_label(plain) == "every 0.5s"
+    ranged = {"mode": "interval", "interval_seconds": 1.0, "start_time_seconds": 10.0, "end_time_seconds": 60.0}
+    assert frame_set_tag(ranged) == "i1_r10-60"
+    assert frame_set_label(ranged) == "every 1s, 10.0s–60.0s"
+    open_ended = {"mode": "interval", "interval_seconds": 2.0, "start_time_seconds": 5.0, "end_time_seconds": None}
+    assert frame_set_tag(open_ended) == "i2_r5-end"
+    counted = {"mode": "count", "interval_seconds": 0.37, "requested_count": 200}
+    assert frame_set_tag(counted) == "n200"
+    assert frame_set_label(counted) == "200 frames total"
+
+
+def test_frame_set_id_for_is_deterministic_and_reuses_a_matching_set(tmp_path):
+    from vine360.config import CaptureMode
+    from vine360.ingest.frames import frame_set_id_for
+    from vine360.project import create_project, open_index_db
+
+    root = tmp_path / "proj"
+    create_project(root, "Test", CaptureMode.THREE_SIXTY)
+    conn = open_index_db(root)
+    try:
+        assert frame_set_id_for(conn, "s1", interval_seconds=0.5) == "s1~i0.5"
+        # start_time 0 is the same config as no start time
+        assert frame_set_id_for(conn, "s1", interval_seconds=0.5, start_time=0.0) == "s1~i0.5"
+        assert frame_set_id_for(conn, "s1", interval_seconds=0.5, end_time=30.0) == "s1~i0.5_r0-30"
+
+        # A legacy frame set (id == source_id, docs/adr/0034) with the same
+        # config is reused rather than duplicated.
+        conn.execute(
+            "INSERT INTO sources (source_id, path, checksum, media_type, projection, timestamps) "
+            "VALUES ('s1', '/a.mp4', 'x', 'video', 'equirectangular', '{}')"
+        )
+        conn.execute(
+            "INSERT INTO frame_sets (frame_set_id, source_id, label, extraction_settings, created_at) "
+            "VALUES ('s1', 's1', 'every 1s', ?, '2026-01-01')",
+            ('{"mode": "interval", "interval_seconds": 1.0, "start_time_seconds": null, "end_time_seconds": null}',),
+        )
+        assert frame_set_id_for(conn, "s1", interval_seconds=1.0) == "s1"
+        assert frame_set_id_for(conn, "s1", interval_seconds=0.5) == "s1~i0.5"
+    finally:
+        conn.close()

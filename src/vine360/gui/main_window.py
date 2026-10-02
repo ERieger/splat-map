@@ -60,12 +60,28 @@ from PySide6.QtWidgets import (
     QStyle,
     QTableWidget,
     QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from vine360.config import FRAME_PRESET_INTERVALS, CaptureMode, FramePreset
-from vine360.ingest.frames import FrameExtractionError, extract_frames
+from vine360.data_manager import (
+    DataManagerError,
+    delete_export_dir,
+    delete_frame_set,
+    delete_masks_for_frame_set,
+    delete_sfm_run,
+    delete_views_for_frame_set,
+    directory_size,
+    frame_set_disk_usage,
+    list_export_dirs,
+    list_frame_sets,
+    list_sfm_runs,
+    list_sources,
+)
+from vine360.ingest.frames import FrameExtractionError, extract_frames, frame_set_id_for
 from vine360.ingest.media_probe import ProbeError
 from vine360.ingest.sources import (
     EquirectangularConfirmationRequired,
@@ -73,7 +89,7 @@ from vine360.ingest.sources import (
     add_source,
     remove_source,
 )
-from vine360.masking.build import MaskBuildError, build_masks_for_source, set_view_flagged
+from vine360.masking.build import MaskBuildError, build_masks_for_frame_set, set_view_flagged
 from vine360.masking.sam3_adapter import validate_installation as sam3_validate_installation
 from vine360.masking.semantics import is_keep_fraction_anomalous
 from vine360.models import Project
@@ -85,7 +101,7 @@ from vine360.project import (
     open_index_db,
 )
 from vine360.projection.cubemap import ALL_FACE_NAMES
-from vine360.projection.generate import ProjectionGenerationError, generate_views_for_source
+from vine360.projection.generate import ProjectionGenerationError, generate_views_for_frame_set
 from vine360.runners.local import LocalRunner
 from vine360.runners.probe import probe_dependencies
 from vine360.export.postshot import (
@@ -146,6 +162,7 @@ STAGE_PROJECTION = 3
 STAGE_MASKS = 4
 STAGE_POSE = 5
 STAGE_EXPORT = 6
+STAGE_DATA_MANAGER = 7  # not a pipeline stage: no status dot, not in compute_stage_statuses
 
 
 @dataclass
@@ -212,6 +229,101 @@ def compute_stage_statuses(conn: sqlite3.Connection | None) -> dict[int, str]:
         STAGE_MASKS: DONE if n_masks > 0 else (ACTIVE if n_views > 0 else PENDING),
         STAGE_POSE: pose_status,
     }
+
+
+@dataclass
+class FrameSetChoice:
+    """One entry in a stage panel's frame-set dropdown (docs/adr/0034)."""
+
+    frame_set_id: str
+    source_id: str
+    name: str  # "<clip file name> — <config label>"
+    frame_count: int = 0
+    view_count: int = 0
+    mask_count: int = 0
+    pending: str | None = None  # why it has no frames yet ("queued", "not extracted"), None once extracted
+
+
+def frame_set_choices(state: AppState, *, equirect_only: bool = False) -> list[FrameSetChoice]:
+    """What the Projection/Masks/Pose/Export dropdowns offer: every
+    extracted frame set, plus the ones that don't exist *yet* but can be
+    targeted through the queue -- a frame set a queued Frames job will
+    write, and, for a video source with no frame sets at all, the
+    balanced-preset frame set the queue knows how to auto-extract (the
+    same "Add to Queue on a source with nothing upstream yet" path these
+    panels had per-source before frame sets)."""
+    conn = state.conn
+    if conn is None:
+        return []
+    from vine360.ingest.frames import frame_set_label
+
+    sources = {
+        source_id: (path, projection)
+        for source_id, path, projection in conn.execute(
+            "SELECT source_id, path, projection FROM sources WHERE media_type = 'video' ORDER BY rowid"
+        )
+    }
+
+    def allowed(source_id: str) -> bool:
+        return source_id in sources and (not equirect_only or sources[source_id][1] == "equirectangular")
+
+    choices = [
+        FrameSetChoice(
+            info.frame_set_id, info.source_id, info.display_name, info.frame_count, info.view_count, info.mask_count
+        )
+        for info in list_frame_sets(conn)
+        if allowed(info.source_id)
+    ]
+    known = {c.frame_set_id for c in choices}
+    queue = state.queue_manager
+    for job in queue.jobs if queue is not None else []:
+        if (
+            job.stage != QUEUE_STAGE_FRAMES
+            or job.status in ("done", "failed", "skipped")
+            or not job.target_frame_set_id
+            or job.target_frame_set_id in known
+            or not allowed(job.target_source_id)
+        ):
+            continue
+        label = frame_set_label(
+            {
+                "mode": "interval",
+                "interval_seconds": job.params["interval_seconds"],
+                "start_time_seconds": job.params.get("start_time"),
+                "end_time_seconds": job.params.get("end_time"),
+            }
+        )
+        choices.append(
+            FrameSetChoice(
+                job.target_frame_set_id,
+                job.target_source_id,
+                f"{Path(sources[job.target_source_id][0]).name} — {label}",
+                pending="queued",
+            )
+        )
+        known.add(job.target_frame_set_id)
+    sources_with_sets = {c.source_id for c in choices}
+    balanced = FRAME_PRESET_INTERVALS[FramePreset.BALANCED]
+    for source_id, (path, _projection) in sources.items():
+        if source_id in sources_with_sets or not allowed(source_id):
+            continue
+        choices.append(
+            FrameSetChoice(
+                frame_set_id_for(conn, source_id, interval_seconds=balanced),
+                source_id,
+                f"{Path(path).name} — every {balanced:g}s",
+                pending="not extracted -- the queue will extract it with the balanced preset",
+            )
+        )
+    return choices
+
+
+def _restore_combo_selection(combo: QComboBox, data) -> None:
+    """Re-selects the entry whose userData is `data` after a combo was
+    repopulated (no-op if it's gone)."""
+    index = combo.findData(data) if data is not None else -1
+    if index >= 0:
+        combo.setCurrentIndex(index)
 
 
 class _BackgroundWorker(QObject):
@@ -986,6 +1098,7 @@ def _extract_frames_worker(
     start_time: float | None,
     end_time: float | None,
     generate_thumbnails: bool,
+    frame_set_id: str | None = None,
     progress_callback=None,
 ):
     conn = open_index_db(project_root)
@@ -999,6 +1112,7 @@ def _extract_frames_worker(
             start_time=start_time,
             end_time=end_time,
             generate_thumbnails=generate_thumbnails,
+            frame_set_id=frame_set_id,
             progress_callback=progress_callback,
         )
     finally:
@@ -1043,7 +1157,12 @@ class FramesPanel(QWidget):
         self.custom_interval_spin.setSuffix(" s")
         self.custom_interval_spin.setValue(FRAME_PRESET_INTERVALS[FramePreset.BALANCED])
         self.custom_interval_spin.setEnabled(False)
-        form.addRow("Custom interval:", self.custom_interval_spin)
+        # Last value typed while "custom" was selected -- restored on
+        # switching back to it, since a preset overwrites the (disabled)
+        # spin box to show that preset's own interval.
+        self._custom_interval = self.custom_interval_spin.value()
+        self.custom_interval_spin.valueChanged.connect(self._on_custom_interval_edited)
+        form.addRow("Interval:", self.custom_interval_spin)
         controls_layout.addLayout(form)
 
         range_row = QHBoxLayout()
@@ -1075,14 +1194,20 @@ class FramesPanel(QWidget):
         controls_layout.addWidget(self.thumbnails_check)
 
         intervals_note = QLabel(
-            "Preset intervals (vine360.config.FRAME_PRESET_INTERVALS): "
-            + ", ".join(f"{p.value}={FRAME_PRESET_INTERVALS[p]}s" for p in FRAME_PRESET_INTERVALS)
-            + ". Re-extracting a source replaces its previous frames. A time range only limits which "
-            "part of the source is sampled; the interval/preset still applies within it."
+            "Each interval/time-range combination is its own frame set, kept side by side with the "
+            "source's others -- extracting a combination that already exists replaces just that set. "
+            "A time range only limits which part of the source is sampled; the interval still applies "
+            "within it. Remove frame sets on the Data manager tab."
         )
         intervals_note.setWordWrap(True)
         intervals_note.setStyleSheet("color: palette(mid);")
         controls_layout.addWidget(intervals_note)
+
+        controls_layout.addWidget(QLabel("Frame sets already extracted from this source:"))
+        self.frame_sets_list = QListWidget()
+        self.frame_sets_list.setMaximumHeight(110)
+        self.frame_sets_list.setSelectionMode(QAbstractItemView.NoSelection)
+        controls_layout.addWidget(self.frame_sets_list)
 
         btn_row = QHBoxLayout()
         self.extract_btn = QPushButton("Extract Frames")
@@ -1121,15 +1246,15 @@ class FramesPanel(QWidget):
             return
         rows = self.state.conn.execute(
             "SELECT s.source_id, s.path, s.timestamps, "
-            "(SELECT COUNT(*) FROM frames WHERE frames.source_id = s.source_id) AS frame_count "
+            "(SELECT COUNT(*) FROM frame_sets WHERE frame_sets.source_id = s.source_id) AS set_count "
             "FROM sources s WHERE s.media_type = 'video' ORDER BY s.rowid"
         ).fetchall()
         self._source_durations: dict[str, float] = {}
-        for source_id, path, timestamps_json, frame_count in rows:
+        for source_id, path, timestamps_json, set_count in rows:
             duration = json.loads(timestamps_json).get("duration_seconds") if timestamps_json else None
             if duration:
                 self._source_durations[source_id] = duration
-            existing = f"{frame_count} frames already extracted" if frame_count else "no frames yet"
+            existing = f"{set_count} frame set{'s' if set_count != 1 else ''}" if set_count else "no frames yet"
             self.source_combo.addItem(f"{Path(path).name} ({source_id[:8]}) — {existing}", userData=source_id)
         has_sources = self.source_combo.count() > 0
         self._has_sources = has_sources
@@ -1143,7 +1268,16 @@ class FramesPanel(QWidget):
         self.extract_btn.setEnabled(getattr(self, "_has_sources", False) and not busy)
 
     def _on_preset_changed(self, text: str) -> None:
-        self.custom_interval_spin.setEnabled(FramePreset(text) == FramePreset.CUSTOM)
+        preset = FramePreset(text)
+        is_custom = preset == FramePreset.CUSTOM
+        self.custom_interval_spin.blockSignals(True)
+        self.custom_interval_spin.setValue(self._custom_interval if is_custom else FRAME_PRESET_INTERVALS[preset])
+        self.custom_interval_spin.blockSignals(False)
+        self.custom_interval_spin.setEnabled(is_custom)
+
+    def _on_custom_interval_edited(self, value: float) -> None:
+        if FramePreset(self.preset_combo.currentText()) == FramePreset.CUSTOM:
+            self._custom_interval = value
 
     def _current_interval(self) -> float:
         preset = FramePreset(self.preset_combo.currentText())
@@ -1158,6 +1292,19 @@ class FramesPanel(QWidget):
             spin.setMaximum(duration)
         self.start_time_spin.setValue(0.0)
         self.end_time_spin.setValue(duration)
+        self._refresh_frame_sets_list()
+
+    def _refresh_frame_sets_list(self) -> None:
+        self.frame_sets_list.clear()
+        source_id = self.source_combo.currentData()
+        if self.state.conn is None or source_id is None:
+            return
+        for info in list_frame_sets(self.state.conn, source_id=source_id):
+            self.frame_sets_list.addItem(
+                f"{info.label} — {info.frame_count} frames, {info.view_count} views, {info.mask_count} masks"
+            )
+        if self.frame_sets_list.count() == 0:
+            self.frame_sets_list.addItem("(none yet)")
 
     def _on_time_range_toggled(self, checked: bool) -> None:
         self.start_time_spin.setEnabled(checked)
@@ -1191,6 +1338,9 @@ class FramesPanel(QWidget):
             },
             f"Frame extraction — {name} (every {interval}s{range_label}"
             f"{'' if generate_thumbnails else ', no thumbnails'})",
+            target_frame_set_id=frame_set_id_for(
+                self.state.conn, source_id, interval_seconds=interval, start_time=start_time, end_time=end_time
+            ),
         )
 
     def _on_extract(self) -> None:
@@ -1220,7 +1370,9 @@ class FramesPanel(QWidget):
         )
 
     def _on_extract_success(self, frames) -> None:
-        self._refresh_run_enabled()
+        current = self.source_combo.currentIndex()
+        self.refresh_sources()  # frame-set counts changed
+        self.source_combo.setCurrentIndex(current)
         self.progress_area.finish(f"Extracted {len(frames)} frames.")
         self.state.notify_change()
 
@@ -1239,7 +1391,7 @@ def _default_parallel_worker_count() -> int:
 
 def _generate_views_worker(
     project_root: Path,
-    source_id: str,
+    frame_set_id: str,
     face_size: int,
     fov_degrees: float,
     face_names: list[str],
@@ -1248,10 +1400,10 @@ def _generate_views_worker(
 ):
     conn = open_index_db(project_root)
     try:
-        return generate_views_for_source(
+        return generate_views_for_frame_set(
             conn,
             project_root,
-            source_id,
+            frame_set_id,
             face_size=face_size,
             fov_degrees=fov_degrees,
             face_names=face_names,
@@ -1263,14 +1415,14 @@ def _generate_views_worker(
 
 
 class ProjectionPanel(QWidget):
-    """Real projection: vine360.projection.generate.generate_views_for_source,
+    """Real projection: vine360.projection.generate.generate_views_for_frame_set,
     run off the GUI thread. Previously this stage never left PENDING in the
     sidebar because it had no execution at all -- it does now."""
 
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
-        self._source_frame_counts: dict[str, int] = {}
+        self._choices: dict[str, FrameSetChoice] = {}
         layout = QVBoxLayout(self)
         _panel_header(
             "Projection",
@@ -1290,7 +1442,7 @@ class ProjectionPanel(QWidget):
         self.source_combo = QComboBox()
         self.source_combo.currentIndexChanged.connect(self._refresh_frame_list)
         self.source_combo.currentIndexChanged.connect(self._refresh_run_enabled)
-        form.addRow("Source (its extracted frames):", self.source_combo)
+        form.addRow("Frame set:", self.source_combo)
         self.face_size_spin = QSpinBox()
         self.face_size_spin.setRange(128, 4096)
         self.face_size_spin.setSingleStep(128)
@@ -1374,52 +1526,49 @@ class ProjectionPanel(QWidget):
             self.refresh_sources()
 
     def refresh_sources(self) -> None:
+        previous = self.source_combo.currentData()
         self.source_combo.clear()
         if self.state.conn is None:
             return
-        rows = self.state.conn.execute(
-            "SELECT s.source_id, s.path, "
-            "COUNT(DISTINCT f.frame_id) AS frame_count, COUNT(v.view_id) AS view_count "
-            "FROM sources s LEFT JOIN frames f ON f.source_id = s.source_id "
-            "LEFT JOIN views v ON v.frame_id = f.frame_id "
-            "WHERE s.media_type = 'video' "
-            "GROUP BY s.source_id ORDER BY s.rowid"
-        ).fetchall()
-        self._source_frame_counts = {}
-        for source_id, path, frame_count, view_count in rows:
-            self._source_frame_counts[source_id] = frame_count
-            existing = f"{view_count} views already generated" if view_count else "no views yet"
-            self.source_combo.addItem(
-                f"{Path(path).name} ({source_id[:8]}) — {frame_count} frames, {existing}", userData=source_id
-            )
+        self._choices = {c.frame_set_id: c for c in frame_set_choices(self.state)}
+        for choice in self._choices.values():
+            if choice.pending:
+                detail = f"no frames yet ({choice.pending})"
+            else:
+                views = f"{choice.view_count} views already generated" if choice.view_count else "no views yet"
+                detail = f"{choice.frame_count} frames, {views}"
+            self.source_combo.addItem(f"{choice.name} — {detail}", userData=choice.frame_set_id)
+        _restore_combo_selection(self.source_combo, previous)
         has_sources = self.source_combo.count() > 0
         self._has_sources = has_sources
         self.queue_btn.setEnabled(has_sources)
         self._refresh_run_enabled()
-        self.progress_area.label.setText("" if has_sources else "No video sources registered yet -- add one on Import.")
+        self.progress_area.label.setText(
+            "" if has_sources else "No video sources registered yet -- add one on Import, then extract frames."
+        )
         self._refresh_frame_list()
 
     def _refresh_run_enabled(self) -> None:
         busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
-        source_id = self.source_combo.currentData()
-        has_frames = bool(source_id) and self._source_frame_counts.get(source_id, 0) > 0
+        choice = self._choices.get(self.source_combo.currentData())
+        has_frames = choice is not None and choice.frame_count > 0
         self.generate_btn.setEnabled(has_frames and not busy)
         self.generate_btn.setToolTip(
             ""
             if has_frames
-            else 'This source has no extracted frames yet -- use "Add to Queue" instead; it will queue '
-            "frame extraction automatically ahead of this projection job."
+            else 'This frame set has no extracted frames yet -- use "Add to Queue" instead; it will queue '
+            "frame extraction automatically ahead of this projection job (or wait for the one already queued)."
         )
 
     def _refresh_frame_list(self) -> None:
-        source_id = self.source_combo.currentData()
+        frame_set_id = self.source_combo.currentData()
         frames: list[tuple[str, float, int]] = []
-        if self.state.conn is not None and source_id is not None:
+        if self.state.conn is not None and frame_set_id is not None:
             frames = self.state.conn.execute(
                 "SELECT f.frame_id, f.source_time, COUNT(v.view_id) AS view_count "
                 "FROM frames f LEFT JOIN views v ON v.frame_id = f.frame_id "
-                "WHERE f.source_id = ? GROUP BY f.frame_id ORDER BY f.source_time",
-                (source_id,),
+                "WHERE f.frame_set_id = ? GROUP BY f.frame_id ORDER BY f.source_time",
+                (frame_set_id,),
             ).fetchall()
         self.frame_selector.set_frames(frames)  # emits frame_changed -> _refresh_preview
 
@@ -1447,18 +1596,18 @@ class ProjectionPanel(QWidget):
         return self.worker_count_spin.value() if self.parallel_check.isChecked() else None
 
     def _on_add_to_queue(self) -> None:
-        source_id = self.source_combo.currentData()
-        if source_id is None:
+        choice = self._choices.get(self.source_combo.currentData())
+        if choice is None:
             return
         face_names = self._selected_face_names()
         if not face_names:
             QMessageBox.warning(self, "No views selected", "Check at least one face to generate.")
             return
-        name = self.source_combo.currentText().split(" (")[0]
+        name = choice.name
         max_workers = self._current_max_workers()
         self.state.queue_manager.add_job(
             QUEUE_STAGE_PROJECTION,
-            source_id,
+            choice.source_id,
             {
                 "face_size": self.face_size_spin.value(),
                 "fov_degrees": self.fov_spin.value(),
@@ -1466,11 +1615,12 @@ class ProjectionPanel(QWidget):
                 "max_workers": max_workers,
             },
             f"Projection — {name} ({', '.join(face_names)})",
+            target_frame_set_id=choice.frame_set_id,
         )
 
     def _on_generate(self) -> None:
-        source_id = self.source_combo.currentData()
-        if source_id is None:
+        frame_set_id = self.source_combo.currentData()
+        if frame_set_id is None:
             return
         face_names = self._selected_face_names()
         if not face_names:
@@ -1483,7 +1633,7 @@ class ProjectionPanel(QWidget):
             self,
             _generate_views_worker,
             self.state.project_root,
-            source_id,
+            frame_set_id,
             self.face_size_spin.value(),
             self.fov_spin.value(),
             face_names,
@@ -1511,14 +1661,14 @@ class ProjectionPanel(QWidget):
 
 
 def _build_masks_worker(
-    project_root: Path, source_id: str, use_sam3_person: bool, use_sam3_sky: bool, progress_callback=None
+    project_root: Path, frame_set_id: str, use_sam3_person: bool, use_sam3_sky: bool, progress_callback=None
 ):
     conn = open_index_db(project_root)
     try:
-        return build_masks_for_source(
+        return build_masks_for_frame_set(
             conn,
             project_root,
-            source_id,
+            frame_set_id,
             use_sam3_person=use_sam3_person,
             use_sam3_sky=use_sam3_sky,
             progress_callback=progress_callback,
@@ -1528,7 +1678,7 @@ def _build_masks_worker(
 
 
 class MasksPanel(QWidget):
-    """Real masking: vine360.masking.build.build_masks_for_source, run off
+    """Real masking: vine360.masking.build.build_masks_for_frame_set, run off
     the GUI thread. SAM 3, if requested, loads once for the whole batch
     (not once per view)."""
 
@@ -1539,7 +1689,7 @@ class MasksPanel(QWidget):
         # torch/transformers to check availability is expensive (roughly
         # 140MB -> 700MB+ RSS observed) and shouldn't cost anything at app
         # startup for users who never open this panel.
-        self._source_view_counts: dict[str, int] = {}
+        self._choices: dict[str, FrameSetChoice] = {}
         layout = QVBoxLayout(self)
         _panel_header("Masks", "Segment person/sky and build the keep-mask for each view.", layout)
 
@@ -1557,7 +1707,7 @@ class MasksPanel(QWidget):
         self.source_combo = QComboBox()
         self.source_combo.currentIndexChanged.connect(self._refresh_frame_list)
         self.source_combo.currentIndexChanged.connect(self._refresh_run_enabled)
-        form.addRow("Source (its generated views):", self.source_combo)
+        form.addRow("Frame set:", self.source_combo)
         controls_layout.addLayout(form)
 
         sam3_row = QHBoxLayout()
@@ -1664,23 +1814,19 @@ class MasksPanel(QWidget):
             self.refresh_sources()
 
     def refresh_sources(self) -> None:
+        previous = self.source_combo.currentData()
         self.source_combo.clear()
         if self.state.conn is None:
             return
-        rows = self.state.conn.execute(
-            "SELECT s.source_id, s.path, COUNT(DISTINCT v.view_id) AS view_count, COUNT(m.view_id) AS mask_count "
-            "FROM sources s LEFT JOIN frames f ON f.source_id = s.source_id "
-            "LEFT JOIN views v ON v.frame_id = f.frame_id LEFT JOIN masks m ON m.view_id = v.view_id "
-            "WHERE s.media_type = 'video' "
-            "GROUP BY s.source_id ORDER BY s.rowid"
-        ).fetchall()
-        self._source_view_counts = {}
-        for source_id, path, view_count, mask_count in rows:
-            self._source_view_counts[source_id] = view_count
-            existing = f"{mask_count} masked already" if mask_count else "not masked yet"
-            self.source_combo.addItem(
-                f"{Path(path).name} ({source_id[:8]}) — {view_count} views, {existing}", userData=source_id
-            )
+        self._choices = {c.frame_set_id: c for c in frame_set_choices(self.state)}
+        for choice in self._choices.values():
+            if choice.pending:
+                detail = f"no frames yet ({choice.pending})"
+            else:
+                masked = f"{choice.mask_count} masked already" if choice.mask_count else "not masked yet"
+                detail = f"{choice.view_count} views, {masked}"
+            self.source_combo.addItem(f"{choice.name} — {detail}", userData=choice.frame_set_id)
+        _restore_combo_selection(self.source_combo, previous)
         has_sources = self.source_combo.count() > 0
         self._has_sources = has_sources
         self.queue_btn.setEnabled(has_sources)
@@ -1690,33 +1836,33 @@ class MasksPanel(QWidget):
 
     def _refresh_run_enabled(self) -> None:
         busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
-        source_id = self.source_combo.currentData()
-        has_views = bool(source_id) and self._source_view_counts.get(source_id, 0) > 0
+        choice = self._choices.get(self.source_combo.currentData())
+        has_views = choice is not None and choice.view_count > 0
         self.build_btn.setEnabled(has_views and not busy)
         self.build_btn.setToolTip(
             ""
             if has_views
-            else 'This source has no projected views yet -- use "Add to Queue" instead; it will queue '
+            else 'This frame set has no projected views yet -- use "Add to Queue" instead; it will queue '
             "projection automatically ahead of this masking job."
         )
 
     def _refresh_frame_list(self) -> None:
-        source_id = self.source_combo.currentData()
+        frame_set_id = self.source_combo.currentData()
         self._flat_views = []
         frames: list[tuple[str, float, int]] = []
-        if self.state.conn is not None and source_id is not None:
+        if self.state.conn is not None and frame_set_id is not None:
             frame_rows = self.state.conn.execute(
                 "SELECT f.frame_id, f.source_time, COUNT(v.view_id) AS view_count "
                 "FROM frames f JOIN views v ON v.frame_id = f.frame_id "
-                "WHERE f.source_id = ? GROUP BY f.frame_id ORDER BY f.source_time",
-                (source_id,),
+                "WHERE f.frame_set_id = ? GROUP BY f.frame_id ORDER BY f.source_time",
+                (frame_set_id,),
             ).fetchall()
             frames = [(fid, t, vc) for fid, t, vc in frame_rows]
             self._flat_views = self.state.conn.execute(
                 "SELECT f.frame_id, v.view_id, m.keep_fraction, COALESCE(m.flagged_for_review, 0) "
                 "FROM views v JOIN frames f ON f.frame_id = v.frame_id LEFT JOIN masks m ON m.view_id = v.view_id "
-                "WHERE f.source_id = ? ORDER BY f.source_time, v.view_id",
-                (source_id,),
+                "WHERE f.frame_set_id = ? ORDER BY f.source_time, v.view_id",
+                (frame_set_id,),
             ).fetchall()
         self.frame_selector.set_frames(frames)  # emits frame_changed -> _refresh_face_combo
         self._update_stage_indicator()
@@ -1819,22 +1965,22 @@ class MasksPanel(QWidget):
             self.face_combo.setCurrentIndex(index)
 
     def _on_add_to_queue(self) -> None:
-        source_id = self.source_combo.currentData()
-        if source_id is None:
+        choice = self._choices.get(self.source_combo.currentData())
+        if choice is None:
             return
-        name = self.source_combo.currentText().split(" (")[0]
         use_person = self.sam3_person_check.isChecked()
         use_sky = self.sam3_sky_check.isChecked()
         self.state.queue_manager.add_job(
             QUEUE_STAGE_MASKS,
-            source_id,
+            choice.source_id,
             {"use_sam3_person": use_person, "use_sam3_sky": use_sky},
-            f"Masks — {name} (SAM 3 person={use_person}, sky={use_sky})",
+            f"Masks — {choice.name} (SAM 3 person={use_person}, sky={use_sky})",
+            target_frame_set_id=choice.frame_set_id,
         )
 
     def _on_build(self) -> None:
-        source_id = self.source_combo.currentData()
-        if source_id is None:
+        frame_set_id = self.source_combo.currentData()
+        if frame_set_id is None:
             return
         self.build_btn.setEnabled(False)
         self.flags_summary_label.setText("")
@@ -1844,7 +1990,7 @@ class MasksPanel(QWidget):
             self,
             _build_masks_worker,
             self.state.project_root,
-            source_id,
+            frame_set_id,
             self.sam3_person_check.isChecked(),
             self.sam3_sky_check.isChecked(),
             on_success=self._on_build_success,
@@ -1913,7 +2059,7 @@ ENGINE_SPHERESFM = "spheresfm"
 def _run_sfm_worker(
     project_root: Path,
     image_source: str,
-    source_id: str | None,
+    frame_set_id: str | None,
     camera_model: str,
     progress_callback=None,
 ):
@@ -1926,7 +2072,7 @@ def _run_sfm_worker(
             project_root,
             config=SfmConfig(camera_model=camera_model),
             image_source=image_source,
-            source_id=source_id,
+            frame_set_id=frame_set_id,
             progress_callback=progress_callback,
         )
     finally:
@@ -1949,7 +2095,7 @@ class PoseEstimationPanel(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
-        self._source_frame_counts: dict[str, int] = {}
+        self._choices: dict[str, FrameSetChoice] = {}
         layout = QVBoxLayout(self)
         _panel_header("Pose estimation", "Run COLMAP feature extraction, matching and mapping.", layout)
 
@@ -1971,7 +2117,7 @@ class PoseEstimationPanel(QWidget):
         form.addRow("Engine:", self.engine_combo)
         self.source_combo = QComboBox()
         self.source_combo.currentIndexChanged.connect(self._refresh_enabled)
-        form.addRow("Source (equirectangular only):", self.source_combo)
+        form.addRow("Frame set:", self.source_combo)
         controls_layout.addLayout(form)
 
         self.engine_note = QLabel("")
@@ -2017,32 +2163,47 @@ class PoseEstimationPanel(QWidget):
             self._show_latest_run()
 
     def _refresh_sources(self) -> None:
+        """The six-face engine can run project-wide ("All frame sets") or
+        on one frame set's views; the native-equirectangular engine always
+        needs one equirectangular frame set (docs/adr/0034)."""
+        previous = self.source_combo.currentData()
+        self.source_combo.blockSignals(True)
         self.source_combo.clear()
-        if self.state.conn is None:
-            return
-        rows = self.state.conn.execute(
-            "SELECT s.source_id, s.path, "
-            "(SELECT COUNT(*) FROM frames WHERE frames.source_id = s.source_id) AS frame_count "
-            "FROM sources s WHERE s.projection = 'equirectangular' AND s.media_type = 'video' "
-            "ORDER BY s.rowid"
-        ).fetchall()
-        self._source_frame_counts = {}
-        for source_id, path, frame_count in rows:
-            self._source_frame_counts[source_id] = frame_count
-            existing = f"{frame_count} frames extracted" if frame_count else "no frames yet"
-            self.source_combo.addItem(f"{Path(path).name} ({source_id[:8]}) — {existing}", userData=source_id)
+        self._choices = {}
+        if self.state.conn is not None:
+            engine = self.engine_combo.currentData()
+            frames_engine = engine == ENGINE_COLMAP_EQUIRECTANGULAR
+            if not frames_engine:
+                self.source_combo.addItem("All frame sets (every projected view in the project)", userData=None)
+            self._choices = {
+                c.frame_set_id: c for c in frame_set_choices(self.state, equirect_only=frames_engine)
+            }
+            for choice in self._choices.values():
+                if choice.pending:
+                    detail = f"no frames yet ({choice.pending})"
+                elif frames_engine:
+                    detail = f"{choice.frame_count} frames"
+                else:
+                    detail = f"{choice.view_count} views" if choice.view_count else "no views yet"
+                self.source_combo.addItem(f"{choice.name} — {detail}", userData=choice.frame_set_id)
+            _restore_combo_selection(self.source_combo, previous)
+        self.source_combo.blockSignals(False)
 
     def _on_engine_changed(self) -> None:
         engine = self.engine_combo.currentData()
-        self.source_combo.setEnabled(engine == ENGINE_COLMAP_EQUIRECTANGULAR)
+        self._refresh_sources()
+        self.source_combo.setEnabled(engine != ENGINE_SPHERESFM)
         if engine == ENGINE_COLMAP_PROJECTIONS:
             self.engine_note.setText(
-                "Runs against every projected view in project/projections/, using masks from "
-                "project/masks/keep/ if any have been built. The handover doc's originally recommended pipeline."
+                "Runs against the projected views of the chosen frame set -- or every projected view in "
+                "project/projections/ for \"All frame sets\" -- using masks from project/masks/keep/ if any "
+                "have been built. The handover doc's originally recommended pipeline. If a source has more "
+                "than one frame set, pick one: \"All\" would feed COLMAP near-duplicate images of the same "
+                "moments."
             )
         elif engine == ENGINE_COLMAP_EQUIRECTANGULAR:
             self.engine_note.setText(
-                "Runs directly on the selected source's raw equirectangular frames, using COLMAP's own native "
+                "Runs directly on the selected frame set's raw equirectangular frames, using COLMAP's own native "
                 "EQUIRECTANGULAR camera model -- no projection step needed. Confirmed for real with synthetic "
                 "ground truth (full registration, near-zero error); real-photo feature-matching quality near the "
                 "poles and across the seam is unproven. No masking support yet on this path."
@@ -2070,14 +2231,21 @@ class PoseEstimationPanel(QWidget):
             self.run_btn.setToolTip("Not runnable here -- SphereSfM needs a custom build; see the note above.")
             return
         self.run_btn.setToolTip("")
+        choice = self._choices.get(self.source_combo.currentData())
         if engine == ENGINE_COLMAP_EQUIRECTANGULAR:
-            source_id = self.source_combo.currentData()
-            has_frames = bool(source_id) and self._source_frame_counts.get(source_id, 0) > 0
+            has_frames = choice is not None and choice.frame_count > 0
             self.run_btn.setEnabled(has_frames and not busy)
             if not has_frames:
                 self.run_btn.setToolTip(
-                    'This source has no extracted frames yet -- use "Add to Queue" instead; it will '
+                    'This frame set has no extracted frames yet -- use "Add to Queue" instead; it will '
                     "queue frame extraction automatically first."
+                )
+        elif choice is not None:
+            self.run_btn.setEnabled(choice.view_count > 0 and not busy)
+            if choice.view_count == 0:
+                self.run_btn.setToolTip(
+                    'This frame set has no projected views yet -- use "Add to Queue" instead; it will '
+                    "queue projection automatically first."
                 )
         else:
             n_views = self.state.conn.execute("SELECT COUNT(*) FROM views").fetchone()[0]
@@ -2101,28 +2269,30 @@ class PoseEstimationPanel(QWidget):
         engine = self.engine_combo.currentData()
         if engine == ENGINE_COLMAP_EQUIRECTANGULAR:
             return "frames", self.source_combo.currentData(), "EQUIRECTANGULAR"
-        return "projections", None, "SIMPLE_RADIAL"
+        return "projections", self.source_combo.currentData(), "SIMPLE_RADIAL"
 
     def _on_add_to_queue(self) -> None:
         if self.engine_combo.currentData() == ENGINE_SPHERESFM:
             QMessageBox.warning(self, "Not runnable", "SphereSfM needs a custom build; see the note above.")
             return
-        image_source, source_id, camera_model = self._current_sfm_args()
-        if image_source == "frames" and source_id is None:
-            QMessageBox.warning(self, "No source selected", "Choose an equirectangular source first.")
+        image_source, frame_set_id, camera_model = self._current_sfm_args()
+        if image_source == "frames" and frame_set_id is None:
+            QMessageBox.warning(self, "No frame set selected", "Choose an equirectangular frame set first.")
             return
         engine_label = (
             "COLMAP (equirectangular)" if image_source == "frames" else "COLMAP (six-face projections)"
         )
+        choice = self._choices.get(frame_set_id)
+        scope = choice.name if choice else "all frame sets"
         self.state.queue_manager.add_job(
             QUEUE_STAGE_POSE,
-            source_id,
-            {"image_source": image_source, "source_id": source_id, "camera_model": camera_model},
-            f"Pose estimation — {engine_label}",
+            choice.source_id if choice else None,
+            {"image_source": image_source, "frame_set_id": frame_set_id, "camera_model": camera_model},
+            f"Pose estimation — {engine_label}, {scope}",
         )
 
     def _on_run(self) -> None:
-        image_source, source_id, camera_model = self._current_sfm_args()
+        image_source, frame_set_id, camera_model = self._current_sfm_args()
 
         self.run_btn.setEnabled(False)
         self.progress_area.start("Running SfM…")
@@ -2131,7 +2301,7 @@ class PoseEstimationPanel(QWidget):
             _run_sfm_worker,
             self.state.project_root,
             image_source,
-            source_id,
+            frame_set_id,
             camera_model,
             on_success=self._on_run_success,
             on_error=self._on_run_error,
@@ -2318,12 +2488,12 @@ def _export_postshot_worker(project_root: Path, output_dir: Path, run_id: str | 
 
 
 def _export_frames_and_masks_worker(
-    project_root: Path, output_dir: Path, source_id: str | None, progress_callback=None
+    project_root: Path, output_dir: Path, frame_set_id: str | None, progress_callback=None
 ):
     conn = open_index_db(project_root)
     try:
         return export_frames_and_masks_for_postshot(
-            conn, project_root, output_dir, source_id=source_id, progress_callback=progress_callback
+            conn, project_root, output_dir, frame_set_id=frame_set_id, progress_callback=progress_callback
         )
     finally:
         conn.close()
@@ -2332,7 +2502,7 @@ def _export_frames_and_masks_worker(
 def _export_realityscan_worker(
     project_root: Path,
     output_dir: Path,
-    source_id: str | None,
+    frame_set_id: str | None,
     include_camera_priors: bool = False,
     progress_callback=None,
 ):
@@ -2342,7 +2512,7 @@ def _export_realityscan_worker(
             conn,
             project_root,
             output_dir,
-            source_id=source_id,
+            frame_set_id=frame_set_id,
             include_camera_priors=include_camera_priors,
             progress_callback=progress_callback,
         )
@@ -2372,7 +2542,7 @@ class ExportPanel(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
-        self._source_view_counts: dict[str, int] = {}
+        self._choices: dict[str, FrameSetChoice] = {}
         layout = QVBoxLayout(self)
         _panel_header(
             "Export",
@@ -2409,11 +2579,11 @@ class ExportPanel(QWidget):
         form.addRow("SfM run:", self.run_combo)
         self.source_combo = QComboBox()
         self.source_combo.setToolTip(
-            "Only applies to \"Images + masks only\" -- the poses mode always exports whatever "
-            "the chosen SfM run covers, with no per-source filter."
+            "Only applies to the two images + masks modes -- the poses mode always exports whatever "
+            "the chosen SfM run covers, with no per-frame-set filter."
         )
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
-        form.addRow("Source:", self.source_combo)
+        form.addRow("Frame set:", self.source_combo)
         self.priors_checkbox = QCheckBox("Include camera priors CSV (from vine360's own SfM run)")
         self.priors_checkbox.toggled.connect(self._on_priors_toggled)
         form.addRow("Priors:", self.priors_checkbox)
@@ -2465,6 +2635,13 @@ class ExportPanel(QWidget):
             self.state.queue_manager.queue_changed.connect(self._refresh_enabled)
 
     def on_project_changed(self) -> None:
+        # A folder pinned via "Choose output folder…" belongs to the
+        # previous project -- drop it so the new project's own exports/
+        # default takes over again.
+        self._output_dir_user_chosen = False
+        self.output_dir = None
+        self.output_label.setText("No output folder chosen.")
+        self._exported = False
         self.on_shown()
 
     def on_shown(self) -> None:
@@ -2491,29 +2668,24 @@ class ExportPanel(QWidget):
         self._refresh_enabled()
 
     def _refresh_sources(self) -> None:
-        """"All sources" (the default, matching this panel's original
-        behavior) plus every video source, whether or not it has
-        projected views yet -- broadened from an INNER JOIN so a
-        not-yet-projected source is still selectable (so it can be added
-        to the queue, which auto-inserts the missing Projection job
-        ahead of it); _refresh_enabled, not this method, is what actually
-        gates "Export for Postshot"/"Export for RealityScan" on the
-        selected source's view count."""
+        """"All frame sets" (the default, matching this panel's original
+        all-sources behavior) plus every frame set, whether or not it has
+        projected views yet -- a not-yet-projected one is still selectable
+        so it can be added to the queue, which auto-inserts the missing
+        Projection job ahead of it; _refresh_enabled, not this method, is
+        what actually gates the Export button on the selected frame set's
+        view count."""
         current = self.source_combo.currentData()
         self.source_combo.blockSignals(True)
         self.source_combo.clear()
-        self.source_combo.addItem("All sources", userData=None)
-        rows = self.state.conn.execute(
-            "SELECT s.source_id, s.path, COUNT(DISTINCT v.view_id) AS view_count "
-            "FROM sources s LEFT JOIN frames f ON f.source_id = s.source_id "
-            "LEFT JOIN views v ON v.frame_id = f.frame_id "
-            "WHERE s.media_type = 'video' GROUP BY s.source_id ORDER BY s.rowid"
-        ).fetchall()
-        self._source_view_counts = {}
-        for source_id, path, view_count in rows:
-            self._source_view_counts[source_id] = view_count
-            existing = f"{view_count} views" if view_count else "no views yet"
-            self.source_combo.addItem(f"{Path(path).name} ({source_id[:8]}) — {existing}", userData=source_id)
+        self.source_combo.addItem("All frame sets", userData=None)
+        self._choices = {c.frame_set_id: c for c in frame_set_choices(self.state)}
+        for choice in self._choices.values():
+            if choice.pending:
+                detail = f"no frames yet ({choice.pending})"
+            else:
+                detail = f"{choice.view_count} views" if choice.view_count else "no views yet"
+            self.source_combo.addItem(f"{choice.name} — {detail}", userData=choice.frame_set_id)
         index = self.source_combo.findData(current)
         self.source_combo.setCurrentIndex(index if index >= 0 else 0)
         self.source_combo.blockSignals(False)
@@ -2536,7 +2708,7 @@ class ExportPanel(QWidget):
         if poses_mode:
             self.mode_note.setText(
                 "Imports vine360's own already-computed COLMAP reconstruction into Postshot. Always "
-                "exports whatever the chosen SfM run covers -- the Source selector above doesn't "
+                "exports whatever the chosen SfM run covers -- the Frame set selector above doesn't "
                 "filter this mode (see docs/adr/0026)."
             )
         elif mode == "realityscan":
@@ -2578,15 +2750,13 @@ class ExportPanel(QWidget):
 
     def _capture_folder_name(self, mode: str) -> str:
         """The <capture> half of exports/<capture>/<format>/ (docs/adr/
-        0028). The two images-only modes are source-filterable (ADR
-        0026): a chosen source gets its own folder, "All sources" gets
-        "all". Poses mode has no source filter of its own, but if the
-        selected run was scoped to one source anyway (the native-
-        equirectangular engine records its source_id in the run's
-        config, the same field export_for_postshot itself reads), default
-        to that source's folder too -- a nicer default path only, not a
-        new filter; still "all" for a project-wide six-face-projections
-        run or when no run is selected yet."""
+        0028). The two images-only modes are frame-set-filterable (ADR
+        0026/0034): a chosen frame set gets its own folder, "All frame
+        sets" gets "all". Poses mode has no filter of its own, but if the
+        selected run was scoped to one frame set anyway, default to that
+        frame set's folder too -- a nicer default path only, not a new
+        filter; still "all" for a project-wide run or when no run is
+        selected yet."""
         if mode == "poses":
             run_id = self.run_combo.currentData()
             if run_id and self.state.conn is not None:
@@ -2595,21 +2765,28 @@ class ExportPanel(QWidget):
                 ).fetchone()
                 if row:
                     config = json.loads(row[0])
-                    if config.get("image_source") == "frames" and config.get("source_id"):
-                        return self._source_folder_name(config["source_id"])
+                    frame_set_id = config.get("frame_set_id") or (
+                        config.get("source_id") if config.get("image_source") == "frames" else None
+                    )
+                    if frame_set_id:
+                        return self._frame_set_folder_name(frame_set_id)
             return "all"
-        source_id = self.source_combo.currentData()
-        return self._source_folder_name(source_id) if source_id else "all"
+        frame_set_id = self.source_combo.currentData()
+        return self._frame_set_folder_name(frame_set_id) if frame_set_id else "all"
 
-    def _source_folder_name(self, source_id: str) -> str:
-        """A filesystem-safe folder name for a per-source export default
+    def _frame_set_folder_name(self, frame_set_id: str) -> str:
+        """A filesystem-safe folder name for a per-frame-set export default
         -- the source's own file stem where available (more useful than a
-        bare id at a glance), falling back to the id if sanitizing leaves
-        nothing usable."""
+        bare id at a glance) plus the frame set's config tag (e.g.
+        "clip_i0.5"), falling back to the id if sanitizing leaves nothing
+        usable. A legacy frame set (id == source_id, docs/adr/0034) keeps
+        the bare stem, so its exports land where they always did."""
+        source_id, _, tag = frame_set_id.partition("~")
         row = self.state.conn.execute("SELECT path FROM sources WHERE source_id = ?", (source_id,)).fetchone()
         stem = Path(row[0]).stem if row else ""
-        safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in stem)
-        return safe or source_id[:8]
+        name = f"{stem}_{tag}" if (stem and tag) else stem
+        safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in name)
+        return safe or frame_set_id[:8]
 
     def _refresh_enabled(self) -> None:
         busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
@@ -2618,21 +2795,21 @@ class ExportPanel(QWidget):
             configured = self.run_combo.count() > 0 and self.output_dir is not None
             has_prereq = True
         else:
-            source_id = self.source_combo.currentData()
-            has_prereq = source_id is None or self._source_view_counts.get(source_id, 0) > 0
+            choice = self._choices.get(self.source_combo.currentData())
+            has_prereq = choice is None or choice.view_count > 0
             configured = self.output_dir is not None and has_prereq
         self.export_btn.setEnabled(configured and not busy)
         self.export_btn.setToolTip(
             ""
             if has_prereq
-            else 'This source has no projected views yet -- use "Add to Queue" instead; it will queue '
+            else 'This frame set has no projected views yet -- use "Add to Queue" instead; it will queue '
             "projection automatically ahead of this export job."
         )
         self.queue_btn.setEnabled(self.output_dir is not None)
 
         if mode == "realityscan":
             priors_available = self.state.conn is not None and realityscan_priors_available(
-                self.state.conn, source_id=self.source_combo.currentData()
+                self.state.conn, frame_set_id=self.source_combo.currentData()
             )
             self.priors_checkbox.setEnabled(priors_available and not busy)
             if not priors_available and self.priors_checkbox.isChecked():
@@ -2640,7 +2817,7 @@ class ExportPanel(QWidget):
             self.priors_checkbox.setToolTip(
                 ""
                 if priors_available
-                else "No usable vine360 SfM run found for this source selection -- run Pose estimation first."
+                else "No usable vine360 SfM run found for this frame set selection -- run Pose estimation first."
             )
         else:
             self.priors_checkbox.setEnabled(False)
@@ -2655,8 +2832,9 @@ class ExportPanel(QWidget):
         )
 
     def _on_choose_output_dir(self) -> None:
-        default = str(self.output_dir) if self.output_dir else str(self.state.project_root)
-        directory = QFileDialog.getExistingDirectory(self, "Choose a folder to export into", default)
+        directory = QFileDialog.getExistingDirectory(
+            self, "Choose a folder to export into", str(self._dialog_start_dir())
+        )
         if directory:
             self.output_dir = Path(directory)
             self._output_dir_user_chosen = True  # pin it -- stop following mode/source changes
@@ -2664,20 +2842,32 @@ class ExportPanel(QWidget):
             self._exported = False  # a new output folder means the last export no longer matches it
             self._refresh_enabled()
 
+    def _dialog_start_dir(self) -> Path:
+        """The suggested exports/<capture>/<format>/ default usually doesn't
+        exist yet (it's only created by the export itself), and Qt's folder
+        dialog silently falls back to the process's working directory for a
+        missing path -- so start from the nearest folder that does exist,
+        which is at worst the project's own exports/."""
+        candidate = self.output_dir or (self.state.project_root / "exports")
+        while not candidate.is_dir() and candidate != candidate.parent:
+            candidate = candidate.parent
+        return candidate
+
     def _on_add_to_queue(self) -> None:
         if self.output_dir is None:
             QMessageBox.warning(self, "No output folder", "Choose an output folder first.")
             return
         mode = self.mode_combo.currentData()
-        source_id = self.source_combo.currentData() if mode != "poses" else None
-        params = {"mode": mode, "output_dir": str(self.output_dir), "source_id": source_id}
+        frame_set_id = self.source_combo.currentData() if mode != "poses" else None
+        params = {"mode": mode, "output_dir": str(self.output_dir), "frame_set_id": frame_set_id}
         if mode == "realityscan":
             params["include_camera_priors"] = self.priors_checkbox.isChecked()
         if mode == "poses":
             params["run_id"] = self.run_combo.currentData()  # None -> resolved lazily at run time
             label = f"Export — poses + images + masks → {self.output_dir.name}"
         else:
-            source_text = self.source_combo.currentText() if source_id else "all sources"
+            choice = self._choices.get(frame_set_id)
+            source_text = choice.name if choice else "all frame sets"
             mode_text = "RealityScan images + masks" if mode == "realityscan" else "images + masks only"
             label = f"Export — {mode_text} ({source_text}) → {self.output_dir.name}"
         self.state.queue_manager.add_job(QUEUE_STAGE_EXPORT, None, params, label)
@@ -2755,6 +2945,415 @@ class ExportPanel(QWidget):
         else:
             QMessageBox.critical(self, "Unexpected error exporting", f"{type(exc).__name__}: {exc}")
 
+def _format_bytes(n: int | None) -> str:
+    if n is None:
+        return "…"
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _disk_usage_worker(project_root: Path, generation: int) -> tuple[int, dict]:
+    """Walks every frame set's and export folder's files for the Data
+    manager's size column -- off the GUI thread, since a real project can
+    hold tens of thousands of images on a slow (e.g. Windows-mounted)
+    drive."""
+    conn = open_index_db(project_root)
+    try:
+        frame_sets = {
+            info.frame_set_id: frame_set_disk_usage(conn, project_root, info.frame_set_id)
+            for info in list_frame_sets(conn)
+        }
+        sfm_runs = {run.run_id: directory_size(project_root / "sfm" / "sparse" / run.run_id) for run in list_sfm_runs(conn)}
+    finally:
+        conn.close()
+    exports = {info.relative_path: directory_size(project_root / info.relative_path) for info in list_export_dirs(project_root)}
+    return generation, {"frame_sets": frame_sets, "sfm_runs": sfm_runs, "exports": exports}
+
+
+def _data_manager_delete_worker(project_root: Path, action: str, target: str) -> str:
+    conn = open_index_db(project_root)
+    try:
+        if action == "frame_set":
+            delete_frame_set(conn, project_root, target)
+        elif action == "views":
+            delete_views_for_frame_set(conn, project_root, target)
+        elif action == "masks":
+            delete_masks_for_frame_set(conn, project_root, target)
+        elif action == "sfm_run":
+            delete_sfm_run(conn, project_root, target)
+        elif action == "export":
+            delete_export_dir(project_root, target)
+        else:
+            raise ValueError(f"unknown delete action {action!r}")
+        return action
+    finally:
+        conn.close()
+
+
+class DataManagerPanel(QWidget):
+    """Lists a project's sources (read-only -- removing one stays on
+    Import) and everything derived from them, and deletes derived data:
+    a whole frame set (cascading to its projections and masks), just a
+    frame set's projections (and their masks) or just its masks, an SfM
+    run, or an export folder. Every delete goes through
+    vine360.data_manager, which keeps the cascade-delete invariant
+    (docs/adr/0017, 0035). Not a pipeline stage, so it has no sidebar
+    status dot."""
+
+    def __init__(self, state: AppState):
+        super().__init__()
+        self.state = state
+        self._usage: dict = {}
+        self._usage_generation = 0
+        layout = QVBoxLayout(self)
+        _panel_header(
+            "Data manager",
+            "Everything this project holds, by source and frame set, with what it costs on disk. "
+            "Deleting never touches original source media.",
+            layout,
+        )
+
+        self.no_project_label = QLabel("Open a project first.")
+        layout.addWidget(self.no_project_label)
+
+        self.controls = QWidget()
+        controls_layout = QVBoxLayout(self.controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+
+        top_row = QHBoxLayout()
+        self.summary_label = QLabel("")
+        top_row.addWidget(self.summary_label, stretch=1)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh)
+        top_row.addWidget(refresh_btn)
+        controls_layout.addLayout(top_row)
+
+        sources_box = QGroupBox("Sources (read-only -- add or remove them on Import)")
+        sources_layout = QVBoxLayout(sources_box)
+        self.sources_table = QTableWidget(0, 5)
+        self.sources_table.setHorizontalHeaderLabels(["Name", "Type", "Projection", "Duration", "Frame sets"])
+        self.sources_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.sources_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.sources_table.verticalHeader().setVisible(False)
+        self.sources_table.setMaximumHeight(130)
+        sources_layout.addWidget(self.sources_table)
+        controls_layout.addWidget(sources_box)
+
+        sets_box = QGroupBox("Frame sets and their projections / masks")
+        sets_layout = QVBoxLayout(sets_box)
+        self.sets_tree = QTreeWidget()
+        self.sets_tree.setHeaderLabels(["Source / frame set", "Frames", "Views", "Masks", "Frames on disk",
+                                        "Projections on disk", "Masks on disk"])
+        self.sets_tree.itemSelectionChanged.connect(self._refresh_enabled)
+        sets_layout.addWidget(self.sets_tree)
+        sets_btn_row = QHBoxLayout()
+        self.delete_set_btn = QPushButton("Delete frame set…")
+        self.delete_set_btn.setToolTip("Deletes the frames and everything built from them (projections, masks).")
+        self.delete_set_btn.clicked.connect(lambda: self._delete_frame_set_part("frame_set"))
+        self.delete_views_btn = QPushButton("Delete projections…")
+        self.delete_views_btn.setToolTip("Deletes this frame set's projected views and their masks; keeps the frames.")
+        self.delete_views_btn.clicked.connect(lambda: self._delete_frame_set_part("views"))
+        self.delete_masks_btn = QPushButton("Delete masks…")
+        self.delete_masks_btn.setToolTip("Deletes this frame set's masks only; keeps frames and projections.")
+        self.delete_masks_btn.clicked.connect(lambda: self._delete_frame_set_part("masks"))
+        for btn in (self.delete_set_btn, self.delete_views_btn, self.delete_masks_btn):
+            sets_btn_row.addWidget(btn)
+        sets_btn_row.addStretch()
+        sets_layout.addLayout(sets_btn_row)
+        controls_layout.addWidget(sets_box, stretch=2)
+
+        runs_box = QGroupBox("Pose estimation (SfM) runs")
+        runs_layout = QVBoxLayout(runs_box)
+        self.runs_table = QTableWidget(0, 5)
+        self.runs_table.setHorizontalHeaderLabels(["Created", "Engine", "Frame set", "Registered", "On disk"])
+        self.runs_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.runs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.runs_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.runs_table.verticalHeader().setVisible(False)
+        self.runs_table.itemSelectionChanged.connect(self._refresh_enabled)
+        runs_layout.addWidget(self.runs_table)
+        self.delete_run_btn = QPushButton("Delete run…")
+        self.delete_run_btn.clicked.connect(self._delete_sfm_run)
+        runs_btn_row = QHBoxLayout()
+        runs_btn_row.addWidget(self.delete_run_btn)
+        runs_btn_row.addStretch()
+        runs_layout.addLayout(runs_btn_row)
+        controls_layout.addWidget(runs_box, stretch=1)
+
+        exports_box = QGroupBox("Exports")
+        exports_layout = QVBoxLayout(exports_box)
+        self.exports_table = QTableWidget(0, 2)
+        self.exports_table.setHorizontalHeaderLabels(["Folder", "On disk"])
+        self.exports_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.exports_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.exports_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.exports_table.verticalHeader().setVisible(False)
+        self.exports_table.itemSelectionChanged.connect(self._refresh_enabled)
+        exports_layout.addWidget(self.exports_table)
+        self.delete_export_btn = QPushButton("Delete export folder…")
+        self.delete_export_btn.clicked.connect(self._delete_export)
+        exports_btn_row = QHBoxLayout()
+        exports_btn_row.addWidget(self.delete_export_btn)
+        exports_btn_row.addStretch()
+        exports_layout.addLayout(exports_btn_row)
+        controls_layout.addWidget(exports_box, stretch=1)
+
+        self.progress_area = ProgressArea()
+        controls_layout.addWidget(self.progress_area)
+
+        layout.addWidget(self.controls, stretch=1)
+        self.controls.setVisible(False)
+        self._busy = False
+        self._refresh_enabled()
+
+        if self.state.queue_manager is not None:
+            self.state.queue_manager.queue_changed.connect(self._refresh_enabled)
+
+    def on_project_changed(self) -> None:
+        self.on_shown()
+
+    def on_shown(self) -> None:
+        have_project = self.state.conn is not None
+        self.no_project_label.setVisible(not have_project)
+        self.controls.setVisible(have_project)
+        if have_project:
+            self.refresh()
+
+    # -- listing ----------------------------------------------------------
+
+    def refresh(self) -> None:
+        if self.state.conn is None:
+            return
+        conn = self.state.conn
+        sources = list_sources(conn)
+        self.sources_table.setRowCount(len(sources))
+        for r, src in enumerate(sources):
+            duration = f"{src.duration_seconds:.1f}s" if src.duration_seconds else "—"
+            for c, text in enumerate(
+                [src.name, src.media_type, src.projection, duration, str(src.frame_set_count)]
+            ):
+                item = QTableWidgetItem(text)
+                if c == 0:
+                    item.setToolTip(src.path)
+                self.sources_table.setItem(r, c, item)
+        self.sources_table.resizeColumnsToContents()
+
+        selected = self._selected_frame_set_id()
+        self.sets_tree.clear()
+        frame_sets = list_frame_sets(conn)
+        by_source: dict[str, QTreeWidgetItem] = {}
+        for src in sources:
+            if src.frame_set_count:
+                parent = QTreeWidgetItem([src.name])
+                parent.setToolTip(0, src.path)
+                self.sets_tree.addTopLevelItem(parent)
+                by_source[src.source_id] = parent
+        for info in frame_sets:
+            parent = by_source.get(info.source_id)
+            if parent is None:
+                continue
+            item = QTreeWidgetItem(
+                [info.label, str(info.frame_count), str(info.view_count), str(info.mask_count), "", "", ""]
+            )
+            item.setData(0, Qt.UserRole, info.frame_set_id)
+            item.setData(1, Qt.UserRole, (info.frame_count, info.view_count, info.mask_count))
+            item.setToolTip(0, f"{info.frame_set_id} (created {info.created_at})")
+            parent.addChild(item)
+            if info.frame_set_id == selected:
+                item.setSelected(True)
+        self.sets_tree.expandAll()
+        for c in range(self.sets_tree.columnCount()):
+            self.sets_tree.resizeColumnToContents(c)
+
+        runs = list_sfm_runs(conn)
+        set_names = {info.frame_set_id: info.display_name for info in frame_sets}
+        self.runs_table.setRowCount(len(runs))
+        for r, run in enumerate(runs):
+            engine = "Equirectangular (raw frames)" if run.image_source == "frames" else "Six-face projections"
+            scope = set_names.get(run.frame_set_id, run.frame_set_id or "all frame sets")
+            cells = [run.created_at, engine, scope, f"{run.registered_images}/{run.total_images}", ""]
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if c == 0:
+                    item.setData(Qt.UserRole, run.run_id)
+                    item.setToolTip(run.run_id)
+                self.runs_table.setItem(r, c, item)
+        self.runs_table.resizeColumnsToContents()
+
+        exports = list_export_dirs(self.state.project_root)
+        self.exports_table.setRowCount(len(exports))
+        for r, info in enumerate(exports):
+            text = info.relative_path + ("  (older flat layout)" if info.legacy_layout else "")
+            item = QTableWidgetItem(text)
+            item.setData(Qt.UserRole, info.relative_path)
+            self.exports_table.setItem(r, 0, item)
+            self.exports_table.setItem(r, 1, QTableWidgetItem(""))
+        self.exports_table.resizeColumnsToContents()
+
+        self.summary_label.setText(
+            f"{len(sources)} source(s), {len(frame_sets)} frame set(s), {len(runs)} SfM run(s), "
+            f"{len(exports)} export folder(s)."
+        )
+        self._apply_usage()
+        self._start_usage_scan()
+        self._refresh_enabled()
+
+    def _start_usage_scan(self) -> None:
+        # Bound-method callbacks, not lambdas: a lambda has no QObject
+        # thread affinity, so Qt would run it on the worker thread (see
+        # QueueManager._start_job). The generation number rides along in
+        # the result instead of a closure.
+        self._usage_generation += 1
+        run_in_background(
+            self,
+            _disk_usage_worker,
+            self.state.project_root,
+            self._usage_generation,
+            on_success=self._on_usage,
+            on_error=self._on_usage_error,
+        )
+
+    def _on_usage_error(self, _exc: Exception) -> None:
+        pass  # sizes are informational; the lists themselves are already correct
+
+    def _on_usage(self, result: tuple[int, dict]) -> None:
+        generation, usage = result
+        if generation != self._usage_generation:
+            return  # a newer refresh superseded this scan
+        self._usage = usage
+        self._apply_usage()
+
+    def _apply_usage(self) -> None:
+        frame_sets = self._usage.get("frame_sets", {})
+        for i in range(self.sets_tree.topLevelItemCount()):
+            parent = self.sets_tree.topLevelItem(i)
+            for k in range(parent.childCount()):
+                item = parent.child(k)
+                sizes = frame_sets.get(item.data(0, Qt.UserRole))
+                for col, key in ((4, "frames"), (5, "projections"), (6, "masks")):
+                    item.setText(col, _format_bytes(sizes[key] if sizes else None))
+        runs = self._usage.get("sfm_runs", {})
+        for r in range(self.runs_table.rowCount()):
+            run_id = self.runs_table.item(r, 0).data(Qt.UserRole)
+            self.runs_table.item(r, 4).setText(_format_bytes(runs.get(run_id)))
+        exports = self._usage.get("exports", {})
+        for r in range(self.exports_table.rowCount()):
+            rel = self.exports_table.item(r, 0).data(Qt.UserRole)
+            self.exports_table.item(r, 1).setText(_format_bytes(exports.get(rel)))
+
+    # -- selection / enablement -------------------------------------------
+
+    def _selected_frame_set_item(self) -> QTreeWidgetItem | None:
+        items = self.sets_tree.selectedItems()
+        if not items or items[0].data(0, Qt.UserRole) is None:
+            return None  # nothing, or a source row
+        return items[0]
+
+    def _selected_frame_set_id(self) -> str | None:
+        item = self._selected_frame_set_item()
+        return item.data(0, Qt.UserRole) if item else None
+
+    @staticmethod
+    def _selected_row_data(table: QTableWidget) -> str | None:
+        rows = table.selectionModel().selectedRows() if table.selectionModel() else []
+        if not rows:
+            return None
+        item = table.item(rows[0].row(), 0)
+        return item.data(Qt.UserRole) if item else None
+
+    def _refresh_enabled(self) -> None:
+        queue_busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
+        blocked = queue_busy or self._busy
+        item = self._selected_frame_set_item()
+        counts = item.data(1, Qt.UserRole) if item else (0, 0, 0)
+        self.delete_set_btn.setEnabled(item is not None and not blocked)
+        self.delete_views_btn.setEnabled(item is not None and counts[1] > 0 and not blocked)
+        self.delete_masks_btn.setEnabled(item is not None and counts[2] > 0 and not blocked)
+        self.delete_run_btn.setEnabled(self._selected_row_data(self.runs_table) is not None and not blocked)
+        self.delete_export_btn.setEnabled(self._selected_row_data(self.exports_table) is not None and not blocked)
+
+    # -- deleting ---------------------------------------------------------
+
+    def _confirm(self, title: str, text: str) -> bool:
+        return QMessageBox.question(self, title, text) == QMessageBox.Yes
+
+    def _queued_jobs_touching(self, frame_set_id: str) -> int:
+        queue = self.state.queue_manager
+        if queue is None:
+            return 0
+        return sum(
+            1
+            for job in queue.jobs
+            if job.status in ("queued", "blocked")
+            and (job.target_frame_set_id == frame_set_id or job.params.get("frame_set_id") == frame_set_id)
+        )
+
+    def _delete_frame_set_part(self, action: str) -> None:
+        item = self._selected_frame_set_item()
+        if item is None:
+            return
+        frame_set_id = item.data(0, Qt.UserRole)
+        frames, views, masks = item.data(1, Qt.UserRole)
+        name = f"{item.parent().text(0)} — {item.text(0)}"
+        what = {
+            "frame_set": f"the whole frame set: {frames} frames, {views} projected views and {masks} masks",
+            "views": f"{views} projected views and {masks} masks (the {frames} frames are kept)",
+            "masks": f"{masks} masks (frames and projected views are kept)",
+        }[action]
+        text = f"Delete {what} from\n{name}?\n\nFiles are removed from disk. This can't be undone."
+        if self._queued_jobs_touching(frame_set_id):
+            text += "\n\nQueued jobs still target this frame set -- they will fail or re-create it when run."
+        if self._confirm("Delete from frame set", text):
+            self._run_delete(action, frame_set_id)
+
+    def _delete_sfm_run(self) -> None:
+        run_id = self._selected_row_data(self.runs_table)
+        if run_id and self._confirm(
+            "Delete SfM run",
+            f"Delete SfM run {run_id} and its sfm/sparse/{run_id}/ folder?\n\n"
+            "Exports already made from it are kept. This can't be undone.",
+        ):
+            self._run_delete("sfm_run", run_id)
+
+    def _delete_export(self) -> None:
+        rel = self._selected_row_data(self.exports_table)
+        if rel and self._confirm("Delete export folder", f"Delete {rel}/ and everything in it?\n\nThis can't be undone."):
+            self._run_delete("export", rel)
+
+    def _run_delete(self, action: str, target: str) -> None:
+        self._busy = True
+        self._refresh_enabled()
+        self.progress_area.start("Deleting…")
+        run_in_background(
+            self,
+            _data_manager_delete_worker,
+            self.state.project_root,
+            action,
+            target,
+            on_success=self._on_delete_success,
+            on_error=self._on_delete_error,
+        )
+
+    def _on_delete_success(self, _action: str) -> None:
+        self._busy = False
+        self.progress_area.finish("Deleted.")
+        self.refresh()
+        self.state.notify_change()
+
+    def _on_delete_error(self, exc: Exception) -> None:
+        self._busy = False
+        self.progress_area.finish("")
+        self.refresh()
+        if isinstance(exc, DataManagerError):
+            QMessageBox.warning(self, "Could not delete", str(exc))
+        else:
+            QMessageBox.critical(self, "Unexpected error deleting", f"{type(exc).__name__}: {exc}")
+
+
 class Vine360MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2775,6 +3374,7 @@ class Vine360MainWindow(QMainWindow):
         masks_panel = MasksPanel(self.state)
         pose_panel = PoseEstimationPanel(self.state)
         export_panel = ExportPanel(self.state)
+        data_manager_panel = DataManagerPanel(self.state)
 
         project_panel.project_changed.connect(import_panel.on_project_changed)
         project_panel.project_changed.connect(frames_panel.on_project_changed)
@@ -2782,6 +3382,7 @@ class Vine360MainWindow(QMainWindow):
         project_panel.project_changed.connect(masks_panel.on_project_changed)
         project_panel.project_changed.connect(pose_panel.on_project_changed)
         project_panel.project_changed.connect(export_panel.on_project_changed)
+        project_panel.project_changed.connect(data_manager_panel.on_project_changed)
         project_panel.project_changed.connect(self._on_project_changed_for_queue)
 
         self._panels = [
@@ -2792,6 +3393,7 @@ class Vine360MainWindow(QMainWindow):
             masks_panel,
             pose_panel,
             export_panel,
+            data_manager_panel,
         ]
         labels = [
             "Project",
@@ -2801,11 +3403,17 @@ class Vine360MainWindow(QMainWindow):
             "Masks",
             "Pose estimation",
             "Export",
+            "Data manager",
         ]
         self._sidebar_items: list[QListWidgetItem] = []
-        for label, widget in zip(labels, self._panels):
+        for index, (label, widget) in enumerate(zip(labels, self._panels)):
             item = QListWidgetItem(f"  {label}")
-            item.setIcon(QIcon(_status_dot(PENDING)))
+            if index <= STAGE_EXPORT:  # pipeline stages get a status dot; Data manager isn't one
+                item.setIcon(QIcon(_status_dot(PENDING)))
+            else:
+                blank = QPixmap(12, 12)  # same size as a status dot, so the label lines up
+                blank.fill(Qt.transparent)
+                item.setIcon(QIcon(blank))
             self._sidebar_items.append(item)
             self.sidebar.addItem(item)
             self.stack.addWidget(widget)

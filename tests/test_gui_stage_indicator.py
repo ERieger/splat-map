@@ -64,16 +64,28 @@ def _insert_view(conn, root, view_id, frame_id):
         "'{}', NULL)"
     )
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES (?, 's1', 0.0, '{}', 'x', 'y')",
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES (?, 's1', 0.0, '{}', 'x', 'y', 's1')",
         (frame_id,),
     )
+    _insert_frame_set(conn, "s1")
     conn.execute(
         "INSERT INTO views (view_id, frame_id, projection_id, width, height, intrinsics, "
         "fixed_rotation, image_path) VALUES (?, ?, 'p', 64, 64, '{}', '{}', ?)",
         (view_id, frame_id, str(image_path.relative_to(root))),
     )
     conn.commit()
+
+
+def _insert_frame_set(conn, frame_set_id: str) -> None:
+    """A legacy-shaped frame set (id == source_id, docs/adr/0034) for the
+    frames inserted above -- the stage panels list frame sets, not raw
+    frames."""
+    conn.execute(
+        "INSERT OR IGNORE INTO frame_sets (frame_set_id, source_id, label, extraction_settings, created_at) "
+        "VALUES (?, ?, 'every 1s', '{\"mode\": \"interval\", \"interval_seconds\": 1.0}', '2026-01-01')",
+        (frame_set_id, frame_set_id),
+    )
 
 
 def _insert_source_only(conn, source_id: str) -> None:
@@ -88,10 +100,11 @@ def _insert_source_only(conn, source_id: str) -> None:
 def _insert_frames_only(conn, source_id: str, frame_id: str) -> None:
     _insert_source_only(conn, source_id)
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES (?, ?, 0.0, '{}', 'x', 'y')",
-        (frame_id, source_id),
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES (?, ?, 0.0, '{}', 'x', 'y', ?)",
+        (frame_id, source_id, source_id),
     )
+    _insert_frame_set(conn, source_id)
     conn.commit()
 
 

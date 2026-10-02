@@ -132,7 +132,8 @@ def cmd_ingest_extract_frames(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
-    print(f"extracted {len(frames)} frames from source {args.source_id}")
+    frame_set_id = frames[0].frame_set_id if frames else None
+    print(f"extracted {len(frames)} frames from source {args.source_id} into frame set {frame_set_id}")
     return 0
 
 

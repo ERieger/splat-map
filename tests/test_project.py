@@ -134,3 +134,50 @@ def test_opening_an_older_project_migrates_missing_columns(tmp_path):
         reopened.execute("SELECT flagged_for_review FROM masks").fetchall()
     finally:
         reopened.close()
+
+
+def test_opening_an_older_project_migrates_frames_into_legacy_frame_sets(tmp_path):
+    """docs/adr/0034: frames extracted before frame sets existed have no
+    frames.frame_set_id. On open, each source's frames become one frame
+    set whose id is the source_id itself -- so the existing frames/
+    <source_id>/ paths and "<source_id>:NNNNNN" frame_ids stay valid with
+    nothing moved."""
+    root = tmp_path / "myproject"
+    create_project(root, "My Vineyard", CaptureMode.THREE_SIXTY)
+
+    conn = sqlite3.connect(root / "index.sqlite")
+    conn.execute("DROP TABLE frame_sets")
+    conn.execute("ALTER TABLE frames DROP COLUMN frame_set_id")
+    conn.execute(
+        "INSERT INTO sources (source_id, path, checksum, media_type, projection, timestamps) "
+        "VALUES ('src-a', '/a.mp4', 'x', 'video', 'equirectangular', '{}')"
+    )
+    for i in range(3):
+        conn.execute(
+            "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
+            "VALUES (?, 'src-a', ?, ?, ?, 'c')",
+            (
+                f"src-a:{i:06d}",
+                float(i),
+                '{"mode": "interval", "interval_seconds": 0.5, "requested_count": null}',
+                f"frames/src-a/frame_{i + 1:06d}.png",
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+    reopened = open_index_db(root)
+    try:
+        assert reopened.execute("SELECT frame_set_id, source_id, label FROM frame_sets").fetchall() == [
+            ("src-a", "src-a", "every 0.5s")
+        ]
+        assert {r[0] for r in reopened.execute("SELECT frame_set_id FROM frames")} == {"src-a"}
+        assert reopened.execute("SELECT frame_id FROM frames ORDER BY frame_id").fetchall()[0] == ("src-a:000000",)
+    finally:
+        reopened.close()
+
+    again = open_index_db(root)  # idempotent
+    try:
+        assert again.execute("SELECT COUNT(*) FROM frame_sets").fetchone()[0] == 1
+    finally:
+        again.close()

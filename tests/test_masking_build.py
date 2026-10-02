@@ -8,7 +8,7 @@ from vine360.config import CaptureMode
 from vine360.masking.build import (
     MaskBuildError,
     build_mask_for_view,
-    build_masks_for_source,
+    build_masks_for_frame_set,
     set_view_flagged,
 )
 from vine360.project import create_project, open_index_db
@@ -23,8 +23,8 @@ def _insert_fake_view(conn, project_root, view_id="frame-1:front", frame_id="fra
     Image.fromarray(image, "RGB").save(image_path)
 
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES (?, 's1', 0.0, '{}', 'x', 'y') ",
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES (?, 's1', 0.0, '{}', 'x', 'y', 's1') ",
         (frame_id,),
     )
     conn.execute(
@@ -88,8 +88,8 @@ def test_build_mask_for_view_auto_flags_anomalous_keep_fraction(project):
     image = np.full((100, 100, 3), fill_value=[34, 90, 34], dtype=np.uint8)
     Image.fromarray(image, "RGB").save(image_path)
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES ('frame-1', 's1', 0.0, '{}', 'x', 'y')"
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES ('frame-1', 's1', 0.0, '{}', 'x', 'y', 's1')"
     )
     conn.execute(
         "INSERT INTO views (view_id, frame_id, projection_id, width, height, intrinsics, fixed_rotation, image_path) "
@@ -134,7 +134,7 @@ def test_keep_mask_excludes_sky_region(project):
     assert keep[90, 50] == 255  # ground region kept
 
 
-def test_build_masks_for_source_processes_all_views_and_reports_progress(project):
+def test_build_masks_for_frame_set_processes_all_views_and_reports_progress(project):
     root, conn = project
     _insert_fake_view(conn, root, view_id="frame-1:front", frame_id="frame-1")
     # a second view sharing the same source via the frames.source_id join
@@ -148,17 +148,17 @@ def test_build_masks_for_source_processes_all_views_and_reports_progress(project
     conn.commit()
 
     messages = []
-    masks = build_masks_for_source(conn, root, "s1", progress_callback=lambda m, c, t: messages.append((m, c, t)))
+    masks = build_masks_for_frame_set(conn, root, "s1", progress_callback=lambda m, c, t: messages.append((m, c, t)))
 
     assert len(masks) == 2
     assert messages[0] == ("Masking view 1/2…", 0, 2)
     assert messages[-1][1:] == (2, 2)
 
 
-def test_build_masks_for_source_no_views_raises(project):
+def test_build_masks_for_frame_set_no_views_raises(project):
     root, conn = project
     with pytest.raises(MaskBuildError):
-        build_masks_for_source(conn, root, "no-such-source")
+        build_masks_for_frame_set(conn, root, "no-such-source")
 
 
 @pytest.mark.network

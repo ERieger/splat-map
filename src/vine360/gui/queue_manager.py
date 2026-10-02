@@ -56,7 +56,7 @@ STAGE_EXPORT = "export"
 
 _COLUMNS = (
     "job_id, order_index, stage, label, target_source_id, params, depends_on, "
-    "status, auto_added, error_message, created_at, started_at, finished_at"
+    "status, auto_added, error_message, created_at, started_at, finished_at, target_frame_set_id"
 )
 
 
@@ -79,13 +79,22 @@ class QueueJob:
     created_at: str = field(default_factory=_utcnow_iso)
     started_at: str | None = None
     finished_at: str | None = None
+    # The frame set (docs/adr/0034) a Frames/Projection/Masks job writes or
+    # reads -- what prerequisite resolution is keyed on. A Frames job's is
+    # computed up front (frame-set ids are deterministic per config), so
+    # its dependents can target a frame set that doesn't exist yet.
+    target_frame_set_id: str | None = None
 
     @classmethod
     def from_row(cls, row: tuple) -> "QueueJob":
         (
             job_id, order_index, stage, label, target_source_id, params_json, depends_on_json,
-            status, auto_added, error_message, created_at, started_at, finished_at,
+            status, auto_added, error_message, created_at, started_at, finished_at, target_frame_set_id,
         ) = row
+        if target_frame_set_id is None and stage in (STAGE_PROJECTION, STAGE_MASKS):
+            # Persisted before frame sets existed: the source's frames were
+            # migrated into a frame set whose id is the source_id itself.
+            target_frame_set_id = target_source_id
         return cls(
             job_id=job_id,
             order_index=order_index,
@@ -100,6 +109,7 @@ class QueueJob:
             created_at=created_at,
             started_at=started_at,
             finished_at=finished_at,
+            target_frame_set_id=target_frame_set_id,
         )
 
     def to_row(self) -> tuple:
@@ -107,7 +117,7 @@ class QueueJob:
             self.job_id, self.order_index, self.stage, self.label, self.target_source_id,
             json.dumps(self.params), json.dumps(self.depends_on), self.status,
             int(self.auto_added), self.error_message, self.created_at, self.started_at,
-            self.finished_at,
+            self.finished_at, self.target_frame_set_id,
         )
 
 
@@ -132,7 +142,7 @@ def _load_jobs(conn: sqlite3.Connection) -> list[QueueJob]:
 
 def _save_job(conn: sqlite3.Connection, job: QueueJob) -> None:
     conn.execute(
-        f"INSERT OR REPLACE INTO queue_jobs ({_COLUMNS}) VALUES ({','.join('?' * 13)})", job.to_row()
+        f"INSERT OR REPLACE INTO queue_jobs ({_COLUMNS}) VALUES ({','.join('?' * 14)})", job.to_row()
     )
     conn.commit()
 
@@ -142,15 +152,15 @@ def _delete_job(conn: sqlite3.Connection, job_id: str) -> None:
     conn.commit()
 
 
-def _has_frames(conn: sqlite3.Connection, source_id: str) -> bool:
-    return conn.execute("SELECT COUNT(*) FROM frames WHERE source_id = ?", (source_id,)).fetchone()[0] > 0
+def _has_frames(conn: sqlite3.Connection, frame_set_id: str) -> bool:
+    return conn.execute("SELECT COUNT(*) FROM frames WHERE frame_set_id = ?", (frame_set_id,)).fetchone()[0] > 0
 
 
-def _has_views(conn: sqlite3.Connection, source_id: str) -> bool:
+def _has_views(conn: sqlite3.Connection, frame_set_id: str) -> bool:
     return (
         conn.execute(
-            "SELECT COUNT(*) FROM views v JOIN frames f ON v.frame_id = f.frame_id WHERE f.source_id = ?",
-            (source_id,),
+            "SELECT COUNT(*) FROM views v JOIN frames f ON v.frame_id = f.frame_id WHERE f.frame_set_id = ?",
+            (frame_set_id,),
         ).fetchone()[0]
         > 0
     )
@@ -164,12 +174,13 @@ def _has_any_sfm_run(conn: sqlite3.Connection) -> bool:
     return conn.execute("SELECT COUNT(*) FROM sfm_runs").fetchone()[0] > 0
 
 
-def _sources_with_frames_but_no_views(conn: sqlite3.Connection) -> list[str]:
+def _frame_sets_with_frames_but_no_views(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """(frame_set_id, source_id) pairs."""
     rows = conn.execute(
-        "SELECT DISTINCT f.source_id FROM frames f "
-        "LEFT JOIN views v ON v.frame_id = f.frame_id WHERE v.view_id IS NULL"
+        "SELECT DISTINCT f.frame_set_id, f.source_id FROM frames f "
+        "LEFT JOIN views v ON v.frame_id = f.frame_id WHERE v.view_id IS NULL AND f.frame_set_id IS NOT NULL"
     ).fetchall()
-    return [r[0] for r in rows]
+    return [(r[0], r[1]) for r in rows]
 
 
 def _source_display_name(conn: sqlite3.Connection, source_id: str) -> str:
@@ -202,6 +213,12 @@ def _default_label(stage: str, source_name: str) -> str:
     if stage == STAGE_PROJECTION:
         return f"Projection — {source_name} (default faces, auto)"
     raise ValueError(stage)
+
+
+def _params_frame_set_id(params: dict) -> str | None:
+    """Pose/Export jobs persisted before frame sets carry "source_id",
+    which is also that source's migrated legacy frame_set_id."""
+    return params.get("frame_set_id", params.get("source_id"))
 
 
 class QueueManager(QObject):
@@ -258,8 +275,41 @@ class QueueManager(QObject):
 
     # -- adding jobs, with prerequisite auto-insertion ------------------
 
-    def add_job(self, stage: str, target_source_id: str | None, params: dict, label: str) -> QueueJob:
-        depends_on, blocked_reason = self._resolve_prerequisites(stage, target_source_id, params)
+    def add_job(
+        self,
+        stage: str,
+        target_source_id: str | None,
+        params: dict,
+        label: str,
+        *,
+        target_frame_set_id: str | None = None,
+    ) -> QueueJob:
+        """target_frame_set_id: the frame set a Frames job will write (its
+        deterministic id, vine360.ingest.frames.frame_set_id_for) or a
+        Projection/Masks job will read. Pose/Export carry theirs in params
+        ("frame_set_id"), since for them it's an optional filter.
+
+        Left as None, it's derived from target_source_id where that's
+        unambiguous (see _frame_set_for_source) -- a convenience for
+        callers that think in sources; the GUI always passes it."""
+        ambiguity = None
+        if target_frame_set_id is None and target_source_id is not None:
+            if stage == STAGE_FRAMES:
+                from vine360.ingest.frames import frame_set_id_for
+
+                target_frame_set_id = frame_set_id_for(
+                    self.state.conn,
+                    target_source_id,
+                    interval_seconds=params["interval_seconds"],
+                    start_time=params.get("start_time"),
+                    end_time=params.get("end_time"),
+                )
+            elif stage in (STAGE_PROJECTION, STAGE_MASKS):
+                target_frame_set_id, ambiguity = self._frame_set_for_source(target_source_id)
+        if ambiguity:
+            depends_on, blocked_reason = [], ambiguity
+        else:
+            depends_on, blocked_reason = self._resolve_prerequisites(stage, target_frame_set_id, params)
         job = QueueJob(
             job_id=f"job-{uuid.uuid4().hex[:8]}",
             order_index=len(self.jobs),
@@ -270,6 +320,7 @@ class QueueManager(QObject):
             depends_on=depends_on,
             status=BLOCKED if blocked_reason else QUEUED,
             error_message=blocked_reason,
+            target_frame_set_id=target_frame_set_id,
         )
         self.jobs.append(job)
         self._persist(job)
@@ -277,39 +328,126 @@ class QueueManager(QObject):
         self.queue_changed.emit()
         return job
 
-    def _find_existing(self, stage: str, source_id: str | None) -> QueueJob | None:
+    def _find_existing(self, stage: str, frame_set_id: str | None) -> QueueJob | None:
         return next(
             (
                 j
                 for j in self.jobs
-                if j.stage == stage and j.target_source_id == source_id and j.status not in TERMINAL_NOT_DONE
+                if j.stage == stage
+                and j.target_frame_set_id == frame_set_id
+                and j.status not in TERMINAL_NOT_DONE
             ),
             None,
         )
 
-    def _queue_prerequisite(self, stage: str, source_id: str) -> QueueJob:
+    def _queue_prerequisite(self, stage: str, frame_set_id: str, source_id: str) -> QueueJob:
         conn = self.state.conn
-        deps, _ = self._resolve_prerequisites(stage, source_id, _default_params_for_prerequisite(stage))
+        params = _default_params_for_prerequisite(stage)
+        deps, blocked_reason = self._resolve_prerequisites(stage, frame_set_id, params)
         job = QueueJob(
             job_id=f"job-{uuid.uuid4().hex[:8]}",
             order_index=len(self.jobs),
             stage=stage,
             label=_default_label(stage, _source_display_name(conn, source_id)),
             target_source_id=source_id,
-            params=_default_params_for_prerequisite(stage),
+            params=params,
             depends_on=deps,
+            status=BLOCKED if blocked_reason else QUEUED,
+            error_message=blocked_reason,
             auto_added=True,
+            target_frame_set_id=frame_set_id,
         )
         self.jobs.append(job)
         self._persist(job)
         return job
 
+    def _frame_set_for_source(self, source_id: str) -> tuple[str | None, str | None]:
+        """(frame_set_id, ambiguity_reason) for a source-level request: its
+        only frame set (extracted or queued), the balanced-preset one if it
+        has none yet, or -- never guessing between several -- (None,
+        reason)."""
+        from vine360.ingest.frames import frame_set_id_for
+
+        candidates = {
+            row[0]
+            for row in self.state.conn.execute("SELECT frame_set_id FROM frame_sets WHERE source_id = ?", (source_id,))
+        }
+        candidates |= {
+            j.target_frame_set_id
+            for j in self.jobs
+            if j.stage == STAGE_FRAMES
+            and j.target_source_id == source_id
+            and j.target_frame_set_id
+            and j.status not in TERMINAL_NOT_DONE
+        }
+        if not candidates:
+            # Pre-frame-set data: frames with no frame_sets row yet.
+            row = self.state.conn.execute(
+                "SELECT frame_set_id FROM frames WHERE source_id = ? AND frame_set_id IS NOT NULL LIMIT 1", (source_id,)
+            ).fetchone()
+            if row:
+                return row[0], None
+            defaults = _default_params_for_prerequisite(STAGE_FRAMES)
+            return frame_set_id_for(self.state.conn, source_id, interval_seconds=defaults["interval_seconds"]), None
+        if len(candidates) == 1:
+            return candidates.pop(), None
+        return None, f"source has {len(candidates)} frame sets -- choose which one this job is for"
+
+    def _source_of_frame_set(self, frame_set_id: str) -> str | None:
+        row = self.state.conn.execute(
+            "SELECT source_id FROM frame_sets WHERE frame_set_id = ?", (frame_set_id,)
+        ).fetchone()
+        if row:
+            return row[0]
+        # Not extracted yet: a queued Frames job may already be targeting it...
+        pending = self._find_existing(STAGE_FRAMES, frame_set_id)
+        if pending:
+            return pending.target_source_id
+        # ...or it's an id computed for a not-yet-extracted source, which
+        # is always "<source_id>~<tag>" (vine360.ingest.frames.frame_set_id_for).
+        source_id = frame_set_id.split("~", 1)[0]
+        exists = self.state.conn.execute("SELECT 1 FROM sources WHERE source_id = ?", (source_id,)).fetchone()
+        return source_id if exists else None
+
+    def _require_frames(self, frame_set_id: str) -> tuple[list[str], str | None]:
+        """Dependency on frame_set_id's frames existing: already extracted,
+        already queued, or auto-queued -- but only when the default
+        (balanced-preset) extraction would produce exactly this frame set.
+        Any other config would be a guess at settings nobody chose, so the
+        job is BLOCKED instead (the "never guess" rule below)."""
+        from vine360.ingest.frames import frame_set_id_for
+
+        conn = self.state.conn
+        existing = self._find_existing(STAGE_FRAMES, frame_set_id)
+        if existing:
+            return [existing.job_id], None
+        if _has_frames(conn, frame_set_id):
+            return [], None
+        source_id = self._source_of_frame_set(frame_set_id)
+        if source_id is None:
+            return [], f"unknown frame set {frame_set_id!r} -- extract its frames first"
+        defaults = _default_params_for_prerequisite(STAGE_FRAMES)
+        if frame_set_id_for(conn, source_id, interval_seconds=defaults["interval_seconds"]) != frame_set_id:
+            return [], f"frame set {frame_set_id!r} has no frames and no Frames job is queued for it -- add one first"
+        return [self._queue_prerequisite(STAGE_FRAMES, frame_set_id, source_id).job_id], None
+
+    def _require_views(self, frame_set_id: str) -> tuple[list[str], str | None]:
+        existing = self._find_existing(STAGE_PROJECTION, frame_set_id)
+        if existing:
+            return [existing.job_id], None
+        if _has_views(self.state.conn, frame_set_id):
+            return [], None
+        source_id = self._source_of_frame_set(frame_set_id)
+        if source_id is None:
+            return [], f"unknown frame set {frame_set_id!r} -- extract its frames first"
+        return [self._queue_prerequisite(STAGE_PROJECTION, frame_set_id, source_id).job_id], None
+
     def _resolve_prerequisites(
-        self, stage: str, target_source_id: str | None, params: dict
+        self, stage: str, target_frame_set_id: str | None, params: dict
     ) -> tuple[list[str], str | None]:
         """Returns (depends_on job_ids, blocked_reason). Auto-inserts a
         missing upstream job only when there's exactly one unambiguous
-        choice of what to insert (e.g. a single source with extracted
+        choice of what to insert (e.g. a single frame set with extracted
         frames but no views). When the choice would be a guess -- no
         candidate, or more than one -- it never guesses: the job is added
         as BLOCKED with an explanatory error_message instead, matching
@@ -317,61 +455,44 @@ class QueueManager(QObject):
         (vine360.sfm.repair_selected_model)."""
         conn = self.state.conn
 
-        if stage == STAGE_PROJECTION and target_source_id:
-            existing = self._find_existing(STAGE_FRAMES, target_source_id)
-            if existing:
-                return [existing.job_id], None
-            if _has_frames(conn, target_source_id):
-                return [], None
-            return [self._queue_prerequisite(STAGE_FRAMES, target_source_id).job_id], None
+        if stage == STAGE_PROJECTION and target_frame_set_id:
+            return self._require_frames(target_frame_set_id)
 
-        if stage == STAGE_MASKS and target_source_id:
-            existing = self._find_existing(STAGE_PROJECTION, target_source_id)
-            if existing:
-                return [existing.job_id], None
-            if _has_views(conn, target_source_id):
-                return [], None
-            return [self._queue_prerequisite(STAGE_PROJECTION, target_source_id).job_id], None
+        if stage == STAGE_MASKS and target_frame_set_id:
+            return self._require_views(target_frame_set_id)
 
         if stage == STAGE_POSE:
+            frame_set_id = _params_frame_set_id(params)
             if params.get("image_source") == "frames":
-                source_id = params.get("source_id")
-                if not source_id:
-                    return [], "no source selected for the native-equirectangular engine"
-                existing = self._find_existing(STAGE_FRAMES, source_id)
-                if existing:
-                    return [existing.job_id], None
-                if _has_frames(conn, source_id):
-                    return [], None
-                return [self._queue_prerequisite(STAGE_FRAMES, source_id).job_id], None
-            # Six-face-projections engine runs against project/projections/
-            # as a whole -- not scoped to one source -- so its prerequisite
-            # is "some" Projection output existing, not a specific source's.
+                if not frame_set_id:
+                    return [], "no frame set selected for the native-equirectangular engine"
+                return self._require_frames(frame_set_id)
+            if frame_set_id:
+                return self._require_views(frame_set_id)
+            # Six-face-projections engine over the whole project/
+            # projections/ -- not scoped to one frame set -- so its
+            # prerequisite is "some" Projection output existing.
             return self._resolve_project_wide_projection_prerequisite(conn)
 
         if stage == STAGE_EXPORT:
             if params.get("mode") == "poses":
                 if _has_any_sfm_run(conn):
                     return [], None
-                existing = self._find_existing(STAGE_POSE, None)
+                existing = next(
+                    (j for j in self.jobs if j.stage == STAGE_POSE and j.status not in TERMINAL_NOT_DONE), None
+                )
                 if existing:
                     return [existing.job_id], None
                 return [], "no SfM run exists and no Pose estimation job is queued -- add one first"
-            # Any other mode (frames_masks, realityscan -- both source-
-            # filterable, ADR 0026/0028): a specific source_id makes this
-            # unambiguous (same as Masks' own prerequisite check), so
+            # Any other mode (frames_masks, realityscan -- both frame-set-
+            # filterable, ADR 0026/0028/0034): a specific frame set makes
+            # this unambiguous (same as Masks' own prerequisite check), so
             # it's handled precisely instead of falling back to the
-            # project-wide "guess only if there's a single candidate"
-            # path used when the mode's own filter is "All" (source_id
-            # is None).
-            export_source_id = params.get("source_id")
-            if export_source_id:
-                existing = self._find_existing(STAGE_PROJECTION, export_source_id)
-                if existing:
-                    return [existing.job_id], None
-                if _has_views(conn, export_source_id):
-                    return [], None
-                return [self._queue_prerequisite(STAGE_PROJECTION, export_source_id).job_id], None
+            # project-wide "guess only if there's a single candidate" path
+            # used when the mode's own filter is "All".
+            export_frame_set_id = _params_frame_set_id(params)
+            if export_frame_set_id:
+                return self._require_views(export_frame_set_id)
             return self._resolve_project_wide_projection_prerequisite(conn)
 
         return [], None
@@ -384,13 +505,14 @@ class QueueManager(QObject):
         )
         if existing:
             return [existing.job_id], None
-        candidates = _sources_with_frames_but_no_views(conn)
+        candidates = _frame_sets_with_frames_but_no_views(conn)
         if len(candidates) == 1:
-            return [self._queue_prerequisite(STAGE_PROJECTION, candidates[0]).job_id], None
+            frame_set_id, source_id = candidates[0]
+            return [self._queue_prerequisite(STAGE_PROJECTION, frame_set_id, source_id).job_id], None
         return (
             [],
-            "no projected views exist and no single source to auto-project "
-            f"({len(candidates)} candidate source(s)) -- add a Projection job first",
+            "no projected views exist and no single frame set to auto-project "
+            f"({len(candidates)} candidate frame set(s)) -- add a Projection job first",
         )
 
     # -- reordering / removing / retrying --------------------------------
@@ -556,19 +678,20 @@ class QueueManager(QObject):
             fn, args = mw._extract_frames_worker, (
                 project_root, job.target_source_id, params["interval_seconds"],
                 params.get("start_time"), params.get("end_time"), params.get("generate_thumbnails", True),
+                job.target_frame_set_id,
             )
         elif job.stage == STAGE_PROJECTION:
             fn, args = mw._generate_views_worker, (
-                project_root, job.target_source_id, params["face_size"], params["fov_degrees"], params["face_names"],
-                params.get("max_workers"),
+                project_root, job.target_frame_set_id, params["face_size"], params["fov_degrees"],
+                params["face_names"], params.get("max_workers"),
             )
         elif job.stage == STAGE_MASKS:
             fn, args = mw._build_masks_worker, (
-                project_root, job.target_source_id, params["use_sam3_person"], params["use_sam3_sky"],
+                project_root, job.target_frame_set_id, params["use_sam3_person"], params["use_sam3_sky"],
             )
         elif job.stage == STAGE_POSE:
             fn, args = mw._run_sfm_worker, (
-                project_root, params["image_source"], params.get("source_id"), params["camera_model"],
+                project_root, params["image_source"], _params_frame_set_id(params), params["camera_model"],
             )
         elif job.stage == STAGE_EXPORT:
             output_dir = Path(params["output_dir"])
@@ -578,10 +701,11 @@ class QueueManager(QObject):
                 fn, args = mw._export_postshot_worker, (project_root, output_dir, run_id)
             elif export_mode == "realityscan":
                 fn, args = mw._export_realityscan_worker, (
-                    project_root, output_dir, params.get("source_id"), params.get("include_camera_priors", False),
+                    project_root, output_dir, _params_frame_set_id(params),
+                    params.get("include_camera_priors", False),
                 )
             else:
-                fn, args = mw._export_frames_and_masks_worker, (project_root, output_dir, params.get("source_id"))
+                fn, args = mw._export_frames_and_masks_worker, (project_root, output_dir, _params_frame_set_id(params))
         else:
             raise ValueError(f"unknown queue job stage {job.stage!r}")
 

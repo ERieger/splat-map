@@ -132,8 +132,8 @@ def test_export_for_postshot_copies_images_sparse_and_masks(project):
     for i, name in enumerate(image_names):
         frame_id = f"frame-{i}"
         conn.execute(
-            "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-            "VALUES (?, 's1', 0.0, '{}', 'x', 'y')",
+            "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+            "VALUES (?, 's1', 0.0, '{}', 'x', 'y', 's1')",
             (frame_id,),
         )
         view_id = f"{frame_id}:v"
@@ -271,9 +271,9 @@ def _insert_view_with_image(conn, root, frame_id, face_name, *, with_mask=False,
     image_path = root / "projections" / frame_id / f"{face_name}.png"
     _write_dummy_image(image_path)
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES (?, ?, 0.0, '{}', 'x', 'y') ON CONFLICT(frame_id) DO NOTHING",
-        (frame_id, source_id),
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES (?, ?, 0.0, '{}', 'x', 'y', ?) ON CONFLICT(frame_id) DO NOTHING",
+        (frame_id, source_id, source_id),
     )
     view_id = f"{frame_id}:{face_name}"
     conn.execute(
@@ -356,7 +356,7 @@ def test_export_frames_and_masks_filters_by_source_id(project):
     _insert_view_with_image(conn, root, "frame-b", "front", with_mask=True, source_id="source-b")
 
     result = export_frames_and_masks_for_postshot(
-        conn, root, root / "exports" / "source-a-only", source_id="source-a"
+        conn, root, root / "exports" / "source-a-only", frame_set_id="source-a"
     )
 
     assert result.num_images == 1
@@ -380,7 +380,7 @@ def test_export_frames_and_masks_source_filter_with_no_views_raises_actionable_e
 
     with pytest.raises(PostshotExportError, match="source-b.*generate projections"):
         export_frames_and_masks_for_postshot(
-            conn, root, root / "exports" / "source-b-only", source_id="source-b"
+            conn, root, root / "exports" / "source-b-only", frame_set_id="source-b"
         )
 
 
@@ -418,7 +418,7 @@ def test_export_for_realityscan_filters_by_source_id(project):
     _insert_view_with_image(conn, root, "frame-b", "front", with_mask=True, source_id="source-b")
 
     result = export_for_realityscan(
-        conn, root, root / "exports" / "source-a" / "realityscan", source_id="source-a"
+        conn, root, root / "exports" / "source-a" / "realityscan", frame_set_id="source-a"
     )
 
     assert result.num_images == 1
@@ -447,8 +447,8 @@ def _insert_view_for_projections_model(conn, root, frame_id, image_name):
     engine priors path."""
     _write_dummy_image(root / "projections" / image_name)
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES (?, 's1', 0.0, '{}', 'x', 'y')",
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES (?, 's1', 0.0, '{}', 'x', 'y', 's1')",
         (frame_id,),
     )
     conn.execute(
@@ -509,8 +509,8 @@ def test_export_for_realityscan_camera_priors_frames_engine_shares_position_acro
     for i in range(num_frames):
         frame_id = f"s1:{i:06d}"
         conn.execute(
-            "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-            "VALUES (?, 's1', 0.0, '{}', ?, 'y')",
+            "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+            "VALUES (?, 's1', 0.0, '{}', ?, 'y', 's1')",
             (frame_id, f"frames/s1/frame_{i:06d}.png"),
         )
         for face in ("front", "back"):
@@ -597,7 +597,7 @@ def test_select_priors_run_prefers_matching_frames_over_projections(project):
         conn, root, root / "sfm" / "m2", config={"image_source": "frames", "source_id": "s1"}, run_id="frames-run"
     )
 
-    selection = _select_priors_run(conn, source_id="s1")
+    selection = _select_priors_run(conn, frame_set_id="s1")
     assert selection[0] == "frames-run"
 
 
@@ -612,14 +612,14 @@ def test_select_priors_run_falls_back_to_projections_when_no_matching_frames_run
         run_id="frames-run",
     )
 
-    selection = _select_priors_run(conn, source_id="s1")
+    selection = _select_priors_run(conn, frame_set_id="s1")
     assert selection[0] == "proj-run"
 
 
 def test_select_priors_run_returns_none_with_no_runs(project):
     root, conn = project
-    assert _select_priors_run(conn, source_id=None) is None
-    assert _select_priors_run(conn, source_id="s1") is None
+    assert _select_priors_run(conn, frame_set_id=None) is None
+    assert _select_priors_run(conn, frame_set_id="s1") is None
 
 
 def test_select_priors_run_all_sources_prefers_projections_but_falls_back(project):
@@ -627,17 +627,39 @@ def test_select_priors_run_all_sources_prefers_projections_but_falls_back(projec
     _insert_sfm_run(
         conn, root, root / "sfm" / "m1", config={"image_source": "frames", "source_id": "s1"}, run_id="frames-run"
     )
-    assert _select_priors_run(conn, source_id=None)[0] == "frames-run"  # only run available -- falls back to it
+    assert _select_priors_run(conn, frame_set_id=None)[0] == "frames-run"  # only run available -- falls back to it
 
     _insert_sfm_run(conn, root, root / "sfm" / "m2", config={"image_source": "projections"}, run_id="proj-run")
-    assert _select_priors_run(conn, source_id=None)[0] == "proj-run"  # now prefers projections over frames
+    assert _select_priors_run(conn, frame_set_id=None)[0] == "proj-run"  # now prefers projections over frames
+
+
+def test_select_priors_run_respects_a_projections_run_scoped_to_a_frame_set(project):
+    """docs/adr/0034: a six-face run can now be scoped to one frame set.
+    It's the best match for that frame set, but has zero overlap with any
+    other -- it must never be picked for a different frame set, nor as
+    the "project-wide" fallback."""
+    root, conn = project
+    _insert_sfm_run(
+        conn,
+        root,
+        root / "sfm" / "m1",
+        config={"image_source": "projections", "frame_set_id": "s1~i0.5", "source_id": "s1"},
+        run_id="scoped-run",
+    )
+    assert _select_priors_run(conn, frame_set_id="s1~i0.5")[0] == "scoped-run"
+    assert _select_priors_run(conn, frame_set_id="s1~i1") is None
+
+    _insert_sfm_run(conn, root, root / "sfm" / "m2", config={"image_source": "projections"}, run_id="wide-run")
+    conn.execute("UPDATE sfm_runs SET created_at = '2000-01-01T00:00:00' WHERE run_id = 'wide-run'")
+    assert _select_priors_run(conn, frame_set_id="s1~i1")[0] == "wide-run"
+    assert _select_priors_run(conn, frame_set_id=None)[0] == "wide-run"
 
 
 def test_realityscan_priors_available_reflects_selection_logic(project):
     root, conn = project
-    assert realityscan_priors_available(conn, source_id="s1") is False
+    assert realityscan_priors_available(conn, frame_set_id="s1") is False
     _insert_sfm_run(conn, root, root / "sfm" / "m1", config={"image_source": "projections"}, run_id="proj-run")
-    assert realityscan_priors_available(conn, source_id="s1") is True
+    assert realityscan_priors_available(conn, frame_set_id="s1") is True
 
 
 # -- legacy export-layout migration -------------------------------------

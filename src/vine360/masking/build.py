@@ -145,10 +145,10 @@ def set_view_flagged(conn: sqlite3.Connection, view_id: str, flagged: bool) -> N
     conn.commit()
 
 
-def build_masks_for_source(
+def build_masks_for_frame_set(
     conn: sqlite3.Connection,
     project_root: Path,
-    source_id: str,
+    frame_set_id: str,
     *,
     use_sam3_person: bool = False,
     use_sam3_sky: bool = False,
@@ -160,11 +160,11 @@ def build_masks_for_source(
     notify = progress_callback or (lambda *a: None)
     view_rows = conn.execute(
         "SELECT v.view_id FROM views v JOIN frames f ON v.frame_id = f.frame_id "
-        "WHERE f.source_id = ? ORDER BY v.view_id",
-        (source_id,),
+        "WHERE f.frame_set_id = ? ORDER BY v.view_id",
+        (frame_set_id,),
     ).fetchall()
     if not view_rows:
-        raise MaskBuildError(f"no views found for source {source_id}; generate projections first")
+        raise MaskBuildError(f"no views found for frame set {frame_set_id}; generate projections first")
 
     adapter = Sam3Adapter() if (use_sam3_person or use_sam3_sky) else None
     total = len(view_rows)

@@ -16,8 +16,10 @@ import shutil
 import sqlite3
 import threading
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
+from vine360.cleanup import remove_view_files
 from vine360.config import ExtractionSettings
 from vine360.ingest.sources import get_source, sha256_file
 from vine360.models import Frame
@@ -113,46 +115,136 @@ def resolve_time_range(
     return start, end - start
 
 
-def clear_frames_for_source(conn: sqlite3.Connection, project_root: Path, source_id: str) -> None:
-    """Removes any previously extracted frames for this source -- rows and
-    files -- so extract_frames can be safely re-run with different
-    settings (e.g. a different interval). Without this, a second
-    extraction hits the frames table's frame_id PRIMARY KEY (frame_id is
-    deterministic per source+index) and can also leave stale files behind
-    from a larger prior extraction that a smaller new one wouldn't
-    overwrite.
+def _identity(settings: dict) -> tuple:
+    """What makes two extractions "the same config" for frame-set reuse
+    (docs/adr/0034): the sampling rule and the time range. Thumbnails, the
+    derived interval of a count-mode run, and anything else recorded on
+    ExtractionSettings don't count."""
+    mode = settings.get("mode", "interval")
+    rate = settings.get("requested_count") if mode == "count" else settings.get("interval_seconds")
+    rate = float(rate) if rate is not None else None  # None: settings not recorded (very old frames)
+    return (mode, rate, float(settings.get("start_time_seconds") or 0.0), settings.get("end_time_seconds"))
 
-    Real data-integrity gap this also fixes: re-extracting frames used to
-    leave any downstream views/masks built from the *old* frames as
-    orphans -- their frame_id no longer existed, but the rows, files and
-    project/projections/<frame_id>/ directories stuck around. Regenerating
-    frames now cascades exactly like regenerating a single frame's views
-    already does (vine360.projection.generate.clear_views_for_frame):
-    delete masks for the affected views, delete the views, remove their
-    projected-image directories, then remove the frames themselves.
+
+def frame_set_tag(settings: dict) -> str:
+    """The filesystem/id-safe suffix of a new frame set's id, e.g. "i0.5",
+    "n200" or "i1_r10-60"."""
+    mode, rate, start, end = _identity(settings)
+    tag = f"n{rate:g}" if mode == "count" else f"i{rate:g}"
+    if start or end is not None:
+        tag += f"_r{start:g}-{'end' if end is None else f'{float(end):g}'}"
+    return tag
+
+
+def frame_set_label(settings: dict) -> str:
+    """Human-readable description of an extraction config, e.g. "every
+    0.5s" or "every 1s, 10.0s–60.0s"."""
+    mode, rate, start, end = _identity(settings)
+    if rate is None:
+        return "unknown extraction settings"
+    label = f"{rate:g} frames total" if mode == "count" else f"every {rate:g}s"
+    if start or end is not None:
+        label += f", {start:.1f}s–{'end' if end is None else f'{float(end):.1f}s'}"
+    return label
+
+
+def _settings_dict(
+    *, interval_seconds: float | None, target_count: int | None, start_time: float | None, end_time: float | None
+) -> dict:
+    return {
+        "mode": "count" if target_count is not None else "interval",
+        "interval_seconds": interval_seconds,
+        "requested_count": target_count,
+        "start_time_seconds": start_time,
+        "end_time_seconds": end_time,
+    }
+
+
+def frame_set_id_for(
+    conn: sqlite3.Connection,
+    source_id: str,
+    *,
+    interval_seconds: float | None = None,
+    target_count: int | None = None,
+    start_time: float | None = None,
+    end_time: float | None = None,
+) -> str:
+    """Deterministic: the id an extraction of this source with this config
+    will write to -- an existing frame set with the same config (including
+    a legacy one whose id is the bare source_id, see
+    vine360.project._migrate_legacy_frame_sets) if there is one, else
+    "<source_id>~<tag>". Computable before extraction, which is what lets
+    the queue target a frame set that doesn't exist yet."""
+    settings = _settings_dict(
+        interval_seconds=interval_seconds, target_count=target_count, start_time=start_time, end_time=end_time
+    )
+    wanted = _identity(settings)
+    for frame_set_id, settings_json in conn.execute(
+        "SELECT frame_set_id, extraction_settings FROM frame_sets WHERE source_id = ? ORDER BY created_at",
+        (source_id,),
+    ):
+        if _identity(json.loads(settings_json)) == wanted:
+            return frame_set_id
+    return f"{source_id}~{frame_set_tag(settings)}"
+
+
+def clear_frame_set(conn: sqlite3.Connection, project_root: Path, frame_set_id: str) -> None:
+    """Removes one frame set -- rows and files -- and everything derived
+    from it, so extract_frames can safely re-run the same config, or the
+    Data manager can drop it. Without this, a second extraction hits the
+    frames table's frame_id PRIMARY KEY (frame_id is deterministic per
+    frame set+index) and can also leave stale files behind from a larger
+    prior extraction that a smaller new one wouldn't overwrite.
+
+    Cascades exactly like regenerating a single frame's views does
+    (vine360.projection.generate.clear_views_for_frame): delete masks for
+    the affected views, delete the views, remove their projected-image
+    and mask directories, then remove the frames and the frame set
+    itself. Re-extracting frames used to leave downstream views/masks as
+    orphans -- a real data-integrity gap (docs/adr/0017). Other frame
+    sets of the same source are untouched (docs/adr/0034).
     """
-    frame_rows = conn.execute("SELECT frame_id FROM frames WHERE source_id = ?", (source_id,)).fetchall()
-    frame_ids = [row[0] for row in frame_rows]
-
+    frame_ids = [
+        row[0] for row in conn.execute("SELECT frame_id FROM frames WHERE frame_set_id = ?", (frame_set_id,))
+    ]
+    view_ids_by_frame: dict[str, list[str]] = {}
     if frame_ids:
         placeholders = ",".join("?" * len(frame_ids))
+        for view_id, frame_id in conn.execute(
+            f"SELECT view_id, frame_id FROM views WHERE frame_id IN ({placeholders})", frame_ids
+        ):
+            view_ids_by_frame.setdefault(frame_id, []).append(view_id)
         conn.execute(
             f"DELETE FROM masks WHERE view_id IN "
             f"(SELECT view_id FROM views WHERE frame_id IN ({placeholders}))",
             frame_ids,
         )
         conn.execute(f"DELETE FROM views WHERE frame_id IN ({placeholders})", frame_ids)
-    conn.execute("DELETE FROM frames WHERE source_id = ?", (source_id,))
+    conn.execute("DELETE FROM frames WHERE frame_set_id = ?", (frame_set_id,))
+    conn.execute("DELETE FROM frame_sets WHERE frame_set_id = ?", (frame_set_id,))
     conn.commit()
 
-    output_dir = Path(project_root) / "frames" / source_id
+    output_dir = Path(project_root) / "frames" / frame_set_id
     if output_dir.exists():
         shutil.rmtree(output_dir)
-    projections_root = Path(project_root) / "projections"
     for frame_id in frame_ids:
-        frame_projections_dir = projections_root / frame_id
-        if frame_projections_dir.exists():
-            shutil.rmtree(frame_projections_dir)
+        remove_view_files(project_root, frame_id, view_ids_by_frame.get(frame_id, []))
+
+
+def clear_frames_for_source(conn: sqlite3.Connection, project_root: Path, source_id: str) -> None:
+    """Every frame set of this source, each cascaded via clear_frame_set --
+    what removing a source needs."""
+    frame_set_ids = {
+        row[0] for row in conn.execute("SELECT frame_set_id FROM frame_sets WHERE source_id = ?", (source_id,))
+    }
+    frame_set_ids |= {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT frame_set_id FROM frames WHERE source_id = ? AND frame_set_id IS NOT NULL", (source_id,)
+        )
+    }
+    for frame_set_id in sorted(frame_set_ids):
+        clear_frame_set(conn, project_root, frame_set_id)
 
 
 def _poll_output_frame_count(
@@ -184,6 +276,7 @@ def extract_frames(
     start_time: float | None = None,
     end_time: float | None = None,
     generate_thumbnails: bool = True,
+    frame_set_id: str | None = None,
     progress_callback=None,
     poll_interval_seconds: float = 0.5,
 ) -> list[Frame]:
@@ -212,10 +305,17 @@ def extract_frames(
     generate_thumbnails, when False, skips the per-frame thumbnail pass
     entirely -- it's currently the slow part of this function (see above)
     for no benefit right now, since nothing in the app reads
-    frames/<source_id>/thumbs/ back; PreviewGallery loads full-resolution
+    frames/<frame_set_id>/thumbs/ back; PreviewGallery loads full-resolution
     view/mask images directly and lets Qt scale them in-memory instead.
     Defaults to True to keep existing behavior unchanged for any caller
-    that doesn't pass it."""
+    that doesn't pass it.
+
+    Frames are written into one frame set (docs/adr/0034): frame_set_id
+    defaults to frame_set_id_for(...) for this config, so re-running the
+    same config replaces only that set while a different interval/range
+    adds a new set alongside the source's others. The queue passes the id
+    it computed when the job was added, so the job writes exactly where
+    its dependents expect."""
     notify = progress_callback or (lambda *a: None)
 
     source = get_source(conn, source_id)
@@ -236,8 +336,29 @@ def extract_frames(
     )
     extraction_settings = replace(extraction_settings, start_time_seconds=start_time, end_time_seconds=end_time)
 
-    clear_frames_for_source(conn, project_root, source_id)
-    output_dir = Path(project_root) / "frames" / source_id
+    if frame_set_id is None:
+        frame_set_id = frame_set_id_for(
+            conn,
+            source_id,
+            interval_seconds=interval_seconds,
+            target_count=target_count,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    clear_frame_set(conn, project_root, frame_set_id)
+    conn.execute(
+        "INSERT INTO frame_sets (frame_set_id, source_id, label, extraction_settings, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            frame_set_id,
+            source_id,
+            frame_set_label(extraction_settings.to_dict()),
+            json.dumps(extraction_settings.to_dict()),
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ),
+    )
+    conn.commit()
+    output_dir = Path(project_root) / "frames" / frame_set_id
     output_dir.mkdir(parents=True, exist_ok=True)
     thumbs_dir = output_dir / "thumbs"
     if generate_thumbnails:
@@ -264,10 +385,12 @@ def extract_frames(
         poller.join(timeout=2.0)
 
     if not result.ok:
+        clear_frame_set(conn, project_root, frame_set_id)  # don't leave an empty frame set behind
         raise FrameExtractionError(f"ffmpeg failed extracting {source_id}: {result.stderr.strip()}")
 
     frame_files = sorted(output_dir.glob("frame_*.png"))
     if not frame_files:
+        clear_frame_set(conn, project_root, frame_set_id)
         raise FrameExtractionError(f"ffmpeg reported success but produced no frames for {source_id}")
 
     frames: list[Frame] = []
@@ -284,18 +407,19 @@ def extract_frames(
             notify(f"Recording frames ({index + 1}/{len(frame_files)})…", index + 1, len(frame_files))
 
         frame = Frame(
-            frame_id=f"{source_id}:{index:06d}",
+            frame_id=f"{frame_set_id}:{index:06d}",
             source_id=source_id,
             source_time=range_start + index * interval,
             extraction_settings=extraction_settings.to_dict(),
             path=str(frame_path.relative_to(project_root)),
             checksum=sha256_file(frame_path),
+            frame_set_id=frame_set_id,
         )
         frames.append(frame)
         conn.execute(
             """
-            INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 frame.frame_id,
@@ -304,6 +428,7 @@ def extract_frames(
                 json.dumps(frame.extraction_settings),
                 frame.path,
                 frame.checksum,
+                frame.frame_set_id,
             ),
         )
         if (index + 1) % 20 == 0:

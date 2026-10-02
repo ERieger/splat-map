@@ -161,6 +161,21 @@ native-equirectangular SfM engine: verified for real that every cube
 face shares its frame's own optical center, so a face's position is
 identical to its frame's registered position.
 
+**Frame sets, Data manager, and GUI fixes (ADRs 0034, 0035).** A source can now have
+several extraction configs side by side (e.g. every 0.5s and every 1s), each a *frame set*
+carried independently through projection, masking, SfM and export. Every stage dropdown lists
+frame sets. Ids are deterministic per config, so re-extracting the same config replaces just
+that set, and the queue can target a set before it's extracted. Existing projects migrate on
+open: each source's frames become a frame set whose id is the source_id, with no file moved
+(checked on a copy of a real project's database). SfM now hands COLMAP an explicit image list
+and keeps a per-run database. A new **Data manager** tab lists sources (read-only) and each
+frame set's frames/projections/masks, SfM runs and export folders, with sizes on disk, and
+deletes them with full cascade. Mask files now cascade too; they used to be left behind.
+Also:
+- The Frames interval box shows the selected preset's interval.
+- Export resets a manually pinned output folder when another project is opened.
+- Export's folder dialog starts in the nearest existing folder, not the working directory.
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -225,6 +240,9 @@ identical to its frame's registered position.
       pycolmap.COLMAP_version/COLMAP_build are str attributes, not
       callables -- validate_installation() had been calling them as
       functions since ADR 0007, uncaught until now.
+0034: frame sets -- several extraction configs per source, deterministic
+      ids, legacy id == source_id migration, per-run COLMAP database.
+0035: Data manager tab -- list everything derived, delete with cascade.
 
 ## Blockers / known gaps
 

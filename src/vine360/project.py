@@ -7,6 +7,7 @@ copying media into the project on ingest.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -99,6 +100,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 path TEXT NOT NULL,
                 checksum TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS frame_sets (
+                frame_set_id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES sources(source_id),
+                label TEXT NOT NULL,
+                extraction_settings TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS views (
                 view_id TEXT PRIMARY KEY,
                 frame_id TEXT NOT NULL REFERENCES frames(frame_id),
@@ -151,6 +159,36 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "masks", "flagged_for_review", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "views", "updated_at", "TEXT")
     _ensure_column(conn, "masks", "updated_at", "TEXT")
+    _ensure_column(conn, "frames", "frame_set_id", "TEXT")
+    _ensure_column(conn, "queue_jobs", "target_frame_set_id", "TEXT")
+    _migrate_legacy_frame_sets(conn)
+
+
+def _migrate_legacy_frame_sets(conn: sqlite3.Connection) -> None:
+    """Frames extracted before frame sets existed (docs/adr/0034) have no
+    frame_set_id. Each source's existing frames become one frame set whose
+    id is the source_id itself -- deliberately, so every path and id built
+    from it (frames/<source_id>/, frame_id "<source_id>:NNNNNN",
+    projections/<frame_id>/, masks/keep/<frame_id>/, a "frames"-engine
+    sfm run's recorded source_id) is already correct as-is, with no file
+    moved or row rewritten beyond setting frames.frame_set_id. Imports
+    frame_set_label lazily: vine360.ingest.frames imports this module."""
+    rows = conn.execute(
+        "SELECT source_id, MIN(extraction_settings) FROM frames WHERE frame_set_id IS NULL GROUP BY source_id"
+    ).fetchall()
+    if not rows:
+        return
+    from vine360.ingest.frames import frame_set_label
+
+    for source_id, settings_json in rows:
+        settings = json.loads(settings_json)
+        conn.execute(
+            "INSERT OR IGNORE INTO frame_sets (frame_set_id, source_id, label, extraction_settings, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (source_id, source_id, frame_set_label(settings), settings_json, _utcnow_iso()),
+        )
+        conn.execute("UPDATE frames SET frame_set_id = ? WHERE source_id = ? AND frame_set_id IS NULL", (source_id, source_id))
+    conn.commit()
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:

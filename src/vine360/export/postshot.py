@@ -29,11 +29,11 @@ six-face-projection images (pinhole), not the raw equirectangular
 frames: masks are only ever built against projections in this pipeline
 (see vine360.sfm.project_run), and pinhole images are the safe,
 universally-supported choice for an external tool's own SfM regardless.
-Both take an optional `source_id` to export just one source's views
-instead of every source in the project (the default) -- `export_for_
-postshot` has no such filter, since narrowing it would mean editing
-images out of an already-computed COLMAP reconstruction, not supported
-here (docs/adr/0026).
+Both take an optional `frame_set_id` to export just one frame set's
+views (docs/adr/0034) instead of every view in the project (the
+default) -- `export_for_postshot` has no such filter, since narrowing it
+would mean editing images out of an already-computed COLMAP
+reconstruction, not supported here (docs/adr/0026).
 
 **Directory layout** (docs/adr/0028): every export lives at
 `exports/<capture>/<format>/`, where `<capture>` is the per-source (or
@@ -150,20 +150,28 @@ def _flatten_to_unique_filename(relative_path: Path) -> str:
     return "__".join(part.replace(":", "_") for part in relative_path.parts)
 
 
-def _select_priors_run(conn: sqlite3.Connection, *, source_id: str | None) -> tuple[str, str, dict] | None:
+def _run_frame_set_id(config: dict) -> str | None:
+    """Which frame set an sfm run was scoped to -- None for a project-wide
+    "projections" run. Runs recorded before frame sets existed only have
+    source_id, which for a migrated legacy frame set *is* its
+    frame_set_id (docs/adr/0034), so it doubles as the fallback."""
+    return config.get("frame_set_id") or config.get("source_id")
+
+
+def _select_priors_run(conn: sqlite3.Connection, *, frame_set_id: str | None) -> tuple[str, str, dict] | None:
     """Picks which sfm_runs row to draw camera-position priors from for a
-    RealityScan export scoped to source_id (None = all sources) --
-    maximal-overlap-first, not just "most recent": a "frames"-engine run
-    scoped to exactly this source_id is preferred when source_id is
-    given (its every registered image can potentially overlap the
+    RealityScan export scoped to frame_set_id (None = all frame sets) --
+    maximal-overlap-first, not just "most recent": a run scoped to
+    exactly this frame set (either engine) is preferred when frame_set_id
+    is given (its every registered image can potentially overlap the
     export); a project-wide "projections" run is the fallback (always
-    covers any source, since it's project-wide); a "frames" run scoped
-    to a *different* source is never picked when source_id is given
+    covers any frame set, since it's project-wide); a run scoped to a
+    *different* frame set is never picked when frame_set_id is given
     (guaranteed zero overlap -- picking it would silently write an empty
-    CSV). When source_id is None, prefers the most recent "projections"
-    run, falling back to the most recent run of either engine (a
-    "frames" run there only partially covers an all-sources export --
-    acceptable, surfaced as a warning by the caller, not an error here).
+    CSV). When frame_set_id is None, prefers the most recent project-wide
+    "projections" run, falling back to the most recent run of any scope
+    (which only partially covers an all-frame-sets export -- acceptable,
+    surfaced as a warning by the caller, not an error here).
 
     Returns (run_id, selected_model, config) or None if no sfm_runs row
     has a selected_model at all. Does NOT check the model files still
@@ -176,33 +184,34 @@ def _select_priors_run(conn: sqlite3.Connection, *, source_id: str | None) -> tu
     ).fetchall()
     candidates = [(run_id, model, json.loads(cfg)) for run_id, model, cfg in rows]
 
-    def is_projections(candidate: tuple[str, str, dict]) -> bool:
-        return candidate[2].get("image_source", "projections") == "projections"
+    def is_project_wide(candidate: tuple[str, str, dict]) -> bool:
+        config = candidate[2]
+        return config.get("image_source", "projections") == "projections" and not config.get("frame_set_id")
 
-    def is_matching_frames(candidate: tuple[str, str, dict]) -> bool:
-        return candidate[2].get("image_source") == "frames" and candidate[2].get("source_id") == source_id
+    def is_matching(candidate: tuple[str, str, dict]) -> bool:
+        return _run_frame_set_id(candidate[2]) == frame_set_id
 
-    if source_id is not None:
+    if frame_set_id is not None:
         for candidate in candidates:
-            if is_matching_frames(candidate):
+            if is_matching(candidate):
                 return candidate
         for candidate in candidates:
-            if is_projections(candidate):
+            if is_project_wide(candidate):
                 return candidate
         return None
 
     for candidate in candidates:
-        if is_projections(candidate):
+        if is_project_wide(candidate):
             return candidate
     return candidates[0] if candidates else None
 
 
-def realityscan_priors_available(conn: sqlite3.Connection, *, source_id: str | None = None) -> bool:
+def realityscan_priors_available(conn: sqlite3.Connection, *, frame_set_id: str | None = None) -> bool:
     """Cheap (DB-only, no disk/pycolmap access) check for whether
     export_for_realityscan's include_camera_priors option has anything
-    to draw from for this source_id filter -- what ExportPanel's camera
+    to draw from for this frame_set_id filter -- what ExportPanel's camera
     priors checkbox is gated on."""
-    return _select_priors_run(conn, source_id=source_id) is not None
+    return _select_priors_run(conn, frame_set_id=frame_set_id) is not None
 
 
 def _reset_managed_subdirs(output_dir: Path) -> None:
@@ -256,7 +265,7 @@ def _write_camera_priors_csv(
     directly via _flatten_to_unique_filename -- no composition needed.
 
     image_source="frames": COLMAP's registered image.name is a raw
-    equirect frame's filename relative to frames/<source_id>/. Every
+    equirect frame's filename relative to frames/<frame_set_id>/. Every
     cube-face view rendered from that frame shares the panorama's own
     optical center (zero-translation fixed_rotation, see
     vine360.projection.cubemap), so composing the frame's pose with a
@@ -278,27 +287,27 @@ def _write_camera_priors_csv(
                 x, y, z = image.projection_center()
                 rows.append((flat_name, x, y, z))
     elif image_source == "frames":
-        run_source_id = config.get("source_id")
-        if not run_source_id:
-            return None, 0, "camera priors: sfm run config missing source_id for image_source='frames' -- skipped"
+        run_frame_set_id = _run_frame_set_id(config)
+        if not run_frame_set_id:
+            return None, 0, "camera priors: sfm run config missing frame_set_id for image_source='frames' -- skipped"
         frame_id_by_path = {
             Path(path).as_posix(): frame_id
             for frame_id, path in conn.execute(
-                "SELECT frame_id, path FROM frames WHERE source_id = ?", (run_source_id,)
+                "SELECT frame_id, path FROM frames WHERE frame_set_id = ?", (run_frame_set_id,)
             ).fetchall()
         }
         flat_names_by_frame_id: dict[str, list[str]] = {}
         for frame_id, image_path in conn.execute(
             "SELECT v.frame_id, v.image_path FROM views v JOIN frames f ON f.frame_id = v.frame_id "
-            "WHERE f.source_id = ?",
-            (run_source_id,),
+            "WHERE f.frame_set_id = ?",
+            (run_frame_set_id,),
         ).fetchall():
             flat_name = _flatten_to_unique_filename(Path(image_path).relative_to("projections"))
             if flat_name in exported_flat_names:
                 flat_names_by_frame_id.setdefault(frame_id, []).append(flat_name)
 
         for image in reconstruction.images.values():
-            full_rel = (Path("frames") / run_source_id / image.name).as_posix()
+            full_rel = (Path("frames") / run_frame_set_id / image.name).as_posix()
             frame_id = frame_id_by_path.get(full_rel)
             if frame_id is None:
                 continue
@@ -455,10 +464,10 @@ def export_for_postshot(
     if image_source == "projections":
         source_root = project_root / "projections"
     elif image_source == "frames":
-        source_id = config.get("source_id")
-        if not source_id:
-            raise PostshotExportError(f"sfm run {found_run_id!r} used image_source='frames' with no source_id")
-        source_root = project_root / "frames" / source_id
+        run_frame_set_id = _run_frame_set_id(config)
+        if not run_frame_set_id:
+            raise PostshotExportError(f"sfm run {found_run_id!r} used image_source='frames' with no frame_set_id")
+        source_root = project_root / "frames" / run_frame_set_id
     else:
         raise PostshotExportError(f"unknown image_source in sfm run config: {image_source!r}")
 
@@ -530,7 +539,7 @@ def export_frames_and_masks_for_postshot(
     project_root: Path,
     output_dir: Path,
     *,
-    source_id: str | None = None,
+    frame_set_id: str | None = None,
     progress_callback=None,
 ) -> PostshotExportResult:
     """Exports every generated projection view and its keep-mask (if
@@ -540,8 +549,8 @@ def export_frames_and_masks_for_postshot(
     run); masks are optional. Raises PostshotExportError if no
     projections exist yet.
 
-    source_id, if given, restricts the export to that one source's views
-    instead of every source in the project (the default, source_id=None
+    frame_set_id, if given, restricts the export to that one frame set's
+    views instead of every view in the project (the default, frame_set_id=None
     -- matches this function's original behavior for callers that don't
     pass it). export_for_postshot (the "poses" mode) has no equivalent
     filter: its image set is whatever the chosen SfM run already covers,
@@ -556,15 +565,15 @@ def export_frames_and_masks_for_postshot(
     output_dir = Path(output_dir)
     _migrate_legacy_export_layout(output_dir.parent)
 
-    if source_id is not None:
+    if frame_set_id is not None:
         rows = conn.execute(
             "SELECT v.image_path FROM views v JOIN frames f ON f.frame_id = v.frame_id "
-            "WHERE f.source_id = ?",
-            (source_id,),
+            "WHERE f.frame_set_id = ?",
+            (frame_set_id,),
         ).fetchall()
         if not rows:
             raise PostshotExportError(
-                f"no projected views found for source {source_id!r} -- generate projections for it first"
+                f"no projected views found for frame set {frame_set_id!r} -- generate projections for it first"
             )
     else:
         rows = conn.execute("SELECT image_path FROM views").fetchall()
@@ -625,13 +634,13 @@ def export_for_realityscan(
     project_root: Path,
     output_dir: Path,
     *,
-    source_id: str | None = None,
+    frame_set_id: str | None = None,
     include_camera_priors: bool = False,
     progress_callback=None,
 ) -> PostshotExportResult:
     """Exports every generated projection view and its keep-mask (if
     built) with no pose data, for RealityScan to run its own alignment
-    on -- same prerequisite, error messages and source_id filter as
+    on -- same prerequisite, error messages and frame_set_id filter as
     export_frames_and_masks_for_postshot (see its docstring). Masks go
     into a dedicated images/layers/.mask/ subfolder using the *same*
     flattened filename as their color image (no extra suffix -- the
@@ -664,15 +673,15 @@ def export_for_realityscan(
     output_dir = Path(output_dir)
     _migrate_legacy_export_layout(output_dir.parent)
 
-    if source_id is not None:
+    if frame_set_id is not None:
         rows = conn.execute(
             "SELECT v.image_path FROM views v JOIN frames f ON f.frame_id = v.frame_id "
-            "WHERE f.source_id = ?",
-            (source_id,),
+            "WHERE f.frame_set_id = ?",
+            (frame_set_id,),
         ).fetchall()
         if not rows:
             raise PostshotExportError(
-                f"no projected views found for source {source_id!r} -- generate projections for it first"
+                f"no projected views found for frame set {frame_set_id!r} -- generate projections for it first"
             )
     else:
         rows = conn.execute("SELECT image_path FROM views").fetchall()
@@ -726,7 +735,7 @@ def export_for_realityscan(
     num_priors = 0
     if include_camera_priors:
         notify("Looking for an SfM run to draw camera priors from…", None, None)
-        selection = _select_priors_run(conn, source_id=source_id)
+        selection = _select_priors_run(conn, frame_set_id=frame_set_id)
         if selection is None:
             warnings.append("camera priors requested but no usable SfM run was found -- skipped")
         else:

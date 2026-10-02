@@ -99,13 +99,19 @@ def extract_and_match(
     *,
     mask_dir: Path | None = None,
     config: SfmConfig = SfmConfig(),
+    image_names: list[str] | None = None,
 ) -> None:
     """Feature extraction (masked, if mask_dir is given) plus sequential
     matching ("match temporally near frames first" -- section 4, step 5).
     Separated from mapping so it's independently testable: extraction and
     matching are meaningful (and were tested against real overlapping
     renders, including the masking integration) even for an image set that
-    cannot be 3D-reconstructed -- see `map_and_diagnose`'s docstring."""
+    cannot be 3D-reconstructed -- see `map_and_diagnose`'s docstring.
+
+    image_names, if given, restricts extraction to those paths (relative
+    to image_dir) instead of every image under it -- pycolmap's own
+    `extract_features(image_names=...)`, confirmed against the installed
+    pycolmap 4.x signature. Mapping then only sees what was extracted."""
     database_path = Path(database_path)
     database_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -116,6 +122,7 @@ def extract_and_match(
     pycolmap.extract_features(
         database_path=database_path,
         image_path=image_dir,
+        image_names=list(image_names or []),
         reader_options=reader_options,
     )
     pycolmap.match_sequential(
@@ -197,10 +204,12 @@ def run_sfm(
     *,
     mask_dir: Path | None = None,
     config: SfmConfig = SfmConfig(),
+    image_names: list[str] | None = None,
 ) -> tuple[pycolmap.Reconstruction, SfmDiagnostics, Path]:
-    """extract_and_match + map_and_diagnose against real image files on disk."""
-    extract_and_match(image_dir, database_path, mask_dir=mask_dir, config=config)
-    total_images = len(list(Path(image_dir).iterdir()))
+    """extract_and_match + map_and_diagnose against real image files on disk
+    (only image_names, relative to image_dir, if given)."""
+    extract_and_match(image_dir, database_path, mask_dir=mask_dir, config=config, image_names=image_names)
+    total_images = len(image_names) if image_names else len(list(Path(image_dir).iterdir()))
     return map_and_diagnose(database_path, image_dir, sparse_output_dir, total_images=total_images)
 
 

@@ -85,9 +85,9 @@ def _insert_source(conn, source_id: str) -> None:
 def _insert_frames_only(conn, source_id: str, frame_id: str) -> None:
     _insert_source(conn, source_id)
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES (?, ?, 0.0, '{}', 'x', 'y')",
-        (frame_id, source_id),
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES (?, ?, 0.0, '{}', 'x', 'y', ?)",
+        (frame_id, source_id, source_id),
     )
     conn.commit()
 
@@ -151,7 +151,7 @@ def test_pose_six_face_blocked_when_prerequisite_is_ambiguous(project, qapp):
     )
 
     assert job.status == BLOCKED
-    assert "single source" in job.error_message
+    assert "single frame set" in job.error_message
 
 
 def test_pose_six_face_auto_inserts_projection_when_unambiguous(project, qapp):
@@ -228,7 +228,7 @@ def test_export_frames_masks_job_for_all_sources_uses_ambiguity_check(project, q
     )
 
     assert job.status == BLOCKED
-    assert "single source" in job.error_message
+    assert "single frame set" in job.error_message
 
 
 # -- persistence -----------------------------------------------------------
@@ -467,3 +467,80 @@ def test_cancel_all_leaves_already_terminal_jobs_alone(project, qapp):
 
     assert manager._get(done_job.job_id) is not None
     assert manager._get(done_job.job_id).status == DONE
+
+
+# -- frame sets (docs/adr/0034) -------------------------------------------
+
+
+def test_projection_job_for_a_queued_frame_set_depends_on_that_frames_job(project, qapp):
+    root, conn = project
+    _insert_source(conn, "s1")
+    manager = QueueManager(_state(root, conn))
+
+    frames_job = manager.add_job(
+        "frames", "s1", {"interval_seconds": 0.5, "start_time": None, "end_time": None}, "frames s1 0.5s"
+    )
+    assert frames_job.target_frame_set_id == "s1~i0.5"
+
+    projection_job = manager.add_job(
+        STAGE_PROJECTION,
+        "s1",
+        {"face_size": 64, "fov_degrees": 90.0, "face_names": ["front"]},
+        "proj",
+        target_frame_set_id="s1~i0.5",
+    )
+    assert projection_job.depends_on == [frames_job.job_id]
+    assert len(manager.jobs) == 2  # nothing auto-inserted -- the queued Frames job already covers it
+
+
+def test_projection_job_for_an_unknown_non_default_frame_set_is_blocked_not_guessed(project, qapp):
+    """Only the balanced-preset frame set can be auto-extracted -- anything
+    else would mean inventing extraction settings nobody chose."""
+    root, conn = project
+    _insert_source(conn, "s1")
+    manager = QueueManager(_state(root, conn))
+
+    job = manager.add_job(
+        STAGE_PROJECTION,
+        "s1",
+        {"face_size": 64, "fov_degrees": 90.0, "face_names": ["front"]},
+        "proj",
+        target_frame_set_id="s1~i0.25",
+    )
+    assert job.status == BLOCKED
+    assert len(manager.jobs) == 1
+
+
+def test_source_level_masks_job_is_blocked_when_the_source_has_several_frame_sets(project, qapp):
+    root, conn = project
+    _insert_source(conn, "s1")
+    for frame_set_id in ("s1~i0.5", "s1~i1"):
+        conn.execute(
+            "INSERT INTO frame_sets (frame_set_id, source_id, label, extraction_settings, created_at) "
+            "VALUES (?, 's1', 'x', '{}', '2026-01-01')",
+            (frame_set_id,),
+        )
+    conn.commit()
+    manager = QueueManager(_state(root, conn))
+
+    job = manager.add_job(STAGE_MASKS, "s1", {"use_sam3_person": False, "use_sam3_sky": False}, "masks s1")
+
+    assert job.status == BLOCKED
+    assert "2 frame sets" in job.error_message
+
+
+def test_jobs_persisted_before_frame_sets_reload_targeting_the_legacy_frame_set(project, qapp):
+    """A Projection/Masks job saved before target_frame_set_id existed
+    reloads targeting the source's migrated legacy frame set (id ==
+    source_id)."""
+    root, conn = project
+    _insert_frames_only(conn, "s1", "frame-1")
+    manager = QueueManager(_state(root, conn))
+    job = manager.add_job(STAGE_MASKS, "s1", {"use_sam3_person": False, "use_sam3_sky": False}, "masks s1")
+    conn.execute("UPDATE queue_jobs SET target_frame_set_id = NULL WHERE job_id = ?", (job.job_id,))
+    conn.commit()
+
+    reloaded = QueueManager(_state(root, conn))
+    reloaded.load()
+    masks_job = next(j for j in reloaded.jobs if j.stage == STAGE_MASKS)
+    assert masks_job.target_frame_set_id == "s1"

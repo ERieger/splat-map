@@ -8,7 +8,6 @@ sqlite or the project layout) to the project's index database and
 from __future__ import annotations
 
 import json
-import shutil
 import sqlite3
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -18,6 +17,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from vine360.cleanup import remove_view_files
 from vine360.models import View
 from vine360.projection.cubemap import FaceSpec, six_face_preset
 from vine360.projection.render import project_equirect_to_face
@@ -33,15 +33,16 @@ def clear_views_for_frame(conn: sqlite3.Connection, project_root: Path, frame_id
     clear-before-regenerate pattern used for frames, needed for the same
     reason: view_id is deterministic per frame+face, so a second
     generation with a different preset would otherwise collide or leave
-    stale faces behind."""
+    stale faces behind. Mask *files* (masks/keep/<frame_id>/,
+    masks/classes/<view_id>/) are removed along with the rows -- they
+    used to be left behind as orphans (docs/adr/0035)."""
+    view_ids = [r[0] for r in conn.execute("SELECT view_id FROM views WHERE frame_id = ?", (frame_id,))]
     conn.execute(
         "DELETE FROM masks WHERE view_id IN (SELECT view_id FROM views WHERE frame_id = ?)", (frame_id,)
     )
     conn.execute("DELETE FROM views WHERE frame_id = ?", (frame_id,))
     conn.commit()
-    output_dir = Path(project_root) / "projections" / frame_id
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
+    remove_view_files(project_root, frame_id, view_ids)
 
 
 def _render_and_save_frame_views(
@@ -52,7 +53,7 @@ def _render_and_save_frame_views(
     with no sqlite3.Connection involved at all. Deliberately a plain
     module-level function taking only picklable arguments (Path, str,
     FaceSpec dataclasses) so it can run unmodified inside a
-    ProcessPoolExecutor worker (see generate_views_for_source's parallel
+    ProcessPoolExecutor worker (see generate_views_for_frame_set's parallel
     path) as well as in-process for the sequential path and single-frame
     generate_views_for_frame."""
     project_root = Path(project_root)
@@ -134,10 +135,10 @@ def generate_views_for_frame(
     return views
 
 
-def generate_views_for_source(
+def generate_views_for_frame_set(
     conn: sqlite3.Connection,
     project_root: Path,
-    source_id: str,
+    frame_set_id: str,
     *,
     face_size: int = 1024,
     fov_degrees: float = 90.0,
@@ -149,7 +150,7 @@ def generate_views_for_source(
     """progress_callback(message, current, total), current/total counted in
     frames processed (not individual face images).
 
-    max_workers, when >= 2 and the source has more than one frame, renders
+    max_workers, when >= 2 and the frame set has more than one frame, renders
     frames concurrently across that many worker processes
     (ProcessPoolExecutor with a "spawn" context -- see docs/adr/0032).
     Defaults to None (sequential, in-process, today's exact behavior and
@@ -167,10 +168,10 @@ def generate_views_for_source(
     project_root = Path(project_root)
     notify = progress_callback or (lambda *a: None)
     frame_rows = conn.execute(
-        "SELECT frame_id, path FROM frames WHERE source_id = ? ORDER BY source_time", (source_id,)
+        "SELECT frame_id, path FROM frames WHERE frame_set_id = ? ORDER BY source_time", (frame_set_id,)
     ).fetchall()
     if not frame_rows:
-        raise ProjectionGenerationError(f"no frames found for source {source_id}; extract frames first")
+        raise ProjectionGenerationError(f"no frames found for frame set {frame_set_id}; extract frames first")
 
     faces = six_face_preset(
         face_size=face_size, fov_degrees=fov_degrees, include_polar_faces=include_polar_faces, face_names=face_names

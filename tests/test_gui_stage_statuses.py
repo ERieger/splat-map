@@ -53,8 +53,8 @@ def _insert_source_and_frame(conn):
         "VALUES ('s1', '/x.mp4', 'x', 'video', 'equirectangular', 640, 320, '{}', NULL)"
     )
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES ('f1', 's1', 0.0, '{}', 'x', 'y')"
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES ('f1', 's1', 0.0, '{}', 'x', 'y', 's1')"
     )
     conn.commit()
 

@@ -74,6 +74,9 @@ class Frame:
     extraction_settings: dict
     path: str
     checksum: str
+    # Which extraction config (docs/adr/0034) this frame belongs to --
+    # one source can have several frame sets side by side.
+    frame_set_id: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

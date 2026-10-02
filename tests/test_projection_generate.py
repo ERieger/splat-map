@@ -11,7 +11,7 @@ from vine360.projection.generate import (
     ProjectionGenerationError,
     _render_and_save_frame_views,
     generate_views_for_frame,
-    generate_views_for_source,
+    generate_views_for_frame_set,
 )
 
 
@@ -27,9 +27,9 @@ def _insert_fake_source_and_frame(conn, project_root, frame_id="frame-1", source
     image[:, :, 2] = 255
     Image.fromarray(image, "RGB").save(equirect_path)
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES (?, ?, 0.0, '{}', ?, 'cafef00d')",
-        (frame_id, source_id, str(equirect_path.relative_to(project_root))),
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES (?, ?, 0.0, '{}', ?, 'cafef00d', ?)",
+        (frame_id, source_id, str(equirect_path.relative_to(project_root)), source_id),
     )
     conn.commit()
     return source_id, frame_id
@@ -107,25 +107,25 @@ def test_regenerating_views_clears_dependent_masks(project):
     assert conn.execute("SELECT COUNT(*) FROM masks").fetchone()[0] == 0
 
 
-def test_generate_views_for_source_processes_all_frames_and_reports_progress(project):
+def test_generate_views_for_frame_set_processes_all_frames_and_reports_progress(project):
     root, conn = project
     source_id, frame_id_1 = _insert_fake_source_and_frame(conn, root, frame_id="frame-1", source_id="source-1")
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES ('frame-2', ?, 1.0, '{}', ?, 'aa11bb22')",
-        (source_id, f"frames/{source_id}/frame_000001.png"),
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES ('frame-2', ?, 1.0, '{}', ?, 'aa11bb22', ?)",
+        (source_id, f"frames/{source_id}/frame_000001.png", source_id),
     )
     conn.commit()
 
     messages = []
-    views = generate_views_for_source(conn, root, source_id, face_size=64, progress_callback=lambda m, c, t: messages.append((m, c, t)))
+    views = generate_views_for_frame_set(conn, root, source_id, face_size=64, progress_callback=lambda m, c, t: messages.append((m, c, t)))
 
     assert len(views) == 8  # 2 frames x 4 faces
     assert messages[0] == ("Projecting frame 1/2…", 0, 2)
     assert messages[-1][1:] == (2, 2)
 
 
-def test_generate_views_for_source_no_frames_raises(project):
+def test_generate_views_for_frame_set_no_frames_raises(project):
     root, conn = project
     conn.execute(
         "INSERT INTO sources (source_id, path, checksum, media_type, projection, width, height, timestamps, capture_group) "
@@ -133,7 +133,7 @@ def test_generate_views_for_source_no_frames_raises(project):
     )
     conn.commit()
     with pytest.raises(ProjectionGenerationError):
-        generate_views_for_source(conn, root, "s1")
+        generate_views_for_frame_set(conn, root, "s1")
 
 
 def test_render_and_save_frame_views_writes_files_and_returns_views(project):
@@ -154,17 +154,17 @@ def test_render_and_save_frame_views_writes_files_and_returns_views(project):
         assert view.projection_id == "six-face"
 
 
-def test_generate_views_for_source_parallel_matches_sequential(project):
+def test_generate_views_for_frame_set_parallel_matches_sequential(project):
     root, conn = project
     source_id, _frame_id_1 = _insert_fake_source_and_frame(conn, root, frame_id="frame-1", source_id="source-1")
     conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum) "
-        "VALUES ('frame-2', ?, 1.0, '{}', ?, 'aa11bb22')",
-        (source_id, f"frames/{source_id}/frame_000001.png"),
+        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+        "VALUES ('frame-2', ?, 1.0, '{}', ?, 'aa11bb22', ?)",
+        (source_id, f"frames/{source_id}/frame_000001.png", source_id),
     )
     conn.commit()
 
-    views = generate_views_for_source(conn, root, source_id, face_size=64, max_workers=2)
+    views = generate_views_for_frame_set(conn, root, source_id, face_size=64, max_workers=2)
 
     assert len(views) == 8  # 2 frames x 4 faces
     expected_view_ids = {f"frame-1:{name}" for name in ("front", "right", "back", "left")} | {
@@ -178,14 +178,14 @@ def test_generate_views_for_source_parallel_matches_sequential(project):
     assert row_count == 8
 
 
-def test_generate_views_for_source_single_frame_ignores_max_workers(project):
+def test_generate_views_for_frame_set_single_frame_ignores_max_workers(project):
     """A 1-frame source should transparently stay on the sequential path
     even when max_workers is requested -- no benefit to a process pool
     for a single unit of work."""
     root, conn = project
     source_id, frame_id = _insert_fake_source_and_frame(conn, root)
 
-    views = generate_views_for_source(conn, root, source_id, face_size=64, max_workers=4)
+    views = generate_views_for_frame_set(conn, root, source_id, face_size=64, max_workers=4)
 
     assert len(views) == 4  # 1 frame x 4 default faces
     assert {v.view_id for v in views} == {f"{frame_id}:{name}" for name in ("front", "right", "back", "left")}

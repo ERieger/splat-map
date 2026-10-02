@@ -114,7 +114,7 @@ against); don't treat their command shapes as trustworthy without re-verifying f
 never copied into the project. `_ensure_layout_dirs` (mirroring `_ensure_schema`'s migrate-on-open
 pattern) creates any missing directory on every `create_project`/`open_index_db` call, so a new
 `LAYOUT_DIRS` entry reaches an existing project automatically. The SQLite schema
-(`sources → frames → views → masks`, plus `sfm_runs`) is created by `_ensure_schema` in
+(`sources → frame_sets → frames → views → masks`, plus `sfm_runs`) is created by `_ensure_schema` in
 `vine360/project.py`, called on **both** `create_project` and every `open_index_db` — an older
 project missing a table/column (e.g. `views`, or `masks.flagged_for_review`) gets migrated via
 `_ensure_column` rather than breaking silently. `sfm_runs.selected_model` records which
@@ -123,14 +123,23 @@ project missing a table/column (e.g. `views`, or `masks.flagged_for_review`) get
 selected one, and each run gets its own subdirectory specifically so a later run can't overwrite
 an earlier one's files (docs/adr/0019) — this field is load-bearing, not incidental.
 
+**Frame sets** (docs/adr/0034): one source can have several extraction configs side by side
+(e.g. every 0.5s and every 1s). Each is a frame set with a deterministic id
+`<source_id>~<tag>` (`frame_set_id_for`), and every stage after Frames — projection, masks,
+SfM, export, queue jobs, GUI dropdowns — is scoped by `frame_set_id`, not `source_id`. Frames
+extracted before frame sets existed were migrated into a set whose id *is* the source_id, so
+their paths are unchanged.
+
 **Cascade-delete invariant**: re-running an earlier pipeline stage must delete every downstream
 derived artifact (frames → views → masks), both DB rows and on-disk files, or you get orphaned
 references and stale directories (the exact bug fixed in docs/adr/0017/0019 — a real
-data-integrity gap, not hypothetical). Any change to `clear_frames_for_source` /
-`clear_views_for_frame` / mask rebuilding needs to preserve this.
+data-integrity gap, not hypothetical). Any change to `clear_frame_set` /
+`clear_frames_for_source` / `clear_views_for_frame` / `vine360.cleanup` / `vine360.data_manager`
+/ mask rebuilding needs to preserve this.
 
 **Pipeline stages** (mirrored by the GUI sidebar, `vine360/gui/main_window.py`'s `STAGE_*`
-constants): Project → Import → Frames → Projection → Masks → Pose estimation → Export. Training
+constants): Project → Import → Frames → Projection → Masks → Pose estimation → Export, plus a
+non-stage Data manager tab (docs/adr/0035) for listing and deleting derived data. Training
 has no GUI stage (removed from the app's scope, docs/adr/0025) — the adapter-only library code
 (`vine360/training/`) still exists per docs/adr/0009 (no backend is installed or run), it's just
 not surfaced here. `compute_stage_statuses` computes each stage's done/active/pending status from
