@@ -75,6 +75,7 @@ from vine360.data_manager import (
     delete_sfm_run,
     delete_views_for_frame_set,
     directory_size,
+    export_dir_size,
     frame_set_disk_usage,
     list_export_dirs,
     list_frame_sets,
@@ -135,6 +136,10 @@ CAPTURE_GROUP_PRESETS = ["Insta360 (ground)", "Antigravity A1 (aerial)", "Other 
 
 DONE, ACTIVE, PENDING = "done", "active", "pending"
 STATUS_COLOR = {DONE: QColor(70, 150, 90), ACTIVE: QColor(200, 160, 50), PENDING: QColor(120, 120, 120)}
+# The Data manager tab isn't a pipeline stage, so it never takes a status
+# color -- a fixed blue, distinct from every stage and job-status color,
+# keeps its sidebar row lined up and visually of a piece with the rest.
+DATA_MANAGER_DOT_COLOR = QColor(70, 120, 200)
 
 # Job-status vocabulary (queue_manager.QUEUED/RUNNING/DONE/FAILED/BLOCKED/
 # SKIPPED) is deliberately separate from the stage-status vocabulary above
@@ -162,7 +167,7 @@ STAGE_PROJECTION = 3
 STAGE_MASKS = 4
 STAGE_POSE = 5
 STAGE_EXPORT = 6
-STAGE_DATA_MANAGER = 7  # not a pipeline stage: no status dot, not in compute_stage_statuses
+STAGE_DATA_MANAGER = 7  # not a pipeline stage: fixed-color dot, not in compute_stage_statuses
 
 
 @dataclass
@@ -2970,7 +2975,7 @@ def _disk_usage_worker(project_root: Path, generation: int) -> tuple[int, dict]:
         sfm_runs = {run.run_id: directory_size(project_root / "sfm" / "sparse" / run.run_id) for run in list_sfm_runs(conn)}
     finally:
         conn.close()
-    exports = {info.relative_path: directory_size(project_root / info.relative_path) for info in list_export_dirs(project_root)}
+    exports = {info.relative_path: export_dir_size(project_root, info) for info in list_export_dirs(project_root)}
     return generation, {"frame_sets": frame_sets, "sfm_runs": sfm_runs, "exports": exports}
 
 
@@ -3001,8 +3006,8 @@ class DataManagerPanel(QWidget):
     frame set's projections (and their masks) or just its masks, an SfM
     run, or an export folder. Every delete goes through
     vine360.data_manager, which keeps the cascade-delete invariant
-    (docs/adr/0017, 0035). Not a pipeline stage, so it has no sidebar
-    status dot."""
+    (docs/adr/0017, 0035). Not a pipeline stage, so its sidebar dot is a
+    fixed color (DATA_MANAGER_DOT_COLOR), not a status."""
 
     def __init__(self, state: AppState):
         super().__init__()
@@ -3187,7 +3192,10 @@ class DataManagerPanel(QWidget):
         exports = list_export_dirs(self.state.project_root)
         self.exports_table.setRowCount(len(exports))
         for r, info in enumerate(exports):
-            text = info.relative_path + ("  (older flat layout)" if info.legacy_layout else "")
+            if info.in_exports_root:
+                text = "exports  (written directly into exports/)"
+            else:
+                text = info.relative_path + ("  (older flat layout)" if info.legacy_layout else "")
             item = QTableWidgetItem(text)
             item.setData(Qt.UserRole, info.relative_path)
             self.exports_table.setItem(r, 0, item)
@@ -3234,8 +3242,17 @@ class DataManagerPanel(QWidget):
             for k in range(parent.childCount()):
                 item = parent.child(k)
                 sizes = frame_sets.get(item.data(0, Qt.UserRole))
-                for col, key in ((4, "frames"), (5, "projections"), (6, "masks")):
-                    item.setText(col, _format_bytes(sizes[key] if sizes else None))
+                counts = item.data(1, Qt.UserRole)
+                for col, key, count in zip((4, 5, 6), ("frames", "projections", "masks"), counts):
+                    size = sizes[key] if sizes else None
+                    if size == 0 and count > 0:
+                        # Rows in the index but nothing on disk where they
+                        # belong -- say so rather than show a plausible "0 B".
+                        item.setText(col, "files missing")
+                        item.setToolTip(col, f"{count} {key} recorded, but no files found in the project's {key}/ folder.")
+                    else:
+                        item.setText(col, _format_bytes(size))
+                        item.setToolTip(col, "")
         runs = self._usage.get("sfm_runs", {})
         for r in range(self.runs_table.rowCount()):
             run_id = self.runs_table.item(r, 0).data(Qt.UserRole)
@@ -3321,7 +3338,12 @@ class DataManagerPanel(QWidget):
 
     def _delete_export(self) -> None:
         rel = self._selected_row_data(self.exports_table)
-        if rel and self._confirm("Delete export folder", f"Delete {rel}/ and everything in it?\n\nThis can't be undone."):
+        if rel == "exports":
+            question = ("Delete the export written directly into exports/ (its images/, masks/, sparse/ and "
+                        "CameraPriors.csv)?\n\nOther export folders are kept. This can't be undone.")
+        else:
+            question = f"Delete {rel}/ and everything in it?\n\nThis can't be undone."
+        if rel and self._confirm("Delete export folder", question):
             self._run_delete("export", rel)
 
     def _run_delete(self, action: str, target: str) -> None:
@@ -3408,12 +3430,10 @@ class Vine360MainWindow(QMainWindow):
         self._sidebar_items: list[QListWidgetItem] = []
         for index, (label, widget) in enumerate(zip(labels, self._panels)):
             item = QListWidgetItem(f"  {label}")
-            if index <= STAGE_EXPORT:  # pipeline stages get a status dot; Data manager isn't one
+            if index <= STAGE_EXPORT:  # pipeline stages get a status dot
                 item.setIcon(QIcon(_status_dot(PENDING)))
-            else:
-                blank = QPixmap(12, 12)  # same size as a status dot, so the label lines up
-                blank.fill(Qt.transparent)
-                item.setIcon(QIcon(blank))
+            else:  # Data manager isn't a stage: a fixed-color dot instead
+                item.setIcon(QIcon(_dot_pixmap(DATA_MANAGER_DOT_COLOR)))
             self._sidebar_items.append(item)
             self.sidebar.addItem(item)
             self.stack.addWidget(widget)

@@ -34,3 +34,20 @@ finishes.
 
 **Every delete asks for confirmation and is disabled while the queue is running.** The
 confirmation notes any queued jobs that still target the frame set.
+
+## Addendum: exports written directly into exports/, and the sidebar dot
+
+- The Data manager row gets a fixed blue dot (`DATA_MANAGER_DOT_COLOR`) rather than a blank
+  spacer: not a status, but visually of a piece with the stage rows, and distinct from every
+  stage/job status color (purple is already the queue's BLOCKED).
+- Choosing `exports/` itself as an export's output folder is allowed, so `list_export_dirs` lists
+  such an export as one `"exports"` entry (`in_exports_root=True`); its size and delete cover only
+  what an export writes (`images/`, `masks/`, `sparse/`, `CameraPriors.csv`), never the
+  `<capture>/` folders beside it.
+- Real bug this surfaced: the export functions run `_migrate_legacy_export_layout` on
+  `output_dir.parent` -- for `output_dir = exports/` that's the project root, whose own `masks/`
+  looked like a flat legacy export and was moved to `<root>/postshot/masks/`, orphaning every
+  mask row (shown as 0 bytes here). The migration now never touches a folder holding
+  `project.yaml`, and every export function refuses a project root as `output_dir` outright
+  (`_reset_managed_subdirs` would otherwise delete its `masks/`). A frame set row whose
+  frames/projections/masks have rows but no files now shows "files missing" instead of "0 B".

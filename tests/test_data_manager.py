@@ -16,6 +16,7 @@ from vine360.data_manager import (
     delete_masks_for_frame_set,
     delete_sfm_run,
     delete_views_for_frame_set,
+    export_dir_size,
     frame_set_disk_usage,
     list_export_dirs,
     list_frame_sets,
@@ -223,3 +224,32 @@ def test_delete_export_dir_refuses_anything_outside_exports(project, bad):
     with pytest.raises(DataManagerError):
         delete_export_dir(root, bad)
     assert (root / "frames").exists()
+
+
+def test_export_written_directly_into_exports_is_listed_sized_and_deletable(project):
+    """With exports/ itself chosen as the output folder, an export's
+    images/masks sit straight in exports/ -- listed as one "exports"
+    entry, sized and deleted without touching the <capture>/ folders
+    beside it."""
+    root, _conn = project
+    exports = root / "exports"
+    (exports / "images").mkdir()
+    (exports / "images" / "a.png").write_bytes(b"x" * 10)
+    (exports / "masks").mkdir()
+    (exports / "masks" / "a.png").write_bytes(b"x" * 5)
+    (exports / "all" / "postshot").mkdir(parents=True)
+    (exports / "all" / "postshot" / "b.png").write_bytes(b"x" * 100)
+
+    listed = list_export_dirs(root)
+    assert [(i.relative_path, i.legacy_layout, i.in_exports_root) for i in listed] == [
+        ("exports", False, True),
+        ("exports/all/postshot", False, False),
+    ]
+    assert export_dir_size(root, listed[0]) == 15  # not the 100 bytes beside it
+    assert export_dir_size(root, listed[1]) == 100
+
+    delete_export_dir(root, "exports")
+    assert not (exports / "images").exists()
+    assert not (exports / "masks").exists()
+    assert (exports / "all" / "postshot" / "b.png").exists()
+    assert [i.relative_path for i in list_export_dirs(root)] == ["exports/all/postshot"]

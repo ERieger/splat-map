@@ -126,6 +126,7 @@ from pathlib import Path
 import pycolmap
 
 from vine360.masking.semantics import colmap_mask_path
+from vine360.project import PROJECT_FILE
 
 _COLMAP_MODEL_FILES = ("cameras.bin", "images.bin", "points3D.bin")
 _MANAGED_SUBDIRS = ("images", "masks", "sparse")
@@ -337,6 +338,15 @@ def _write_camera_priors_csv(
     return priors_path, len(rows), warning
 
 
+def _refuse_project_root(output_dir: Path) -> None:
+    """A project root as output_dir would have _reset_managed_subdirs
+    delete the project's own masks/ -- refuse it outright."""
+    if (output_dir / PROJECT_FILE).exists():
+        raise PostshotExportError(
+            f"{output_dir} is a vine360 project folder, not an export folder -- choose a folder under its exports/"
+        )
+
+
 def _migrate_legacy_export_layout(capture_dir: Path) -> None:
     """Migrates a pre-nested-layout export (images/masks/sparse directly
     under capture_dir, from before the <capture>/<format>/ layout
@@ -361,6 +371,11 @@ def _migrate_legacy_export_layout(capture_dir: Path) -> None:
     never existed pre-nesting, so a legacy flat export headed for
     exports/all/<format>/ is actually sitting at the sibling
     exports/postshot/ instead -- check there in that one case."""
+    if (capture_dir / PROJECT_FILE).exists():
+        # A project root, reached because exports/ itself was chosen as
+        # output_dir: its masks/ is the project's own mask store, not a
+        # legacy export -- moving it would orphan every mask row.
+        return
     legacy_dir = capture_dir
     if capture_dir.name == "all" and capture_dir.parent.name == "exports":
         legacy_default = capture_dir.parent / "postshot"
@@ -426,6 +441,7 @@ def export_for_postshot(
     notify = progress_callback or (lambda *a: None)
     project_root = Path(project_root)
     output_dir = Path(output_dir)
+    _refuse_project_root(output_dir)
     _migrate_legacy_export_layout(output_dir.parent)
 
     if run_id is not None:
@@ -563,6 +579,7 @@ def export_frames_and_masks_for_postshot(
     notify = progress_callback or (lambda *a: None)
     project_root = Path(project_root)
     output_dir = Path(output_dir)
+    _refuse_project_root(output_dir)
     _migrate_legacy_export_layout(output_dir.parent)
 
     if frame_set_id is not None:
@@ -671,6 +688,7 @@ def export_for_realityscan(
     notify = progress_callback or (lambda *a: None)
     project_root = Path(project_root)
     output_dir = Path(output_dir)
+    _refuse_project_root(output_dir)
     _migrate_legacy_export_layout(output_dir.parent)
 
     if frame_set_id is not None:

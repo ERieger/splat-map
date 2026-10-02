@@ -23,6 +23,10 @@ from vine360.ingest.frames import clear_frame_set
 from vine360.projection.generate import clear_views_for_frame
 
 EXPORT_FORMAT_DIRNAMES = ("colmap", "postshot", "realityscan")
+# What an export function writes into its output folder (vine360.export.
+# postshot's managed subdirectories plus RealityScan's priors CSV) -- the
+# only things an export written straight into exports/ owns there.
+EXPORT_CONTENT_NAMES = ("images", "masks", "sparse", "CameraPriors.csv")
 
 
 class DataManagerError(Exception):
@@ -75,6 +79,10 @@ class SfmRunInfo:
 class ExportDirInfo:
     relative_path: str  # relative to the project root, e.g. "exports/all/postshot"
     legacy_layout: bool  # a pre-ADR-0028 flat exports/<capture>/{images,masks,sparse}/ folder
+    # An export written with exports/ itself chosen as the output folder:
+    # its images/masks/sparse sit directly in exports/, next to the
+    # <capture>/ folders, so only EXPORT_CONTENT_NAMES belong to it.
+    in_exports_root: bool = False
 
 
 def list_sources(conn: sqlite3.Connection) -> list[SourceInfo]:
@@ -227,14 +235,17 @@ def delete_sfm_run(conn: sqlite3.Connection, project_root: Path, run_id: str) ->
 
 
 def list_export_dirs(project_root: Path) -> list[ExportDirInfo]:
-    """Every exports/<capture>/<format>/ folder (docs/adr/0028), plus any
+    """Every exports/<capture>/<format>/ folder (docs/adr/0028), any
     pre-0028 flat exports/<capture>/ folder still holding images/masks/
-    sparse directly."""
+    sparse directly, and an export written straight into exports/ itself
+    (listed as "exports", in_exports_root=True)."""
     exports_root = Path(project_root) / "exports"
     if not exports_root.is_dir():
         return []
     result = []
-    for capture in sorted(p for p in exports_root.iterdir() if p.is_dir()):
+    if any((exports_root / name).exists() for name in EXPORT_CONTENT_NAMES):
+        result.append(ExportDirInfo("exports", legacy_layout=False, in_exports_root=True))
+    for capture in sorted(p for p in exports_root.iterdir() if p.is_dir() and p.name not in EXPORT_CONTENT_NAMES):
         children = [c for c in capture.iterdir() if c.is_dir()]
         for child in sorted(children):
             if child.name in EXPORT_FORMAT_DIRNAMES:
@@ -244,12 +255,40 @@ def list_export_dirs(project_root: Path) -> list[ExportDirInfo]:
     return result
 
 
+def export_dir_size(project_root: Path, info: ExportDirInfo) -> int:
+    """Bytes on disk for one listed export -- for an export straight into
+    exports/, just its own contents, not the <capture>/ folders beside it."""
+    root = Path(project_root) / info.relative_path
+    if not info.in_exports_root:
+        return directory_size(root)
+    total = 0
+    for name in EXPORT_CONTENT_NAMES:
+        path = root / name
+        if path.is_file():
+            total += path.stat().st_size
+        else:
+            total += directory_size(path)
+    return total
+
+
 def delete_export_dir(project_root: Path, relative_path: str) -> None:
     """Deletes one folder under exports/ -- refuses anything that doesn't
     resolve strictly inside it. Removes the now-empty <capture>/ parent
-    too."""
+    too. relative_path "exports" itself means an export written straight
+    into exports/: only its EXPORT_CONTENT_NAMES are removed, never the
+    <capture>/ folders beside them."""
     exports_root = (Path(project_root) / "exports").resolve()
     target = (Path(project_root) / relative_path).resolve()
+    if target == exports_root:
+        present = [exports_root / name for name in EXPORT_CONTENT_NAMES if (exports_root / name).exists()]
+        if not present:
+            raise DataManagerError("no export written directly into exports/")
+        for path in present:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        return
     if target == exports_root or exports_root not in target.parents:
         raise DataManagerError(f"refusing to delete {relative_path!r}: not a folder inside exports/")
     if not target.is_dir():

@@ -809,3 +809,41 @@ def test_export_for_postshot_does_not_leave_images_from_a_previous_larger_run(pr
 
     assert len(names_2) < len(names_1)
     assert sorted(p.name for p in (output_dir / "images").iterdir()) == sorted(names_2)
+
+
+def test_export_into_exports_root_leaves_the_projects_own_masks_alone(project):
+    """Real bug: with exports/ itself chosen as output_dir, the legacy
+    migration ran on its parent -- the project root -- took the project's
+    own masks/ for a flat legacy export and moved it to <root>/postshot/,
+    orphaning every mask row."""
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-1", "front", with_mask=True)
+    keep_mask = root / "masks" / "keep" / "frame-1" / "front.png.png"
+    assert keep_mask.exists()
+
+    result = export_frames_and_masks_for_postshot(conn, root, root / "exports")
+
+    assert keep_mask.exists()
+    assert not (root / "postshot").exists()
+    assert result.num_masks == 1
+    assert (root / "exports" / "masks" / "frame-1__front.png").exists()
+
+
+def test_migrate_legacy_export_layout_never_touches_a_project_root(project):
+    root, _conn = project
+    (root / "masks" / "keep" / "f.png").write_bytes(b"x")
+
+    _migrate_legacy_export_layout(root)
+
+    assert (root / "masks" / "keep" / "f.png").exists()
+    assert not (root / "postshot").exists()
+
+
+def test_export_refuses_a_project_root_as_output_dir(project):
+    """_reset_managed_subdirs would otherwise delete the project's masks/."""
+    root, conn = project
+    _insert_view_with_image(conn, root, "frame-1", "front", with_mask=True)
+
+    with pytest.raises(PostshotExportError, match="project folder"):
+        export_frames_and_masks_for_postshot(conn, root, root)
+    assert (root / "masks" / "keep" / "frame-1" / "front.png.png").exists()
