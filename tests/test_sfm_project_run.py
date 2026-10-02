@@ -95,7 +95,7 @@ def test_run_sfm_for_project_success_records_sfm_run_row(project):
 
     assert diagnostics is fake_diagnostics
     assert warnings == []
-    assert any("Extracting features" in m for m in messages)
+    assert any(m.startswith("COLMAP done: 4/4 images registered") for m in messages)
 
     row = conn.execute("SELECT run_id, model_stats, selected_model FROM sfm_runs").fetchone()
     assert row is not None
@@ -135,7 +135,7 @@ def test_run_sfm_for_project_uses_a_distinct_sparse_dir_per_run(project):
     fake_diagnostics = SfmDiagnostics(4, 4, 1.0, 1, 1, 0.1, 1.0, 1.0)
     sparse_dirs_used = []
 
-    def fake_run_sfm(image_dir, database_path, sparse_dir, *, mask_dir=None, config=None, image_names=None):
+    def fake_run_sfm(image_dir, database_path, sparse_dir, *, mask_dir=None, config=None, image_names=None, progress_callback=None):
         sparse_dirs_used.append(sparse_dir)
         model_dir = sparse_dir / "0"
         model_dir.mkdir(parents=True)
@@ -196,7 +196,7 @@ def test_run_sfm_for_project_frames_real_equirectangular_camera_model(project):
 def _fake_run_sfm_recording(calls):
     fake_diagnostics = SfmDiagnostics(4, 4, 1.0, 1, 1, 0.1, 1.0, 1.0)
 
-    def fake_run_sfm(image_dir, database_path, sparse_dir, *, mask_dir=None, config=None, image_names=None):
+    def fake_run_sfm(image_dir, database_path, sparse_dir, *, mask_dir=None, config=None, image_names=None, progress_callback=None):
         calls.append({"image_dir": image_dir, "database_path": database_path, "sparse_dir": sparse_dir,
                       "image_names": image_names})
         model_dir = sparse_dir / "0"

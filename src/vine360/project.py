@@ -138,6 +138,20 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 selected_model TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS activity_log (
+                entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation TEXT NOT NULL,
+                label TEXT NOT NULL,
+                target TEXT,
+                params TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                duration_seconds REAL,
+                result TEXT,
+                error TEXT,
+                origin TEXT
+            );
             CREATE TABLE IF NOT EXISTS queue_jobs (
                 job_id TEXT PRIMARY KEY,
                 order_index INTEGER NOT NULL,

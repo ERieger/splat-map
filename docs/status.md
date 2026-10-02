@@ -185,6 +185,18 @@ equirect frames. RealityScan camera priors work for both engines too. The frame-
 conversion is pinned by real reconstructions of a synthetic ray-cast 360 room: median 0.11 px
 reprojection agreement, plus a cross-check against SphereSfM's own cube-face exporter.
 
+**Verbose progress and Activity log (ADR 0037).**
+- Every SfM step now reports counted, labelled progress. SphereSfM's live log is streamed and
+  parsed, and each step's log is kept in the run folder. pycolmap's native log lines are
+  captured during each call, and its mapper registration callbacks are used.
+- Every panel's progress area has a timestamped Details log and a per-step ETA.
+- A new Activity log tab lists every operation run in the project, in order, with its exact
+  parameters, timing, outcome, and whether it was started by hand or by the queue. It can be
+  exported to CSV.
+- Verbose progress and activity logging are now standing requirements for new features
+  (CLAUDE.md). pycolmap and SphereSfM both use the GPU (`sfm-cuda` extra; CUDA build of
+  SphereSfM).
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -252,6 +264,8 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
 0034: frame sets -- several extraction configs per source, deterministic
       ids, legacy id == source_id migration, per-run COLMAP database.
 0035: Data manager tab -- list everything derived, delete with cascade.
+0037: verbose, counted progress for long operations (streamed tool logs,
+      native log capture -- never DB polling) and a per-project activity log.
 0036: SphereSfM engine (CLI via Runner, TXT models -- never pycolmap) and
       pinhole export of 360 runs via measured frame->view pose conversion.
 

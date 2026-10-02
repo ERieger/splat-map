@@ -300,3 +300,61 @@ def test_export_panel_needs_projections_to_export_a_360_run(qapp, project):
     stages = [job.stage for job in state.queue_manager.jobs]
     assert stages == ["projection", "export"], "Add to Queue projects the frame set first"
     assert state.queue_manager.jobs[0].target_frame_set_id == "s1~i1"
+
+
+def test_progress_area_keeps_a_timestamped_details_log_and_per_phase_eta(qapp):
+    from vine360.gui.main_window import ProgressArea
+
+    area = ProgressArea()
+    area.start("Running SfM…")
+    area.update_progress("step 1/3: 5/10 frames", 5, 10)
+    area.update_progress("step 1/3: 5/10 frames", 5, 10)  # repeats aren't logged twice
+    area.update_progress("step 2/3: 1/4 pairs", 1, 4)  # a new phase resets the ETA baseline
+    assert area._phase_total == 4 and area._phase_start[1] == 1
+    area.finish("SfM complete.")
+
+    lines = area.details.toPlainText().splitlines()
+    assert [line.split("] ", 1)[1] for line in lines] == [
+        "Running SfM…", "step 1/3: 5/10 frames", "step 2/3: 1/4 pairs", "SfM complete."
+    ]
+    assert lines[0].startswith("[0m00s]")
+    assert area.details_btn.isVisibleTo(area) and not area.details.isVisibleTo(area)
+    area.details_btn.setChecked(True)
+    assert area.details.isVisibleTo(area)
+
+
+def test_activity_log_panel_lists_runs_with_parameters(qapp, project):
+    from vine360.activity_log import STATUS_DONE, finish_entry, start_entry
+    from vine360.gui.main_window import ActivityLogPanel
+
+    root, conn = project
+    _insert_source(conn, "s1")
+    _insert_frame_set(conn, "s1", "s1~i1", "every 1s")
+    entry = start_entry(conn, "projection.generate", "Projection", target="s1~i1", params={"face_size": 1024})
+    finish_entry(conn, entry, status=STATUS_DONE, duration_seconds=75.0, result="24 views")
+    start_entry(conn, "sfm.run", "Pose estimation", target="s1~i1", params={"engine": "spheresfm"}, origin="queue: pose")
+
+    panel = ActivityLogPanel(_state(root, conn))
+    panel.on_shown()
+
+    assert panel.table.rowCount() == 2
+    row = [panel.table.item(0, c).text() for c in range(panel.table.columnCount())]
+    assert row[2:6] == ["1m15s", "Projection", "s1.mp4 — every 1s", "done"]
+    assert panel.table.item(1, 5).text() == "running" and panel.table.item(1, 6).text() == "queue: pose"
+    panel.table.selectRow(0)
+    assert '"face_size": 1024' in panel.details.toPlainText()
+    panel.newest_first_check.setChecked(True)
+    assert panel.table.item(0, 3).text() == "Pose estimation"
+
+
+def test_activity_log_csv_export(qapp, project, tmp_path):
+    import csv
+
+    from vine360.activity_log import start_entry
+    from vine360.gui.main_window import write_activity_log_csv
+
+    _root, conn = project
+    start_entry(conn, "frames.extract", "Frame extraction", params={"interval_seconds": 0.5})
+    write_activity_log_csv(conn, tmp_path / "log.csv")
+    rows = list(csv.DictReader(open(tmp_path / "log.csv")))
+    assert rows[0]["operation"] == "frames.extract" and json.loads(rows[0]["params"]) == {"interval_seconds": 0.5}

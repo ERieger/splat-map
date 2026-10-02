@@ -12,7 +12,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 
 @dataclass
@@ -44,5 +44,10 @@ class Runner(ABC):
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
         timeout: float | None = None,
+        on_output: "Callable[[str], None] | None" = None,
     ) -> RunResult:
+        """on_output, if given, is called with each line of the command's
+        combined stdout/stderr as it's produced -- what lets a long external
+        run (SphereSfM, ffmpeg) report live progress instead of nothing
+        until it exits."""
         raise NotImplementedError

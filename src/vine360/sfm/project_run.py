@@ -157,11 +157,16 @@ def run_sfm_for_project(
     sparse_dir = project_root / "sfm" / "sparse" / run_id
     database_path = sparse_dir / "database.db"
 
-    notify("Extracting features and matching views…", None, None)
     _reconstruction, diagnostics, model_dir = run_sfm(
-        image_dir, database_path, sparse_dir, mask_dir=mask_dir_arg, config=config, image_names=image_names
+        image_dir, database_path, sparse_dir, mask_dir=mask_dir_arg, config=config, image_names=image_names,
+        progress_callback=notify,
     )
-    notify("Mapping complete.", None, None)
+    notify(
+        f"COLMAP done: {diagnostics.registered_images}/{diagnostics.total_images} images registered, "
+        f"{diagnostics.num_points3d} points, {diagnostics.num_connected_models} model(s).",
+        diagnostics.registered_images,
+        diagnostics.total_images,
+    )
 
     warnings = evaluate_registration_quality(diagnostics)
 
@@ -232,27 +237,40 @@ def _run_spheresfm(
     image_list_path = run_dir / "image_list.txt"
     image_list_path.write_text("\n".join(image_names) + "\n")
 
-    steps = 4
-    notify(
-        f"SphereSfM: extracting features from {len(image_names)} frames ({'GPU' if use_gpu else 'CPU'})…", 0, steps
-    )
+    device = "GPU" if use_gpu else "CPU"
+    n = len(image_names)
+
+    def parser(step: int, label: str) -> sph.ProgressParser:
+        return sph.ProgressParser(f"SphereSfM step {step}/4 ({label}): ", n, notify)
+
+    notify(f"SphereSfM step 1/4 (features, {device}): starting on {n} frames…", 0, n)
     sph.run_command(
         runner,
         sph.build_feature_extraction_command(
             binary, database_path, image_dir, image_list_path, width=width, height=height, use_gpu=use_gpu
         ),
         "feature extraction",
+        on_line=parser(1, f"features, {device}").feed,
+        log_path=run_dir / "1_feature_extractor.log",
     )
-    notify("SphereSfM: matching frames…", 1, steps)
+    notify(f"SphereSfM step 2/4 (matching, {device}): starting…", 0, n)
     sph.run_command(
         runner,
         sph.build_matcher_command(binary, database_path, overlap=config.sequential_overlap, use_gpu=use_gpu),
         "matching",
+        on_line=parser(2, f"matching, {device}").feed,
+        log_path=run_dir / "2_sequential_matcher.log",
     )
-    notify("SphereSfM: mapping (this is the slow part)…", 2, steps)
-    sph.run_command(runner, sph.build_mapper_command(binary, database_path, image_dir, run_dir), "mapping")
+    notify("SphereSfM step 3/4 (mapping, CPU): starting…", 0, n)
+    sph.run_command(
+        runner,
+        sph.build_mapper_command(binary, database_path, image_dir, run_dir),
+        "mapping",
+        on_line=parser(3, "mapping, CPU").feed,
+        log_path=run_dir / "3_mapper.log",
+    )
 
-    notify("SphereSfM: reading the reconstruction…", 3, steps)
+    notify("SphereSfM step 4/4: reading the reconstruction…", None, None)
     candidates = {}
     for model_dir in sorted(p for p in run_dir.iterdir() if p.is_dir() and p.name.isdigit()):
         txt_dir = model_dir / "txt"
@@ -277,7 +295,12 @@ def _run_spheresfm(
         mean_track_length=sum(track_lengths) / len(track_lengths) if track_lengths else 0.0,
         mean_observations_per_reg_image=sum(track_lengths) / registered if registered else 0.0,
     )
-    notify("SphereSfM: done.", steps, steps)
+    notify(
+        f"SphereSfM done: {registered}/{n} frames registered, {len(model.points)} points, "
+        f"{len(candidates)} model(s).",
+        registered,
+        n,
+    )
     warnings = evaluate_registration_quality(diagnostics)
 
     conn.execute(

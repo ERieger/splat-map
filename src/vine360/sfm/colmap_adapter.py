@@ -18,6 +18,11 @@ same layout, so the masking and SfM adapters agree by construction.
 from __future__ import annotations
 
 import hashlib
+import os
+import re
+import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -100,6 +105,7 @@ def extract_and_match(
     mask_dir: Path | None = None,
     config: SfmConfig = SfmConfig(),
     image_names: list[str] | None = None,
+    progress_callback=None,
 ) -> None:
     """Feature extraction (masked, if mask_dir is given) plus sequential
     matching ("match temporally near frames first" -- section 4, step 5).
@@ -119,16 +125,86 @@ def extract_and_match(
     if mask_dir is not None:
         reader_options.mask_path = Path(mask_dir)
 
-    pycolmap.extract_features(
-        database_path=database_path,
-        image_path=image_dir,
-        image_names=list(image_names or []),
-        reader_options=reader_options,
-    )
-    pycolmap.match_sequential(
-        database_path=database_path,
-        pairing_options=pycolmap.SequentialPairingOptions(overlap=config.sequential_overlap),
-    )
+    notify = progress_callback or (lambda *a: None)
+    device = "GPU" if pycolmap.has_cuda else "CPU"
+    total = len(image_names) if image_names else None
+
+    # Progress: pycolmap's extractor/matcher have no Python callback, but
+    # COLMAP logs "Processed file [i/N]" / "Processing image [i/N]" to the
+    # process's stderr -- captured and parsed for the duration of each call
+    # (native_log_lines). Two approaches that DON'T work, both tried for
+    # real: polling the database from another connection aborts the whole
+    # process ("database is locked" -- pycolmap doesn't use WAL), and
+    # extracting in small batches to report between them made GPU SIFT
+    # registration measurably worse (3/10 runs lost a frame vs 0/10 for one
+    # call on the same synthetic sequence).
+    def on_extract_line(line: str) -> None:
+        if match := _PROCESSED_FILE.search(line):
+            i, n = int(match.group(1)), int(match.group(2))
+            notify(f"COLMAP step 1/3 (features, {device}): frame {i}/{n}", i, n)
+
+    def on_match_line(line: str) -> None:
+        if match := _PROCESSING_IMAGE.search(line):
+            i, n = int(match.group(1)), int(match.group(2))
+            notify(f"COLMAP step 2/3 (matching, {device}): frame {i}/{n}", i, n)
+
+    notify(f"COLMAP step 1/3 (features, {device}): starting on {total or 'all'} frames…", 0 if total else None, total)
+    with native_log_lines(on_extract_line if progress_callback else None):
+        pycolmap.extract_features(
+            database_path=database_path,
+            image_path=image_dir,
+            image_names=list(image_names or []),
+            reader_options=reader_options,
+        )
+    notify(f"COLMAP step 2/3 (matching, {device}): sequential, overlap {config.sequential_overlap}…", None, None)
+    with native_log_lines(on_match_line if progress_callback else None):
+        pycolmap.match_sequential(
+            database_path=database_path,
+            pairing_options=pycolmap.SequentialPairingOptions(overlap=config.sequential_overlap),
+        )
+
+
+_PROCESSED_FILE = re.compile(r"Processed file \[(\d+)/(\d+)\]")
+_PROCESSING_IMAGE = re.compile(r"Processing image \[(\d+)/(\d+)\]")
+_NATIVE_LOG_LOCK = threading.Lock()
+
+
+@contextmanager
+def native_log_lines(on_line):
+    """Captures what native code (COLMAP's glog) writes to file descriptor 2
+    while the block runs, handing each line to on_line -- and passing every
+    line through to the real stderr unchanged, so nothing is lost from the
+    terminal. A no-op when on_line is None. Process-wide by nature (fd 2 is
+    shared), so one capture at a time (a lock); anything else that writes
+    to stderr meanwhile is simply passed through."""
+    if on_line is None:
+        yield
+        return
+    with _NATIVE_LOG_LOCK:
+        sys.stderr.flush()
+        read_fd, write_fd = os.pipe()
+        saved_fd = os.dup(2)
+        os.dup2(write_fd, 2)
+        os.close(write_fd)
+
+        def pump() -> None:
+            with os.fdopen(read_fd, "rb") as pipe:
+                for raw in pipe:
+                    os.write(saved_fd, raw)
+                    try:
+                        on_line(raw.decode("utf-8", "replace").rstrip("\n"))
+                    except Exception:
+                        pass  # progress reporting must never break the run
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        try:
+            yield
+        finally:
+            sys.stderr.flush()
+            os.dup2(saved_fd, 2)  # closes the pipe's last write end -> reader sees EOF
+            reader.join(timeout=5)
+            os.close(saved_fd)
 
 
 def map_and_diagnose(
@@ -137,6 +213,7 @@ def map_and_diagnose(
     sparse_output_dir: Path,
     *,
     total_images: int | None = None,
+    progress_callback=None,
 ) -> tuple[pycolmap.Reconstruction, SfmDiagnostics, Path]:
     """Incremental mapping against an already-populated database (from
     `extract_and_match`, or any other source of keypoints/matches -- e.g. a
@@ -161,10 +238,37 @@ def map_and_diagnose(
     """
     sparse_output_dir = Path(sparse_output_dir)
     sparse_output_dir.mkdir(parents=True, exist_ok=True)
+    notify = progress_callback or (lambda *a: None)
+    expected = total_images or 0
+    registered = 0
+
+    def report(what: str) -> None:
+        if expected:
+            notify(
+                f"COLMAP step 3/3 (mapping): {registered}/{expected} images registered ({what})",
+                min(registered, expected),
+                expected,
+            )
+        else:
+            notify(f"COLMAP step 3/3 (mapping): {registered} images registered ({what})", None, None)
+
+    def on_initial_pair() -> None:
+        nonlocal registered
+        registered += 2
+        report("initial pair")
+
+    def on_next_image() -> None:
+        nonlocal registered
+        registered += 1
+        report("registering")
+
+    report("finding an initial pair")
     reconstructions = pycolmap.incremental_mapping(
         database_path=database_path,
         image_path=image_dir,
         output_path=sparse_output_dir,
+        initial_image_pair_callback=on_initial_pair,
+        next_image_callback=on_next_image,
     )
 
     if total_images is None:
@@ -205,12 +309,18 @@ def run_sfm(
     mask_dir: Path | None = None,
     config: SfmConfig = SfmConfig(),
     image_names: list[str] | None = None,
+    progress_callback=None,
 ) -> tuple[pycolmap.Reconstruction, SfmDiagnostics, Path]:
     """extract_and_match + map_and_diagnose against real image files on disk
     (only image_names, relative to image_dir, if given)."""
-    extract_and_match(image_dir, database_path, mask_dir=mask_dir, config=config, image_names=image_names)
+    extract_and_match(
+        image_dir, database_path, mask_dir=mask_dir, config=config, image_names=image_names,
+        progress_callback=progress_callback,
+    )
     total_images = len(image_names) if image_names else len(list(Path(image_dir).iterdir()))
-    return map_and_diagnose(database_path, image_dir, sparse_output_dir, total_images=total_images)
+    return map_and_diagnose(
+        database_path, image_dir, sparse_output_dir, total_images=total_images, progress_callback=progress_callback
+    )
 
 
 def evaluate_registration_quality(

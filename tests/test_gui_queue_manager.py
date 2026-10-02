@@ -378,6 +378,14 @@ def test_real_dispatch_persists_done_status_without_a_cross_thread_error(project
     row = conn.execute("SELECT status FROM queue_jobs WHERE job_id = ?", (job.job_id,)).fetchone()
     assert row is not None and row[0] == "done"  # actually persisted, not just updated in memory
 
+    # ...and the run was recorded in the activity log, attributed to the queue.
+    from vine360.activity_log import list_entries
+
+    (entry,) = list_entries(conn)
+    assert entry.operation == "export.postshot_images" and entry.status == "done"
+    assert entry.origin == "queue: export"
+    assert entry.params["output_dir"] == str(tmp_path / "out")
+
 
 # -- cancel / pause -------------------------------------------------------
 

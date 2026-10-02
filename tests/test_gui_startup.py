@@ -36,5 +36,5 @@ def test_main_window_constructs_with_no_project_open(qapp):
     assert window.state.project_root is None
     # every stage panel + the queue dock should exist and show the
     # "no project" placeholder rather than having crashed mid-construction
-    assert len(window._panels) == 8  # 7 pipeline stages + Data manager
+    assert len(window._panels) == 9  # 7 pipeline stages + Data manager + Activity log
     assert window.queue_manager is not None

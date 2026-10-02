@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QPoint, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QPlainTextEdit,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -60,12 +61,21 @@ from PySide6.QtWidgets import (
     QStyle,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from vine360.activity_log import (
+    STATUS_DONE,
+    finish_entry,
+    list_entries,
+    logged_operation,
+    mark_interrupted,
+    start_entry,
+)
 from vine360.config import FRAME_PRESET_INTERVALS, CaptureMode, FramePreset
 from vine360.data_manager import (
     DataManagerError,
@@ -168,6 +178,7 @@ STAGE_MASKS = 4
 STAGE_POSE = 5
 STAGE_EXPORT = 6
 STAGE_DATA_MANAGER = 7  # not a pipeline stage: fixed-color dot, not in compute_stage_statuses
+STAGE_ACTIVITY_LOG = 8  # likewise
 
 
 @dataclass
@@ -403,10 +414,21 @@ def run_in_background(
 
 class ProgressArea(QWidget):
     """A progress bar + status label shared by every panel that runs a
-    background operation. Switches to determinate + an elapsed-time-based
-    ETA whenever the underlying function reports (current, total); stays
-    an indeterminate spinner for phases without a natural count (e.g. a
-    single ffmpeg/COLMAP subprocess call with no internal progress)."""
+    background operation. Switches to determinate + an ETA whenever the
+    underlying function reports (current, total); stays an indeterminate
+    spinner for phases without a natural count.
+
+    Verbose by design (see CLAUDE.md): every distinct progress message is
+    also appended, with its elapsed time, to a "Details" log under the bar
+    -- hidden until the user expands it, kept after the run finishes -- so
+    a long multi-step run (e.g. SphereSfM's extract -> match -> map) shows
+    what it has done so far, not just its current line.
+
+    The ETA restarts whenever a new phase begins (the total changes or
+    the count goes backwards), so a multi-step run's ETA describes the
+    current step rather than mixing rates across steps."""
+
+    MAX_DETAIL_LINES = 5000
 
     def __init__(self):
         super().__init__()
@@ -415,19 +437,64 @@ class ProgressArea(QWidget):
         self.bar = QProgressBar()
         self.bar.setVisible(False)
         layout.addWidget(self.bar)
+        row = QHBoxLayout()
         self.label = QLabel("")
         self.label.setWordWrap(True)
-        layout.addWidget(self.label)
+        row.addWidget(self.label, stretch=1)
+        self.details_btn = QToolButton()
+        self.details_btn.setText("Details")
+        self.details_btn.setCheckable(True)
+        self.details_btn.setArrowType(Qt.RightArrow)
+        self.details_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.details_btn.setVisible(False)
+        self.details_btn.toggled.connect(self._on_details_toggled)
+        row.addWidget(self.details_btn, alignment=Qt.AlignTop)
+        layout.addLayout(row)
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMaximumBlockCount(self.MAX_DETAIL_LINES)
+        self.details.setMaximumHeight(160)
+        self.details.setVisible(False)
+        layout.addWidget(self.details)
         self._start_time: float | None = None
+        self._phase_start: tuple[float, int] | None = None  # (time, count) the current ETA is measured from
+        self._phase_total: int | None = None
+        self._last_current: int | None = None
+        self._last_message = ""
+
+    def _on_details_toggled(self, shown: bool) -> None:
+        self.details.setVisible(shown)
+        self.details_btn.setArrowType(Qt.DownArrow if shown else Qt.RightArrow)
+
+    def _log(self, message: str) -> None:
+        if message == self._last_message:
+            return
+        self._last_message = message
+        elapsed = time.monotonic() - self._start_time if self._start_time else 0.0
+        self.details.appendPlainText(f"[{self._format_duration(elapsed, always_minutes=True)}] {message}")
 
     def start(self, message: str = "Starting…") -> None:
         self._start_time = time.monotonic()
+        self._phase_start = None
+        self._phase_total = None
+        self._last_current = None
+        self._last_message = ""
+        self.details.clear()
+        self.details_btn.setVisible(True)
         self.bar.setRange(0, 0)
         self.bar.setVisible(True)
         self.label.setText(message)
+        self._log(message)
 
     def update_progress(self, message: str, current: int | None, total: int | None) -> None:
+        self._log(message)
         if current is not None and total:
+            now = time.monotonic()
+            new_phase = total != self._phase_total or (self._last_current is not None and current < self._last_current)
+            if new_phase or self._phase_start is None:
+                self._phase_start = (now, current)
+                self._phase_total = total
+            self._last_current = current
             self.bar.setRange(0, total)
             self.bar.setValue(current)
             self.label.setText(message + self._eta_suffix(current, total))
@@ -436,26 +503,34 @@ class ProgressArea(QWidget):
             self.label.setText(message)
 
     def _eta_suffix(self, current: int, total: int) -> str:
-        if not self._start_time or current <= 0:
+        if not self._phase_start:
             return ""
-        elapsed = time.monotonic() - self._start_time
-        rate = current / elapsed
-        if rate <= 0:
+        started_at, started_count = self._phase_start
+        done = current - started_count
+        elapsed = time.monotonic() - started_at
+        if done <= 0 or elapsed <= 0:
             return ""
-        remaining = (total - current) / rate
+        remaining = (total - current) / (done / elapsed)
         if remaining < 1:
             return ""
         return f"  (~{self._format_duration(remaining)} remaining)"
 
     @staticmethod
-    def _format_duration(seconds: float) -> str:
+    def _format_duration(seconds: float, *, always_minutes: bool = False) -> str:
         seconds = int(seconds)
-        if seconds < 60:
+        if seconds < 60 and not always_minutes:
             return f"{seconds}s"
         minutes, secs = divmod(seconds, 60)
+        if minutes >= 60:
+            hours, minutes = divmod(minutes, 60)
+            return f"{hours}h{minutes:02d}m{secs:02d}s"
         return f"{minutes}m{secs:02d}s"
 
     def finish(self, message: str) -> None:
+        if message:
+            self._log(message)
+        elif self._start_time is not None:
+            self._log("stopped")
         self.bar.setVisible(False)
         self.label.setText(message)
         self._start_time = None
@@ -746,6 +821,40 @@ class TemporalFrameSelector(QWidget):
         return False
 
 
+# -- activity log (docs/adr/0037) -------------------------------------------
+# Every worker below is wrapped in logged_operation, so a run is recorded
+# (order, time, parameters, outcome) whether a panel or the queue started it.
+
+
+def _summarize_source(source, _conn) -> str:
+    return f"{Path(source.path).name}: {source.media_type.value}, {source.projection.value} ({source.source_id[:8]})"
+
+
+def _summarize_frames(frames, _conn) -> str:
+    frame_set_id = frames[0].frame_set_id if frames else None
+    return f"{len(frames)} frames into frame set {frame_set_id}"
+
+
+def _summarize_count(noun: str):
+    return lambda items, _conn: f"{len(items)} {noun}"
+
+
+def _summarize_sfm(result, conn) -> str:
+    diagnostics, warnings = result
+    run_id = conn.execute("SELECT run_id FROM sfm_runs ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
+    text = (
+        f"run {run_id[0] if run_id else '?'}: {diagnostics.registered_images}/{diagnostics.total_images} registered, "
+        f"{diagnostics.num_points3d} points, mean reprojection error {diagnostics.mean_reprojection_error:.2f}px"
+    )
+    return text + (f"; warnings: {'; '.join(warnings)}" if warnings else "")
+
+
+def _summarize_export(result, _conn) -> str:
+    text = f"{result.num_images} images, {result.num_masks} masks -> {result.output_dir}"
+    return text + (f"; warnings: {'; '.join(result.warnings)}" if result.warnings else "")
+
+
+
 def _panel_header(title: str, subtitle: str, layout: QVBoxLayout) -> None:
     heading = QLabel(title)
     heading.setStyleSheet("font-size: 16px; font-weight: 600;")
@@ -838,6 +947,18 @@ class ProjectPanel(QWidget):
         except ProjectAlreadyExistsError as exc:
             QMessageBox.warning(self, "Cannot create project", str(exc))
             return
+        conn = open_index_db(Path(directory))
+        try:
+            entry_id = start_entry(
+                conn,
+                "project.create",
+                "Create project",
+                target=project.name,
+                params={"name": project.name, "capture_mode": project.capture_mode.value, "path": directory},
+            )
+            finish_entry(conn, entry_id, status=STATUS_DONE, duration_seconds=0.0, result=f"project_id={project.project_id}")
+        finally:
+            conn.close()
         self._set_active_project(Path(directory), project)
 
     def _on_open(self) -> None:
@@ -857,6 +978,9 @@ class ProjectPanel(QWidget):
         self.state.project_root = root
         self.state.project = project
         self.state.conn = open_index_db(root)
+        # Anything still "running" in the log ran in an app session that has
+        # since ended -- same reasoning as the queue's own RUNNING jobs.
+        mark_interrupted(self.state.conn)
         self.path_label.setText(
             f"Open: {project.name!r} ({project.capture_mode.value}) at {root}\n"
             f"project_id={project.project_id}  created_at={project.created_at}"
@@ -865,6 +989,7 @@ class ProjectPanel(QWidget):
         self.state.notify_change()
 
 
+@logged_operation("source.add", "Add source", target=lambda p: str(p.get("file_path") or p.get("path") or ""), summarize=_summarize_source)
 def _add_source_worker(
     project_root: Path,
     file_path: Path,
@@ -891,6 +1016,7 @@ def _add_source_worker(
         conn.close()
 
 
+@logged_operation("source.remove", "Remove source", target=lambda p: p.get("source_id"))
 def _remove_source_worker(project_root: Path, source_id: str) -> str:
     conn = open_index_db(project_root)
     try:
@@ -1096,6 +1222,7 @@ class ImportPanel(QWidget):
             QMessageBox.critical(self, "Unexpected error removing source", f"{type(exc).__name__}: {exc}")
 
 
+@logged_operation("frames.extract", "Frame extraction", target=lambda p: p.get("frame_set_id") or p.get("source_id"), summarize=_summarize_frames)
 def _extract_frames_worker(
     project_root: Path,
     source_id: str,
@@ -1394,6 +1521,7 @@ def _default_parallel_worker_count() -> int:
     return min(os.cpu_count() or 1, 4)
 
 
+@logged_operation("projection.generate", "Projection", target=lambda p: p.get("frame_set_id"), summarize=_summarize_count("views"))
 def _generate_views_worker(
     project_root: Path,
     frame_set_id: str,
@@ -1665,6 +1793,7 @@ class ProjectionPanel(QWidget):
             QMessageBox.critical(self, "Unexpected error generating projections", f"{type(exc).__name__}: {exc}")
 
 
+@logged_operation("masks.build", "Masks", target=lambda p: p.get("frame_set_id"), summarize=_summarize_count("masks"))
 def _build_masks_worker(
     project_root: Path, frame_set_id: str, use_sam3_person: bool, use_sam3_sky: bool, progress_callback=None
 ):
@@ -2061,6 +2190,7 @@ ENGINE_COLMAP_EQUIRECTANGULAR = "colmap_equirectangular"
 ENGINE_SPHERESFM = "spheresfm"
 
 
+@logged_operation("sfm.run", "Pose estimation", target=lambda p: p.get("frame_set_id") or "all frame sets", summarize=_summarize_sfm)
 def _run_sfm_worker(
     project_root: Path,
     image_source: str,
@@ -2279,7 +2409,7 @@ class PoseEstimationPanel(QWidget):
             return
         stats = json.loads(row[0])
         self.stats_label.setText(
-            f"Last run ({row[1]}): registered {stats['registered_images']}/{stats['total_images']} "
+            f"Last run ({_local_time(row[1])}): registered {stats['registered_images']}/{stats['total_images']} "
             f"({stats['registered_ratio']:.0%}), {stats['num_points3d']} points, "
             f"mean reprojection error {stats['mean_reprojection_error']:.2f}px, "
             f"{stats['num_connected_models']} connected model(s)."
@@ -2414,13 +2544,26 @@ class QueuePanel(QWidget):
 
         self._manager: QueueManager | None = None
 
+    def _job_label(self, job_id: str) -> str:
+        job = self._manager._get(job_id) if getattr(self, "_manager", None) else None
+        return job.label if job else job_id
+
+    def _on_job_started_progress(self, job_id: str) -> None:
+        self.progress_area.start(f"Running: {self._job_label(job_id)}")
+
+    def _on_job_finished_progress(self, job_id: str) -> None:
+        self.progress_area.finish(f"Done: {self._job_label(job_id)}")
+
+    def _on_job_failed_progress(self, job_id: str, message: str) -> None:
+        self.progress_area.finish(f"Failed: {self._job_label(job_id)} -- {message}")
+
     def bind_manager(self, manager: QueueManager) -> None:
         self._manager = manager
         manager.queue_changed.connect(self.refresh)
-        manager.job_started.connect(lambda _job_id: self.progress_area.start("Running…"))
+        manager.job_started.connect(self._on_job_started_progress)
         manager.job_progress.connect(self.progress_area.update_progress)
-        manager.job_finished.connect(lambda _job_id: self.progress_area.finish(""))
-        manager.job_failed.connect(lambda _job_id, msg: self.progress_area.finish(""))
+        manager.job_finished.connect(self._on_job_finished_progress)
+        manager.job_failed.connect(self._on_job_failed_progress)
         manager.queue_idle.connect(self._on_idle)
         self.refresh()
 
@@ -2509,6 +2652,7 @@ class QueuePanel(QWidget):
         self.refresh()
 
 
+@logged_operation("export.postshot_poses", "Export: poses + images + masks", target=lambda p: str(p.get("output_dir")), summarize=_summarize_export)
 def _export_postshot_worker(project_root: Path, output_dir: Path, run_id: str | None, progress_callback=None):
     conn = open_index_db(project_root)
     try:
@@ -2519,6 +2663,7 @@ def _export_postshot_worker(project_root: Path, output_dir: Path, run_id: str | 
         conn.close()
 
 
+@logged_operation("export.postshot_images", "Export: images + masks", target=lambda p: str(p.get("output_dir")), summarize=_summarize_export)
 def _export_frames_and_masks_worker(
     project_root: Path, output_dir: Path, frame_set_id: str | None, progress_callback=None
 ):
@@ -2531,6 +2676,7 @@ def _export_frames_and_masks_worker(
         conn.close()
 
 
+@logged_operation("export.realityscan", "Export: RealityScan", target=lambda p: str(p.get("output_dir")), summarize=_summarize_export)
 def _export_realityscan_worker(
     project_root: Path,
     output_dir: Path,
@@ -3036,6 +3182,7 @@ def _disk_usage_worker(project_root: Path, generation: int) -> tuple[int, dict]:
     return generation, {"frame_sets": frame_sets, "sfm_runs": sfm_runs, "exports": exports}
 
 
+@logged_operation("data.delete", "Data manager: delete", target=lambda p: p.get("target"))
 def _data_manager_delete_worker(project_root: Path, action: str, target: str) -> str:
     conn = open_index_db(project_root)
     try:
@@ -3432,6 +3579,222 @@ class DataManagerPanel(QWidget):
             QMessageBox.critical(self, "Unexpected error deleting", f"{type(exc).__name__}: {exc}")
 
 
+def _local_time(iso: str | None) -> str:
+    if not iso:
+        return ""
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return iso
+
+
+class ActivityLogPanel(QWidget):
+    """Everything run in this project, in order: when, how long, what on,
+    with which parameters, started by hand or by the queue, and how it
+    ended (vine360.activity_log, docs/adr/0037). Read-only. Refreshes
+    itself every few seconds while visible, so a running entry's status
+    and elapsed time update without clicking anything."""
+
+    COLUMNS = ["#", "Started", "Duration", "Operation", "Target", "Status", "Origin", "Result"]
+    STATUS_COLORS = {"done": "#2e7d32", "failed": "#c62828", "running": "#1565c0", "interrupted": "#ef6c00"}
+
+    def __init__(self, state: AppState):
+        super().__init__()
+        self.state = state
+        self._entries = []
+        layout = QVBoxLayout(self)
+        _panel_header(
+            "Activity log",
+            "Every operation run in this project, oldest first, with its exact parameters -- whether you "
+            "started it or the queue did. Stored in the project itself, so it survives restarts.",
+            layout,
+        )
+        self.no_project_label = QLabel("Open a project first.")
+        layout.addWidget(self.no_project_label)
+
+        self.controls = QWidget()
+        controls_layout = QVBoxLayout(self.controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        top_row = QHBoxLayout()
+        self.summary_label = QLabel("")
+        top_row.addWidget(self.summary_label, stretch=1)
+        self.newest_first_check = QCheckBox("Newest first")
+        self.newest_first_check.toggled.connect(self.refresh)
+        top_row.addWidget(self.newest_first_check)
+        export_btn = QPushButton("Export CSV…")
+        export_btn.clicked.connect(self._on_export_csv)
+        top_row.addWidget(export_btn)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh)
+        top_row.addWidget(refresh_btn)
+        controls_layout.addLayout(top_row)
+
+        splitter = QSplitter(Qt.Vertical)
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemSelectionChanged.connect(self._show_details)
+        splitter.addWidget(self.table)
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setPlaceholderText("Select an entry to see its full parameters and result.")
+        splitter.addWidget(self.details)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        controls_layout.addWidget(splitter, stretch=1)
+
+        layout.addWidget(self.controls, stretch=1)
+        self.controls.setVisible(False)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(3000)
+        self._timer.timeout.connect(self._refresh_if_changed)
+
+    def on_project_changed(self) -> None:
+        self.on_shown()
+
+    def on_shown(self) -> None:
+        have_project = self.state.conn is not None
+        self.no_project_label.setVisible(not have_project)
+        self.controls.setVisible(have_project)
+        if have_project:
+            self.refresh()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._timer.start()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._timer.stop()
+
+    def _refresh_if_changed(self) -> None:
+        """Cheap check first: only rebuild the table when something is
+        running (its elapsed time ticks) or a new entry has appeared."""
+        if self.state.conn is None:
+            return
+        running = self.state.conn.execute("SELECT COUNT(*) FROM activity_log WHERE status = 'running'").fetchone()[0]
+        latest = self.state.conn.execute("SELECT MAX(entry_id) FROM activity_log").fetchone()[0]
+        shown_running = any(e.status == "running" for e in self._entries)
+        shown_latest = max((e.entry_id for e in self._entries), default=None)
+        if running or shown_running or latest != shown_latest:
+            self.refresh()
+
+    def _target_names(self) -> dict[str, str]:
+        names = {info.frame_set_id: info.display_name for info in list_frame_sets(self.state.conn)}
+        for source_id, path in self.state.conn.execute("SELECT source_id, path FROM sources"):
+            names.setdefault(source_id, Path(path).name)
+        return names
+
+    def refresh(self) -> None:
+        if self.state.conn is None:
+            return
+        selected = self._selected_entry_id()
+        self._entries = list_entries(self.state.conn)
+        shown = list(reversed(self._entries)) if self.newest_first_check.isChecked() else self._entries
+        names = self._target_names()
+        self.table.setRowCount(len(shown))
+        for r, entry in enumerate(shown):
+            duration = ProgressArea._format_duration(entry.duration_seconds) if entry.duration_seconds is not None else ""
+            if entry.status == "running":
+                try:
+                    started = datetime.fromisoformat(entry.started_at)
+                    duration = ProgressArea._format_duration((datetime.now(timezone.utc) - started).total_seconds()) + "…"
+                except ValueError:
+                    pass
+            cells = [
+                str(entry.entry_id),
+                _local_time(entry.started_at),
+                duration,
+                entry.label,
+                names.get(entry.target or "", entry.target or ""),
+                entry.status,
+                entry.origin or "",
+                entry.error if entry.status in ("failed", "interrupted") else (entry.result or ""),
+            ]
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if c == 0:
+                    item.setData(Qt.UserRole, entry.entry_id)
+                if c == 5 and entry.status in self.STATUS_COLORS:
+                    item.setForeground(QColor(self.STATUS_COLORS[entry.status]))
+                if c == 7:
+                    item.setToolTip(text)
+                self.table.setItem(r, c, item)
+        self.table.resizeColumnsToContents()
+        counts = {status: sum(1 for e in self._entries if e.status == status) for status in self.STATUS_COLORS}
+        self.summary_label.setText(
+            f"{len(self._entries)} entries -- " + ", ".join(f"{n} {status}" for status, n in counts.items() if n)
+            if self._entries
+            else "Nothing has been run in this project yet (runs from before the activity log existed aren't listed)."
+        )
+        if selected is not None:
+            for r in range(self.table.rowCount()):
+                if self.table.item(r, 0).data(Qt.UserRole) == selected:
+                    self.table.selectRow(r)
+                    break
+
+    def _selected_entry_id(self) -> int | None:
+        rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not rows:
+            return None
+        item = self.table.item(rows[0].row(), 0)
+        return item.data(Qt.UserRole) if item else None
+
+    def _show_details(self) -> None:
+        entry_id = self._selected_entry_id()
+        entry = next((e for e in self._entries if e.entry_id == entry_id), None)
+        if entry is None:
+            self.details.clear()
+            return
+        duration = ProgressArea._format_duration(entry.duration_seconds) if entry.duration_seconds is not None else "--"
+        lines = [
+            f"#{entry.entry_id}  {entry.label}  ({entry.operation})",
+            f"Status:   {entry.status}",
+            f"Started:  {_local_time(entry.started_at)}",
+            f"Finished: {_local_time(entry.finished_at)}",
+            f"Duration: {duration}",
+            f"Origin:   {entry.origin or ''}",
+            f"Target:   {entry.target or ''}",
+            "",
+            "Parameters:",
+            json.dumps(entry.params, indent=2, sort_keys=True),
+        ]
+        if entry.result:
+            lines += ["", "Result:", entry.result]
+        if entry.error:
+            lines += ["", "Error:", entry.error]
+        self.details.setPlainText("\n".join(lines))
+
+    def _on_export_csv(self) -> None:
+        if self.state.conn is None:
+            return
+        default = str(self.state.project_root / "exports" / "activity_log.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "Export activity log", default, "CSV (*.csv)")
+        if path:
+            write_activity_log_csv(self.state.conn, Path(path))
+
+
+def write_activity_log_csv(conn: sqlite3.Connection, path: Path) -> None:
+    import csv
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["entry_id", "started_at", "finished_at", "duration_seconds", "operation", "label", "target",
+             "status", "origin", "params", "result", "error"]
+        )
+        for e in list_entries(conn):
+            writer.writerow(
+                [e.entry_id, e.started_at, e.finished_at, e.duration_seconds, e.operation, e.label, e.target,
+                 e.status, e.origin, json.dumps(e.params, sort_keys=True), e.result, e.error]
+            )
+
+
 class Vine360MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3453,6 +3816,7 @@ class Vine360MainWindow(QMainWindow):
         pose_panel = PoseEstimationPanel(self.state)
         export_panel = ExportPanel(self.state)
         data_manager_panel = DataManagerPanel(self.state)
+        activity_log_panel = ActivityLogPanel(self.state)
 
         project_panel.project_changed.connect(import_panel.on_project_changed)
         project_panel.project_changed.connect(frames_panel.on_project_changed)
@@ -3461,6 +3825,7 @@ class Vine360MainWindow(QMainWindow):
         project_panel.project_changed.connect(pose_panel.on_project_changed)
         project_panel.project_changed.connect(export_panel.on_project_changed)
         project_panel.project_changed.connect(data_manager_panel.on_project_changed)
+        project_panel.project_changed.connect(activity_log_panel.on_project_changed)
         project_panel.project_changed.connect(self._on_project_changed_for_queue)
 
         self._panels = [
@@ -3472,6 +3837,7 @@ class Vine360MainWindow(QMainWindow):
             pose_panel,
             export_panel,
             data_manager_panel,
+            activity_log_panel,
         ]
         labels = [
             "Project",
@@ -3482,13 +3848,14 @@ class Vine360MainWindow(QMainWindow):
             "Pose estimation",
             "Export",
             "Data manager",
+            "Activity log",
         ]
         self._sidebar_items: list[QListWidgetItem] = []
         for index, (label, widget) in enumerate(zip(labels, self._panels)):
             item = QListWidgetItem(f"  {label}")
             if index <= STAGE_EXPORT:  # pipeline stages get a status dot
                 item.setIcon(QIcon(_status_dot(PENDING)))
-            else:  # Data manager isn't a stage: a fixed-color dot instead
+            else:  # Data manager / Activity log aren't stages: a fixed-color dot instead
                 item.setIcon(QIcon(_dot_pixmap(DATA_MANAGER_DOT_COLOR)))
             self._sidebar_items.append(item)
             self.sidebar.addItem(item)

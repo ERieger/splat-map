@@ -752,6 +752,9 @@ class QueueManager(QObject):
             on_success=self._handle_job_success,
             on_error=self._handle_job_error,
             on_progress=self._handle_job_progress,
+            # Recorded in the activity log (vine360.activity_log): which
+            # queue job started this run.
+            log_origin=f"queue: {job.label}",
         )
 
     def _handle_job_success(self, result) -> None:

@@ -144,7 +144,8 @@ data-integrity gap, not hypothetical). Any change to `clear_frame_set` /
 
 **Pipeline stages** (mirrored by the GUI sidebar, `vine360/gui/main_window.py`'s `STAGE_*`
 constants): Project → Import → Frames → Projection → Masks → Pose estimation → Export, plus a
-non-stage Data manager tab (docs/adr/0035) for listing and deleting derived data. Training
+non-stage Data manager tab (docs/adr/0035) for listing and deleting derived data and an
+Activity log tab (docs/adr/0037) listing every run, in order, with its parameters. Training
 has no GUI stage (removed from the app's scope, docs/adr/0025) — the adapter-only library code
 (`vine360/training/`) still exists per docs/adr/0009 (no backend is installed or run), it's just
 not surfaced here. `compute_stage_statuses` computes each stage's done/active/pending status from
@@ -165,6 +166,29 @@ than one sequenced action — see docs/adr/0022 for which panels qualify and whi
 into Postshot or another COLMAP-based external trainer — two modes (with vine360's own SfM poses,
 or images+masks only so the external tool runs its own SfM). Verified against Postshot's published
 docs only, not a real install (Windows-only, unavailable here) — see docs/adr/0018/0020.
+
+## Requirements for new features
+
+**Verbose progress (docs/adr/0037).** Any operation that can run for more than a few seconds must
+report *counted*, step-labelled progress through its `progress_callback(message, current, total)`
+— e.g. "SphereSfM step 2/4 (matching, GPU): frame 140/280" — not one indeterminate spinner for
+the whole run. Name the step and the device (GPU/CPU) where relevant, report each item as it
+completes, and finish with a one-line summary of the result. `ProgressArea` turns this into a
+bar, a per-step ETA and a timestamped "Details" log automatically, so the callback is all a
+feature needs to provide. Sources of real counts, in order of preference: a library callback
+(e.g. pycolmap's `next_image_callback`); the tool's own log lines, streamed live
+(`Runner.run(on_output=...)` for subprocesses; `colmap_adapter.native_log_lines` for native code
+writing to stderr in-process); counting output files on disk (ffmpeg frames). **Never** poll a
+pycolmap/COLMAP database from another connection while it's being written — pycolmap doesn't use
+WAL and aborts the whole process on "database is locked". And don't change *how* work is done
+just to get progress out of it: batching pycolmap's GPU feature extraction to report between
+batches measurably worsened registration.
+
+**Activity logging (docs/adr/0037).** Every new long-running worker the GUI or queue runs must be
+wrapped in `vine360.activity_log.logged_operation(operation, label, target=..., summarize=...)`,
+so it appears in the project's Activity log tab with its parameters, timing, outcome and origin
+(manual or queue). Parameters are recorded from the worker's own arguments, so keep worker
+signatures explicit (no `**kwargs` blobs) and JSON-friendly.
 
 ## Testing conventions
 

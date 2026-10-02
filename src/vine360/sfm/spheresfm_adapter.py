@@ -194,11 +194,78 @@ def build_cubic_reprojection_command(
 # -- running ---------------------------------------------------------------
 
 
-def run_command(runner: Runner, command: list[str], what: str) -> None:
-    result = runner.run(command, env=_env())
+_PROCESSED_FILE = re.compile(r"Processed file \[(\d+)/(\d+)\]")
+_MATCHING_IMAGE = re.compile(r"Matching image \[(\d+)/(\d+)\]")
+_INITIAL_PAIR = re.compile(r"Initializing with image pair #(\d+) and #(\d+)")
+_REGISTERING = re.compile(r"Registering image #(\d+) \((\d+)\)")
+
+
+class ProgressParser:
+    """Turns SphereSfM's (COLMAP 3.8's) own log lines into
+    (message, current, total) progress -- the exact strings come from its
+    source: feature/extraction.cc "Processed file [i/N]",
+    feature/matching.cc "Matching image [i/N]", and
+    controllers/incremental_mapper.cc "Initializing with image pair #a
+    and #b" / "Registering image #id (n)" (n = images registered so far).
+    `total_images` is what the mapper's count is shown against."""
+
+    def __init__(self, prefix: str, total_images: int, notify):
+        self.prefix = prefix
+        self.total_images = total_images
+        self.notify = notify
+        self.registered = 0
+        self.phase = ""
+
+    def feed(self, line: str) -> None:
+        if match := _PROCESSED_FILE.search(line):
+            i, n = int(match.group(1)), int(match.group(2))
+            self.notify(f"{self.prefix}frame {i}/{n}", i, n)
+        elif match := _MATCHING_IMAGE.search(line):
+            i, n = int(match.group(1)), int(match.group(2))
+            self.notify(f"{self.prefix}frame {i}/{n}", i, n)
+        elif match := _INITIAL_PAIR.search(line):
+            self.registered = 2
+            self._mapper(f"initial pair #{match.group(1)} + #{match.group(2)}")
+        elif match := _REGISTERING.search(line):
+            self.registered = int(match.group(2))
+            self._mapper(f"registering image #{match.group(1)}")
+        elif "Finding good initial image pair" in line:
+            self._mapper("finding a good initial image pair")
+        elif "Global bundle adjustment" in line:
+            self._mapper("global bundle adjustment")
+        elif "Retriangulation" in line:
+            self._mapper("retriangulation")
+
+    def _mapper(self, what: str) -> None:
+        self.notify(
+            f"{self.prefix}{self.registered}/{self.total_images} frames registered ({what})",
+            min(self.registered, self.total_images),
+            self.total_images,
+        )
+
+
+def run_command(
+    runner: Runner, command: list[str], what: str, *, on_line=None, log_path: Path | None = None
+) -> None:
+    """Runs one SphereSfM subcommand, streaming its output to on_line (for
+    live progress) and to log_path (kept with the run, for diagnosis)."""
+    log = open(log_path, "w", encoding="utf-8") if log_path else None
+
+    def handle(line: str) -> None:
+        if log:
+            log.write(line + "\n")
+        if on_line:
+            on_line(line)
+
+    try:
+        result = runner.run(command, env=_env(), on_output=handle if (on_line or log) else None)
+    finally:
+        if log:
+            log.close()
     if not result.ok:
         tail = "\n".join((result.stderr or result.stdout or "").strip().splitlines()[-15:])
-        raise SphereSfmError(f"SphereSfM {what} failed (exit {result.returncode}):\n{tail}")
+        where = f"\n(full log: {log_path})" if log_path else ""
+        raise SphereSfmError(f"SphereSfM {what} failed (exit {result.returncode}):\n{tail}{where}")
 
 
 # -- TXT model reading -----------------------------------------------------
