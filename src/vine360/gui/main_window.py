@@ -891,7 +891,7 @@ class ProjectPanel(QWidget):
         self.path_label.setStyleSheet("padding: 4px; background: palette(alternate-base);")
         layout.addWidget(self.path_label)
 
-        # Per-device list (docs/adr/0038), stored in the user's config dir --
+        # Per-device list (docs/adr/0039), stored in the user's config dir --
         # never in the project or the repository.
         recent_box = QGroupBox("Recent projects")
         recent_layout = QVBoxLayout(recent_box)

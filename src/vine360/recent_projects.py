@@ -1,4 +1,4 @@
-"""Per-device list of recently opened projects (docs/adr/0038).
+"""Per-device list of recently opened projects (docs/adr/0039).
 
 Stored as JSON in the user's config directory, never inside a project or
 the repository: ``$VINE360_CONFIG_DIR`` if set, else the OS convention --
