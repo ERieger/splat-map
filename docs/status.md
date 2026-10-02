@@ -210,6 +210,17 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
 - "Flag for review" is replaced by "Exclude this view" and a list of suspicious views (coverage
   jumps compared with the same face in nearby frames).
 
+**SfM advanced options (ADR 0040).**
+- The Pose panel has a collapsible "Advanced options" section with 45 options for both engines.
+  Groups: camera, features, matching strategy (sequential / exhaustive / vocabulary tree, loop
+  detection), mapping (incremental or GLOMAP global on pycolmap), and quality-check thresholds.
+- The form is generated from `vine360.sfm.options.OPTION_SPECS`, hides what the chosen engine
+  can't use, and has presets and inline validation.
+- Default options are verified to equal pycolmap's own defaults and SphereSfM's `-h` defaults,
+  so a default run behaves exactly as before.
+- Options are stored with each run and in queued jobs, and the panel starts from the latest run's
+  options.
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -283,6 +294,8 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
       pinhole export of 360 runs via measured frame->view pose conversion.
 0038: layered masks (per-class PNG + mask_layers row, composite keep-mask
       rebuilt on change), clipping-based overexposure layer, review that acts.
+0040: SfM advanced options -- one stdlib SfmConfig for both engines, GUI form
+      generated from OPTION_SPECS, defaults == each engine's own defaults.
 
 ## Blockers / known gaps
 

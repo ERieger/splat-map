@@ -154,7 +154,7 @@ def test_pose_panel_scope_choices_follow_the_engine(qapp, project):
     panel.engine_combo.setCurrentIndex(panel.engine_combo.findData(ENGINE_COLMAP_EQUIRECTANGULAR))
     equirect = [panel.source_combo.itemData(i) for i in range(panel.source_combo.count())]
     assert equirect == ["s1~i1"]  # no "All", equirectangular sources only
-    assert panel._current_sfm_args() == ("frames", "s1~i1", "EQUIRECTANGULAR", "pycolmap")
+    assert panel._current_sfm_args() == ("frames", "s1~i1", "EQUIRECTANGULAR", "pycolmap", {})
 
 
 def test_export_panel_defaults_into_the_new_projects_exports_after_switching_project(qapp, tmp_path):
@@ -249,7 +249,7 @@ def test_pose_panel_spheresfm_engine_runs_on_equirect_frame_sets_when_a_build_is
     assert [panel.source_combo.itemData(i) for i in range(panel.source_combo.count())] == ["s1~i1"]
     assert panel.run_btn.isEnabled()
     assert "/opt/spheresfm/colmap" in panel.engine_note.text()
-    assert panel._current_sfm_args() == ("frames", "s1~i1", "SPHERE", "spheresfm")
+    assert panel._current_sfm_args() == ("frames", "s1~i1", "SPHERE", "spheresfm", {})
 
     panel._on_add_to_queue()
     job = state.queue_manager.jobs[-1]

@@ -42,6 +42,7 @@ from pathlib import Path
 
 from vine360.runners.base import Runner
 from vine360.runners.local import LocalRunner
+from vine360.sfm.options import MATCHER_EXHAUSTIVE, MATCHER_SEQUENTIAL, MATCHER_VOCAB_TREE, SfmConfig
 
 SPHERESFM_REPO_URL = "https://github.com/json87/SphereSfM"
 BINARY_ENV_VAR = "VINE360_SPHERESFM_COLMAP"
@@ -114,6 +115,16 @@ def validate_installation() -> dict:
 # -- command construction (pure; unit-testable without the binary) ---------
 
 
+def _flag(value) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return f"{value:g}" if isinstance(value, float) else str(value)
+
+
+def _seed(config: SfmConfig) -> list[str]:
+    return ["--random_seed", str(config.random_seed)] if config.random_seed >= 0 else []
+
+
 def build_feature_extraction_command(
     binary: Path,
     database_path: Path,
@@ -123,10 +134,16 @@ def build_feature_extraction_command(
     width: int,
     height: int,
     use_gpu: bool = False,
+    config: SfmConfig | None = None,
 ) -> list[str]:
     """use_gpu only for a CUDA build (has_cuda): a CPU-only build's GPU SIFT
-    would fall back to OpenGL SiftGPU, which needs a display."""
-    return [
+    would fall back to OpenGL SiftGPU, which needs a display. config's
+    feature options (docs/adr/0040) map onto `--SiftExtraction.*`; camera
+    mode "auto" keeps the single shared SPHERE camera vine360 always used."""
+    config = config or SfmConfig()
+    # Affine-shape / DSP SIFT are CPU-only (SiftGPU has neither).
+    gpu = use_gpu and config.use_gpu and not (config.estimate_affine_shape or config.domain_size_pooling)
+    command = [
         str(binary),
         "feature_extractor",
         "--database_path", str(database_path),
@@ -134,24 +151,88 @@ def build_feature_extraction_command(
         "--image_list_path", str(image_list_path),
         "--ImageReader.camera_model", "SPHERE",
         "--ImageReader.camera_params", f"1,{width / 2:g},{height / 2:g}",
-        "--ImageReader.single_camera", "1",
-        "--SiftExtraction.use_gpu", "1" if use_gpu else "0",
+        "--ImageReader.single_camera", _flag(config.camera_mode in ("auto", "single")),
     ]
+    if config.camera_mode == "per_folder":
+        command += ["--ImageReader.single_camera_per_folder", "1"]
+    elif config.camera_mode == "per_image":
+        command += ["--ImageReader.single_camera_per_image", "1"]
+    command += ["--SiftExtraction.use_gpu", _flag(gpu)]
+    if config.max_image_size > 0:
+        command += ["--SiftExtraction.max_image_size", str(config.max_image_size)]
+    command += [
+        "--SiftExtraction.max_num_features", str(config.max_num_features),
+        "--SiftExtraction.peak_threshold", _flag(config.peak_threshold),
+        "--SiftExtraction.edge_threshold", _flag(config.edge_threshold),
+        "--SiftExtraction.upright", _flag(config.upright),
+        "--SiftExtraction.estimate_affine_shape", _flag(config.estimate_affine_shape),
+        "--SiftExtraction.domain_size_pooling", _flag(config.domain_size_pooling),
+    ]
+    return command + _seed(config)
 
 
-def build_matcher_command(binary: Path, database_path: Path, *, overlap: int, use_gpu: bool = False) -> list[str]:
-    return [
+MATCHER_COMMANDS = {
+    MATCHER_SEQUENTIAL: "sequential_matcher",
+    MATCHER_EXHAUSTIVE: "exhaustive_matcher",
+    MATCHER_VOCAB_TREE: "vocab_tree_matcher",
+}
+
+
+def build_matcher_command(
+    binary: Path, database_path: Path, *, overlap: int | None = None, use_gpu: bool = False, config: SfmConfig | None = None
+) -> list[str]:
+    """config.matcher picks the subcommand (sequential by default);
+    `overlap`, if given, overrides config.sequential_overlap."""
+    config = config or SfmConfig()
+    if overlap is not None:
+        config = config.replace(sequential_overlap=overlap)
+    if config.matcher not in MATCHER_COMMANDS:
+        raise SphereSfmError(f"unknown matcher: {config.matcher!r}")
+    tree = str(Path(config.vocab_tree_path).expanduser()) if config.vocab_tree_path else ""
+    command = [
         str(binary),
-        "sequential_matcher",
+        MATCHER_COMMANDS[config.matcher],
         "--database_path", str(database_path),
-        "--SiftMatching.use_gpu", "1" if use_gpu else "0",
-        "--SequentialMatching.overlap", str(overlap),
+        "--SiftMatching.use_gpu", _flag(use_gpu and config.use_gpu),
+        "--SiftMatching.max_ratio", _flag(config.max_ratio),
+        "--SiftMatching.max_distance", _flag(config.max_distance),
+        "--SiftMatching.cross_check", _flag(config.cross_check),
+        "--SiftMatching.guided_matching", _flag(config.guided_matching),
+        "--SiftMatching.min_num_inliers", str(config.min_num_inliers),
+        "--SiftMatching.max_error", _flag(config.max_error),
+        "--SiftMatching.min_inlier_ratio", _flag(config.min_inlier_ratio),
     ]
+    if config.max_num_matches > 0:
+        command += ["--SiftMatching.max_num_matches", str(config.max_num_matches)]
+    if config.matcher == MATCHER_SEQUENTIAL:
+        command += [
+            "--SequentialMatching.overlap", str(config.sequential_overlap),
+            "--SequentialMatching.quadratic_overlap", _flag(config.quadratic_overlap),
+            "--SequentialMatching.loop_detection", _flag(config.loop_detection),
+        ]
+        if config.loop_detection:
+            command += [
+                "--SequentialMatching.loop_detection_period", str(config.loop_detection_period),
+                "--SequentialMatching.loop_detection_num_images", str(config.loop_detection_num_images),
+                "--SequentialMatching.vocab_tree_path", tree,
+            ]
+    elif config.matcher == MATCHER_EXHAUSTIVE:
+        command += ["--ExhaustiveMatching.block_size", str(config.exhaustive_block_size)]
+    else:
+        command += [
+            "--VocabTreeMatching.num_images", str(config.vocab_tree_num_images),
+            "--VocabTreeMatching.vocab_tree_path", tree,
+        ]
+    return command + _seed(config)
 
 
-def build_mapper_command(binary: Path, database_path: Path, image_path: Path, output_path: Path) -> list[str]:
+def build_mapper_command(
+    binary: Path, database_path: Path, image_path: Path, output_path: Path, *, config: SfmConfig | None = None
+) -> list[str]:
     """Camera intrinsics stay fixed (README step 4) -- SPHERE has nothing
-    meaningful to refine."""
+    meaningful to refine, so the refine options don't apply here. config's
+    mapping thresholds map onto `--Mapper.*`."""
+    config = config or SfmConfig()
     return [
         str(binary),
         "mapper",
@@ -162,7 +243,16 @@ def build_mapper_command(binary: Path, database_path: Path, image_path: Path, ou
         "--Mapper.ba_refine_focal_length", "0",
         "--Mapper.ba_refine_principal_point", "0",
         "--Mapper.ba_refine_extra_params", "0",
-    ]
+        "--Mapper.min_num_matches", str(config.min_num_matches),
+        "--Mapper.multiple_models", _flag(config.multiple_models),
+        "--Mapper.init_min_num_inliers", str(config.init_min_num_inliers),
+        "--Mapper.init_min_tri_angle", _flag(config.init_min_tri_angle),
+        "--Mapper.init_max_forward_motion", _flag(config.init_max_forward_motion),
+        "--Mapper.abs_pose_min_num_inliers", str(config.abs_pose_min_num_inliers),
+        "--Mapper.abs_pose_min_inlier_ratio", _flag(config.abs_pose_min_inlier_ratio),
+        "--Mapper.filter_max_reproj_error", _flag(config.filter_max_reproj_error),
+        "--Mapper.filter_min_tri_angle", _flag(config.filter_min_tri_angle),
+    ] + (["--Mapper.min_model_size", str(config.min_model_size)] if config.min_model_size > 0 else []) + _seed(config)
 
 
 def build_model_converter_command(binary: Path, input_path: Path, output_path: Path) -> list[str]:
@@ -196,6 +286,7 @@ def build_cubic_reprojection_command(
 
 _PROCESSED_FILE = re.compile(r"Processed file \[(\d+)/(\d+)\]")
 _MATCHING_IMAGE = re.compile(r"Matching image \[(\d+)/(\d+)\]")
+_MATCHING_BLOCK = re.compile(r"(?:Matching|Processing) block \[(\d+)/(\d+), (\d+)/(\d+)\]")
 _INITIAL_PAIR = re.compile(r"Initializing with image pair #(\d+) and #(\d+)")
 _REGISTERING = re.compile(r"Registering image #(\d+) \((\d+)\)")
 
@@ -223,6 +314,9 @@ class ProgressParser:
         elif match := _MATCHING_IMAGE.search(line):
             i, n = int(match.group(1)), int(match.group(2))
             self.notify(f"{self.prefix}frame {i}/{n}", i, n)
+        elif match := _MATCHING_BLOCK.search(line):
+            a, rows, b, cols = (int(g) for g in match.groups())
+            self.notify(f"{self.prefix}block {(a - 1) * cols + b}/{rows * cols}", (a - 1) * cols + b, rows * cols)
         elif match := _INITIAL_PAIR.search(line):
             self.registered = 2
             self._mapper(f"initial pair #{match.group(1)} + #{match.group(2)}")

@@ -3,6 +3,7 @@ checked against the real SphereSfM build when one is present -- every
 flag the builders use must appear in that binary's own `<command> -h`
 (docs/adr/0036); the pure builder tests run regardless."""
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 
 from conftest import requires_spheresfm
 from vine360.sfm import spheresfm_adapter as sph
+from vine360.sfm.options import SfmConfig
 
 B = Path("/opt/spheresfm/colmap")
 
@@ -55,6 +57,20 @@ def test_cubic_reprojection_uses_the_real_subcommand_spelling():
     assert cmd[1] == "sphere_cubic_reprojecer"
 
 
+# Every option set away from its default, so every flag a builder can emit
+# is checked against the real binary (docs/adr/0040).
+_ALL_OPTIONS = SfmConfig(
+    camera_mode="per_folder", max_image_size=1600, max_num_features=2048, peak_threshold=0.004, edge_threshold=12.0,
+    upright=True, estimate_affine_shape=True, domain_size_pooling=True, max_ratio=0.7, max_distance=0.6,
+    cross_check=False, max_num_matches=4096, guided_matching=True, min_num_inliers=20, max_error=3.0,
+    min_inlier_ratio=0.3, sequential_overlap=7, quadratic_overlap=False, loop_detection=True, loop_detection_period=5,
+    loop_detection_num_images=20, vocab_tree_path="/p/tree.bin", min_num_matches=20, multiple_models=False,
+    min_model_size=4, init_min_num_inliers=50, init_min_tri_angle=8.0, init_max_forward_motion=0.99,
+    abs_pose_min_num_inliers=20, abs_pose_min_inlier_ratio=0.2, filter_max_reproj_error=3.0, filter_min_tri_angle=1.0,
+    random_seed=7,
+)
+
+
 def _builders():
     p = Path("/p")
     return [
@@ -63,7 +79,20 @@ def _builders():
         sph.build_mapper_command(B, p / "db", p / "img", p / "out"),
         sph.build_model_converter_command(B, p / "in", p / "out"),
         sph.build_cubic_reprojection_command(B, p / "in", p / "img", p / "out"),
+        sph.build_feature_extraction_command(B, p / "db", p / "img", p / "list", width=64, height=32, config=_ALL_OPTIONS),
+        sph.build_feature_extraction_command(
+            B, p / "db", p / "img", p / "list", width=64, height=32, config=_ALL_OPTIONS.replace(camera_mode="per_image")
+        ),
+        sph.build_matcher_command(B, p / "db", config=_ALL_OPTIONS),
+        sph.build_matcher_command(B, p / "db", config=_ALL_OPTIONS.replace(matcher="exhaustive")),
+        sph.build_matcher_command(B, p / "db", config=_ALL_OPTIONS.replace(matcher="vocab_tree")),
+        sph.build_mapper_command(B, p / "db", p / "img", p / "out", config=_ALL_OPTIONS),
     ]
+
+
+def _help_text(subcommand: str) -> str:
+    binary = sph.find_binary()
+    return subprocess.run([str(binary), subcommand, "-h"], capture_output=True, text=True, env=sph._env()).stdout
 
 
 @requires_spheresfm
@@ -105,3 +134,57 @@ def test_gpu_sift_only_for_a_cuda_build():
     assert gpu[gpu.index("--SiftExtraction.use_gpu") + 1] == "1"
     matcher = sph.build_matcher_command(B, p / "db", overlap=5, use_gpu=True)
     assert matcher[matcher.index("--SiftMatching.use_gpu") + 1] == "1"
+
+
+def test_options_map_onto_the_flags():
+    p = Path("/p")
+    extract = sph.build_feature_extraction_command(
+        B, p / "db", p / "img", p / "l", width=64, height=32, use_gpu=True, config=_ALL_OPTIONS
+    )
+    assert extract[extract.index("--ImageReader.single_camera") + 1] == "0"
+    assert extract[extract.index("--ImageReader.single_camera_per_folder") + 1] == "1"
+    assert extract[extract.index("--SiftExtraction.max_image_size") + 1] == "1600"
+    assert extract[extract.index("--SiftExtraction.peak_threshold") + 1] == "0.004"
+    assert extract[extract.index("--SiftExtraction.use_gpu") + 1] == "0"  # affine/DSP SIFT are CPU-only
+    assert extract[extract.index("--random_seed") + 1] == "7"
+    assert "--random_seed" not in sph.build_matcher_command(B, p / "db")  # -1 = not fixed: left to the binary
+
+    sequential = sph.build_matcher_command(B, p / "db", use_gpu=True, config=_ALL_OPTIONS)
+    assert sequential[1] == "sequential_matcher"
+    assert sequential[sequential.index("--SiftMatching.use_gpu") + 1] == "1"
+    assert sequential[sequential.index("--SequentialMatching.overlap") + 1] == "7"
+    assert sequential[sequential.index("--SequentialMatching.vocab_tree_path") + 1] == "/p/tree.bin"
+    exhaustive = sph.build_matcher_command(B, p / "db", config=_ALL_OPTIONS.replace(matcher="exhaustive"))
+    assert exhaustive[1] == "exhaustive_matcher" and "--SequentialMatching.overlap" not in exhaustive
+    vocab = sph.build_matcher_command(B, p / "db", config=_ALL_OPTIONS.replace(matcher="vocab_tree"))
+    assert vocab[1] == "vocab_tree_matcher"
+
+    mapper = sph.build_mapper_command(B, p / "db", p / "img", p / "out", config=_ALL_OPTIONS)
+    assert mapper[mapper.index("--Mapper.init_min_tri_angle") + 1] == "8"
+    assert mapper[mapper.index("--Mapper.min_model_size") + 1] == "4"
+    assert "--Mapper.min_model_size" not in sph.build_mapper_command(B, p / "db", p / "img", p / "out")
+    for flag in ("--Mapper.ba_refine_focal_length", "--Mapper.ba_refine_extra_params"):
+        assert mapper[mapper.index(flag) + 1] == "0"  # SPHERE intrinsics stay fixed whatever the options say
+
+
+_HELP_DEFAULT = re.compile(r"(--[\w.]+) arg \(=([^)]*)\)")
+
+
+@requires_spheresfm
+@pytest.mark.parametrize("command", _builders()[:3], ids=lambda c: c[1])
+def test_default_options_pass_the_binarys_own_defaults(command):
+    """With SfmConfig() every tunable flag vine360 now passes must equal the
+    binary's own default -- so a default-options run behaves exactly as it
+    did before options existed. (The flags vine360 always set on purpose --
+    SPHERE camera, sphere_camera, fixed intrinsics, GPU -- are excluded.)"""
+    defaults = dict(_HELP_DEFAULT.findall(_help_text(command[1])))
+    deliberate = {
+        "--ImageReader.camera_model", "--ImageReader.camera_params", "--SiftExtraction.use_gpu", "--SiftMatching.use_gpu",
+        "--Mapper.sphere_camera", "--Mapper.ba_refine_focal_length", "--Mapper.ba_refine_extra_params",
+    }
+    checked = 0
+    for flag, value in zip(command[2:], command[3:]):
+        if flag in defaults and flag not in deliberate:
+            assert float(value) == pytest.approx(float(defaults[flag])), f"{flag}: {value} != binary default {defaults[flag]}"
+            checked += 1
+    assert checked >= 5

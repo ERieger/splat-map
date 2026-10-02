@@ -145,7 +145,10 @@ from vine360.export.postshot import (
     export_frames_and_masks_for_postshot,
     realityscan_priors_available,
 )
+from vine360.sfm.options import VARIANT_EQUIRECT, VARIANT_PROJECTIONS, VARIANT_SPHERESFM, SfmConfig
+from vine360.sfm.options import describe as describe_sfm_options
 from vine360.sfm.project_run import SfmRegistrationError, run_sfm_for_project
+from vine360.gui.sfm_options import SfmOptionsEditor
 from vine360.gui.queue_manager import (
     BLOCKED,
     DONE as JOB_DONE,
@@ -2612,9 +2615,11 @@ class MasksPanel(QWidget):
 _COLOR_NAMES = {LAYER_SKY: "blue", LAYER_PERSON: "red", LAYER_OVEREXPOSED: "magenta"}
 
 
-ENGINE_COLMAP_PROJECTIONS = "colmap_projections"
-ENGINE_COLMAP_EQUIRECTANGULAR = "colmap_equirectangular"
-ENGINE_SPHERESFM = "spheresfm"
+# The Pose panel's engine choices are vine360.sfm.options' variants (an
+# engine plus the images it runs on) -- the same ids the options use.
+ENGINE_COLMAP_PROJECTIONS = VARIANT_PROJECTIONS
+ENGINE_COLMAP_EQUIRECTANGULAR = VARIANT_EQUIRECT
+ENGINE_SPHERESFM = VARIANT_SPHERESFM
 
 
 @logged_operation("sfm.run", "Pose estimation", target=lambda p: p.get("frame_set_id") or "all frame sets", summarize=_summarize_sfm)
@@ -2624,16 +2629,18 @@ def _run_sfm_worker(
     frame_set_id: str | None,
     camera_model: str,
     engine: str = "pycolmap",
+    options: dict | None = None,
     progress_callback=None,
 ):
-    from vine360.sfm.colmap_adapter import SfmConfig
-
+    """options: the non-default SfmConfig fields (docs/adr/0040) -- absent
+    for jobs queued before options existed, which then run as before."""
+    config = SfmConfig.from_dict(options).replace(camera_model=camera_model)
     conn = open_index_db(project_root)
     try:
         return run_sfm_for_project(
             conn,
             project_root,
-            config=SfmConfig(camera_model=camera_model),
+            config=config,
             image_source=image_source,
             frame_set_id=frame_set_id,
             engine=engine,
@@ -2689,6 +2696,10 @@ class PoseEstimationPanel(QWidget):
         self.engine_note.setStyleSheet("color: palette(mid);")
         controls_layout.addWidget(self.engine_note)
 
+        self.options_editor = SfmOptionsEditor()
+        self.options_editor.changed.connect(self._refresh_enabled)
+        controls_layout.addWidget(self.options_editor)
+
         run_btn_row = QHBoxLayout()
         self.run_btn = QPushButton("Run SfM")
         self.run_btn.clicked.connect(self._on_run)
@@ -2715,7 +2726,25 @@ class PoseEstimationPanel(QWidget):
             self.state.queue_manager.queue_changed.connect(self._refresh_enabled)
 
     def on_project_changed(self) -> None:
+        self._load_last_options()
         self.on_shown()
+
+    def _load_last_options(self) -> None:
+        """Start from the options of this project's latest run, so tuning
+        carries over between runs (and sessions) -- defaults for a project
+        with no runs, or whose runs predate options (docs/adr/0040)."""
+        config = SfmConfig()
+        if self.state.conn is not None:
+            row = self.state.conn.execute(
+                "SELECT config FROM sfm_runs ORDER BY created_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+            if row is not None:
+                stored = json.loads(row[0])
+                config = SfmConfig.from_dict(stored.get("options"))
+                if stored.get("image_source") != "projections":
+                    # EQUIRECTANGULAR/SPHERE were dictated by the engine, not chosen.
+                    config = config.replace(camera_model=SfmConfig().camera_model)
+        self.options_editor.set_config(config)
 
     def on_shown(self) -> None:
         have_project = self.state.conn is not None
@@ -2788,6 +2817,7 @@ class PoseEstimationPanel(QWidget):
                 "for the same frame set: the export converts each frame's pose into its projected views' "
                 f"poses so masks come along (docs/adr/0036). {where}"
             )
+        self.options_editor.set_variant(engine)
         self._refresh_enabled()
 
     def _spheresfm_status(self) -> dict:
@@ -2802,11 +2832,18 @@ class PoseEstimationPanel(QWidget):
         busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
         engine = self.engine_combo.currentData()
         spheresfm_missing = engine == ENGINE_SPHERESFM and not self._spheresfm_status()["found"]
-        self.queue_btn.setEnabled(not spheresfm_missing)
+        option_problems = self.options_editor.problems()
+        self.queue_btn.setEnabled(not spheresfm_missing and not option_problems)
         if spheresfm_missing:
             self.run_btn.setEnabled(False)
             self.run_btn.setToolTip("No SphereSfM build found -- see the note above.")
             return
+        if option_problems:
+            self.run_btn.setEnabled(False)
+            self.run_btn.setToolTip("Fix the advanced options first: " + "; ".join(option_problems))
+            self.queue_btn.setToolTip(self.run_btn.toolTip())
+            return
+        self.queue_btn.setToolTip("Adds this exact configuration as a queued job instead of running it now.")
         self.run_btn.setToolTip("")
         choice = self._choices.get(self.source_combo.currentData())
         if engine in (ENGINE_COLMAP_EQUIRECTANGULAR, ENGINE_SPHERESFM):
@@ -2830,30 +2867,40 @@ class PoseEstimationPanel(QWidget):
 
     def _show_latest_run(self) -> None:
         row = self.state.conn.execute(
-            "SELECT model_stats, created_at FROM sfm_runs ORDER BY created_at DESC LIMIT 1"
+            "SELECT model_stats, created_at, config FROM sfm_runs ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
         if row is None:
             return
         stats = json.loads(row[0])
+        options = json.loads(row[2]).get("options")
+        changed = describe_sfm_options(SfmConfig.from_dict(options).replace(camera_model=SfmConfig().camera_model))
+        if options and options.get("camera_model") not in (None, SfmConfig().camera_model, "EQUIRECTANGULAR", "SPHERE"):
+            changed = ", ".join(filter(None, [f"camera model {options['camera_model']}", changed]))
         self.stats_label.setText(
             f"Last run ({_local_time(row[1])}): registered {stats['registered_images']}/{stats['total_images']} "
             f"({stats['registered_ratio']:.0%}), {stats['num_points3d']} points, "
             f"mean reprojection error {stats['mean_reprojection_error']:.2f}px, "
             f"{stats['num_connected_models']} connected model(s)."
+            + (f" Options: {changed}." if changed else (" Default options." if options is not None else ""))
         )
 
-    def _current_sfm_args(self) -> tuple[str, str | None, str, str]:
-        """(image_source, frame_set_id, camera_model, engine)."""
-        engine = self.engine_combo.currentData()
+    def _current_sfm_args(self) -> tuple[str, str | None, str, str, dict]:
+        """(image_source, frame_set_id, camera_model, engine, options) --
+        options holds only the non-default advanced options that apply to
+        the chosen engine (SfmConfig.for_variant), camera model excluded
+        (it's its own argument)."""
+        variant = self.engine_combo.currentData()
         frame_set_id = self.source_combo.currentData()
-        if engine == ENGINE_SPHERESFM:
-            return "frames", frame_set_id, "SPHERE", "spheresfm"
-        if engine == ENGINE_COLMAP_EQUIRECTANGULAR:
-            return "frames", frame_set_id, "EQUIRECTANGULAR", "pycolmap"
-        return "projections", frame_set_id, "SIMPLE_RADIAL", "pycolmap"
+        config = self.options_editor.config().for_variant(variant)
+        options = {k: v for k, v in config.non_default().items() if k != "camera_model"}
+        if variant == ENGINE_SPHERESFM:
+            return "frames", frame_set_id, "SPHERE", "spheresfm", options
+        if variant == ENGINE_COLMAP_EQUIRECTANGULAR:
+            return "frames", frame_set_id, "EQUIRECTANGULAR", "pycolmap", options
+        return "projections", frame_set_id, config.camera_model, "pycolmap", options
 
     def _on_add_to_queue(self) -> None:
-        image_source, frame_set_id, camera_model, engine = self._current_sfm_args()
+        image_source, frame_set_id, camera_model, engine, options = self._current_sfm_args()
         if image_source == "frames" and frame_set_id is None:
             QMessageBox.warning(self, "No frame set selected", "Choose an equirectangular frame set first.")
             return
@@ -2863,6 +2910,9 @@ class PoseEstimationPanel(QWidget):
         }.get(self.engine_combo.currentData(), "COLMAP (six-face projections)")
         choice = self._choices.get(frame_set_id)
         scope = choice.name if choice else "all frame sets"
+        changed = describe_sfm_options(SfmConfig.from_dict(options))
+        if camera_model != SfmConfig().camera_model and image_source == "projections":
+            changed = ", ".join(filter(None, [f"camera model {camera_model}", changed]))
         self.state.queue_manager.add_job(
             QUEUE_STAGE_POSE,
             choice.source_id if choice else None,
@@ -2871,12 +2921,13 @@ class PoseEstimationPanel(QWidget):
                 "frame_set_id": frame_set_id,
                 "camera_model": camera_model,
                 "engine": engine,
+                "options": options,
             },
-            f"Pose estimation — {engine_label}, {scope}",
+            f"Pose estimation — {engine_label}, {scope}" + (f" ({changed})" if changed else ""),
         )
 
     def _on_run(self) -> None:
-        image_source, frame_set_id, camera_model, engine = self._current_sfm_args()
+        image_source, frame_set_id, camera_model, engine, options = self._current_sfm_args()
 
         self.run_btn.setEnabled(False)
         self.progress_area.start("Running SfM…")
@@ -2888,6 +2939,7 @@ class PoseEstimationPanel(QWidget):
             frame_set_id,
             camera_model,
             engine,
+            options,
             on_success=self._on_run_success,
             on_error=self._on_run_error,
             on_progress=self.progress_area.update_progress,
@@ -2915,6 +2967,8 @@ class PoseEstimationPanel(QWidget):
         self.progress_area.finish("")
         if isinstance(exc, SphereSfmError):
             QMessageBox.warning(self, "SphereSfM failed", str(exc))
+        elif isinstance(exc, ValueError) and "SfM options" in str(exc):
+            QMessageBox.warning(self, "Check the advanced options", str(exc))
         elif isinstance(exc, SfmRegistrationError):
             QMessageBox.warning(
                 self,
