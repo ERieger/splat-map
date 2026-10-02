@@ -112,6 +112,7 @@ from vine360.project import (
     open_index_db,
 )
 from vine360.projection.cubemap import ALL_FACE_NAMES
+from vine360.recent_projects import load_recent_projects, record_recent_project, remove_recent_project
 from vine360.projection.generate import ProjectionGenerationError, generate_views_for_frame_set
 from vine360.runners.local import LocalRunner
 from vine360.runners.probe import probe_dependencies
@@ -888,6 +889,29 @@ class ProjectPanel(QWidget):
         self.path_label.setStyleSheet("padding: 4px; background: palette(alternate-base);")
         layout.addWidget(self.path_label)
 
+        # Per-device list (docs/adr/0038), stored in the user's config dir --
+        # never in the project or the repository.
+        recent_box = QGroupBox("Recent projects")
+        recent_layout = QVBoxLayout(recent_box)
+        self.recent_list = QListWidget()
+        self.recent_list.setMaximumHeight(160)
+        self.recent_list.itemDoubleClicked.connect(lambda _item: self._on_open_recent())
+        self.recent_list.currentItemChanged.connect(lambda *_: self._update_recent_buttons())
+        recent_layout.addWidget(self.recent_list)
+        recent_buttons = QHBoxLayout()
+        self.recent_open_btn = QPushButton("Open")
+        self.recent_open_btn.setToolTip("Open the selected recent project (or double-click it).")
+        self.recent_open_btn.clicked.connect(self._on_open_recent)
+        self.recent_remove_btn = QPushButton("Remove from list")
+        self.recent_remove_btn.setToolTip("Forget this entry. The project folder itself is not touched.")
+        self.recent_remove_btn.clicked.connect(self._on_remove_recent)
+        recent_buttons.addWidget(self.recent_open_btn)
+        recent_buttons.addWidget(self.recent_remove_btn)
+        recent_buttons.addStretch()
+        recent_layout.addLayout(recent_buttons)
+        layout.addWidget(recent_box)
+        self._refresh_recent_list()
+
         create_box = QGroupBox("Create a new project")
         create_layout = QVBoxLayout(create_box)
         form = QFormLayout()
@@ -965,12 +989,55 @@ class ProjectPanel(QWidget):
         directory = QFileDialog.getExistingDirectory(self, "Choose an existing project folder")
         if not directory:
             return
+        self._open_path(Path(directory))
+
+    def _open_path(self, root: Path) -> bool:
         try:
-            project = load_project(Path(directory))
+            project = load_project(root)
         except ProjectNotFoundError as exc:
             QMessageBox.warning(self, "Cannot open project", str(exc))
+            return False
+        self._set_active_project(root, project)
+        return True
+
+    def _refresh_recent_list(self) -> None:
+        self.recent_list.clear()
+        for entry in load_recent_projects():
+            missing = not entry.exists()
+            label = f"{entry.name}  —  {entry.path}" + ("  (missing)" if missing else "")
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, entry.path)
+            item.setToolTip(f"{entry.path}\nLast opened {entry.opened_at}")
+            if missing:
+                item.setForeground(QColor("gray"))
+            self.recent_list.addItem(item)
+        if self.recent_list.count() == 0:
+            placeholder = QListWidgetItem("No recent projects yet.")
+            placeholder.setFlags(Qt.NoItemFlags)
+            self.recent_list.addItem(placeholder)
+        self._update_recent_buttons()
+
+    def _selected_recent_path(self) -> str | None:
+        item = self.recent_list.currentItem()
+        return item.data(Qt.UserRole) if item is not None else None
+
+    def _update_recent_buttons(self) -> None:
+        has_selection = self._selected_recent_path() is not None
+        self.recent_open_btn.setEnabled(has_selection)
+        self.recent_remove_btn.setEnabled(has_selection)
+
+    def _on_open_recent(self) -> None:
+        path = self._selected_recent_path()
+        if path is None:
             return
-        self._set_active_project(Path(directory), project)
+        self._open_path(Path(path))
+
+    def _on_remove_recent(self) -> None:
+        path = self._selected_recent_path()
+        if path is None:
+            return
+        remove_recent_project(path)
+        self._refresh_recent_list()
 
     def _set_active_project(self, root: Path, project: Project) -> None:
         if self.state.conn is not None:
@@ -985,6 +1052,8 @@ class ProjectPanel(QWidget):
             f"Open: {project.name!r} ({project.capture_mode.value}) at {root}\n"
             f"project_id={project.project_id}  created_at={project.created_at}"
         )
+        record_recent_project(root, project.name)
+        self._refresh_recent_list()
         self.project_changed.emit()
         self.state.notify_change()
 
