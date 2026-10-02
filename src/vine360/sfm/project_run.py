@@ -38,7 +38,16 @@ from vine360.sfm.colmap_adapter import (
     validate_installation,
 )
 
-__all__ = ["SfmRegistrationError", "run_sfm_for_project"]
+__all__ = ["ENGINE_PYCOLMAP", "ENGINE_SPHERESFM", "SfmRegistrationError", "run_sfm_for_project"]
+
+# sfm_runs.config["engine"]; rows recorded before the field existed are
+# pycolmap runs (run_engine()).
+ENGINE_PYCOLMAP = "pycolmap"
+ENGINE_SPHERESFM = "spheresfm"
+
+
+def run_engine(config: dict) -> str:
+    return config.get("engine", ENGINE_PYCOLMAP)
 
 
 def _image_set_hash(image_names: list[str]) -> str:
@@ -59,6 +68,8 @@ def run_sfm_for_project(
     config: SfmConfig = SfmConfig(),
     image_source: str = "projections",
     frame_set_id: str | None = None,
+    engine: str = ENGINE_PYCOLMAP,
+    runner=None,
     progress_callback=None,
 ) -> tuple[SfmDiagnostics, list[str]]:
     """image_source="frames" requires frame_set_id and runs directly
@@ -79,6 +90,10 @@ def run_sfm_for_project(
     images rather than per-frame subdirectories. Each run gets its own
     COLMAP database under its own sparse/<run_id>/, so a scoped run never
     sees an earlier run's images left in a shared database.
+
+    engine="spheresfm" runs the external SphereSfM build instead of
+    pycolmap (raw equirectangular frames only -- docs/adr/0036), through
+    `runner` (a LocalRunner by default).
 
     Raises SfmRegistrationError if COLMAP produces no usable
     reconstruction (a real, correct outcome for e.g. single-panorama,
@@ -123,6 +138,14 @@ def run_sfm_for_project(
     image_names = [name for name in image_names if (image_dir / name).exists()]
     if not image_names:
         raise SfmRegistrationError(missing_message)
+    if engine == ENGINE_SPHERESFM:
+        if image_source != "frames":
+            raise ValueError("the SphereSfM engine only runs on raw equirectangular frames (image_source='frames')")
+        return _run_spheresfm(
+            conn, project_root, image_dir, image_names, frame_set_id, source_id, config, runner, notify
+        )
+    if engine != ENGINE_PYCOLMAP:
+        raise ValueError(f"unknown SfM engine: {engine!r}")
 
     # Each run gets its own sparse/<run_id>/ subtree. A shared sparse_dir
     # across runs let a later run's pycolmap.incremental_mapping silently
@@ -154,9 +177,118 @@ def run_sfm_for_project(
             json.dumps(validate_installation()),
             json.dumps(
                 {
+                    "engine": ENGINE_PYCOLMAP,
                     "camera_model": config.camera_model,
                     "sequential_overlap": config.sequential_overlap,
                     "image_source": image_source,
+                    "frame_set_id": frame_set_id,
+                    "source_id": source_id,
+                }
+            ),
+            json.dumps(diagnostics.to_dict()),
+            model_dir.relative_to(project_root).as_posix(),
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ),
+    )
+    conn.commit()
+    return diagnostics, warnings
+
+
+def _run_spheresfm(
+    conn: sqlite3.Connection,
+    project_root: Path,
+    image_dir: Path,
+    image_names: list[str],
+    frame_set_id: str,
+    source_id: str | None,
+    config: SfmConfig,
+    runner,
+    notify,
+) -> tuple[SfmDiagnostics, list[str]]:
+    """SphereSfM's own CLI pipeline (vine360.sfm.spheresfm_adapter), with
+    the same per-run layout as a pycolmap run: everything -- database,
+    every candidate model, each model's TXT conversion -- under
+    sfm/sparse/<run_id>/ (docs/adr/0019/0034/0036)."""
+    from PIL import Image
+
+    from vine360.runners.local import LocalRunner
+    from vine360.sfm import spheresfm_adapter as sph
+
+    binary = sph.find_binary()
+    if binary is None:
+        raise sph.SphereSfmError(
+            "no SphereSfM build found -- looked in: " + ", ".join(str(p) for p in sph.candidate_binaries())
+            + f" (set {sph.BINARY_ENV_VAR} to its colmap binary)"
+        )
+    runner = runner or LocalRunner()
+    with Image.open(image_dir / image_names[0]) as first:
+        width, height = first.size
+
+    run_id = f"sfm-{uuid.uuid4().hex[:8]}"
+    run_dir = project_root / "sfm" / "sparse" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    database_path = run_dir / "database.db"
+    image_list_path = run_dir / "image_list.txt"
+    image_list_path.write_text("\n".join(image_names) + "\n")
+
+    steps = 4
+    notify(f"SphereSfM: extracting features from {len(image_names)} frames…", 0, steps)
+    sph.run_command(
+        runner,
+        sph.build_feature_extraction_command(binary, database_path, image_dir, image_list_path, width=width, height=height),
+        "feature extraction",
+    )
+    notify("SphereSfM: matching frames…", 1, steps)
+    sph.run_command(
+        runner, sph.build_matcher_command(binary, database_path, overlap=config.sequential_overlap), "matching"
+    )
+    notify("SphereSfM: mapping (this is the slow part)…", 2, steps)
+    sph.run_command(runner, sph.build_mapper_command(binary, database_path, image_dir, run_dir), "mapping")
+
+    notify("SphereSfM: reading the reconstruction…", 3, steps)
+    candidates = {}
+    for model_dir in sorted(p for p in run_dir.iterdir() if p.is_dir() and p.name.isdigit()):
+        txt_dir = model_dir / "txt"
+        txt_dir.mkdir(exist_ok=True)
+        sph.run_command(runner, sph.build_model_converter_command(binary, model_dir, txt_dir), "model conversion")
+        candidates[model_dir] = sph.read_text_model(txt_dir)
+    if not candidates:
+        raise SfmRegistrationError(f"SphereSfM registered no images from frames/{frame_set_id}/")
+    model_dir, model = max(candidates.items(), key=lambda item: len(item[1].images))
+
+    track_lengths = [len(point.track) for point in model.points.values()]
+    registered = len(model.images)
+    diagnostics = SfmDiagnostics(
+        total_images=len(image_names),
+        registered_images=registered,
+        registered_ratio=registered / len(image_names),
+        num_connected_models=len(candidates),
+        num_points3d=len(model.points),
+        mean_reprojection_error=(
+            sum(point.error for point in model.points.values()) / len(model.points) if model.points else 0.0
+        ),
+        mean_track_length=sum(track_lengths) / len(track_lengths) if track_lengths else 0.0,
+        mean_observations_per_reg_image=sum(track_lengths) / registered if registered else 0.0,
+    )
+    notify("SphereSfM: done.", steps, steps)
+    warnings = evaluate_registration_quality(diagnostics)
+
+    conn.execute(
+        """
+        INSERT INTO sfm_runs
+            (run_id, image_set_hash, engine_version, config, model_stats, selected_model, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            _image_set_hash(image_names),
+            json.dumps({"spheresfm": sph.validate_installation()["version"], "binary": str(binary)}),
+            json.dumps(
+                {
+                    "engine": ENGINE_SPHERESFM,
+                    "camera_model": "SPHERE",
+                    "sequential_overlap": config.sequential_overlap,
+                    "image_source": "frames",
                     "frame_set_id": frame_set_id,
                     "source_id": source_id,
                 }

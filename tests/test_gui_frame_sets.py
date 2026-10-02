@@ -2,6 +2,7 @@
 (docs/adr/0035), the Frames interval box and the Export folder default.
 Offscreen Qt, same as test_gui_stage_indicator.py."""
 
+import json
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 from vine360.config import FRAME_PRESET_INTERVALS, CaptureMode, FramePreset
 from vine360.gui.main_window import (
     ENGINE_COLMAP_EQUIRECTANGULAR,
+    ENGINE_SPHERESFM,
     AppState,
     DataManagerPanel,
     ExportPanel,
@@ -152,7 +154,7 @@ def test_pose_panel_scope_choices_follow_the_engine(qapp, project):
     panel.engine_combo.setCurrentIndex(panel.engine_combo.findData(ENGINE_COLMAP_EQUIRECTANGULAR))
     equirect = [panel.source_combo.itemData(i) for i in range(panel.source_combo.count())]
     assert equirect == ["s1~i1"]  # no "All", equirectangular sources only
-    assert panel._current_sfm_args() == ("frames", "s1~i1", "EQUIRECTANGULAR")
+    assert panel._current_sfm_args() == ("frames", "s1~i1", "EQUIRECTANGULAR", "pycolmap")
 
 
 def test_export_panel_defaults_into_the_new_projects_exports_after_switching_project(qapp, tmp_path):
@@ -220,3 +222,81 @@ def test_data_manager_panel_lists_everything_and_gates_deletes_on_selection(qapp
     assert panel.delete_set_btn.isEnabled()
     assert not panel.delete_views_btn.isEnabled()  # nothing projected yet
     assert not panel.delete_masks_btn.isEnabled()
+
+
+def _fake_spheresfm_status(found: bool):
+    return lambda self: {
+        "found": found,
+        "path": "/opt/spheresfm/colmap" if found else None,
+        "version": "COLMAP 3.8 (Commit 6b40b2d)" if found else None,
+        "searched": ["/opt/spheresfm/colmap"],
+        "env_var": "VINE360_SPHERESFM_COLMAP",
+    }
+
+
+def test_pose_panel_spheresfm_engine_runs_on_equirect_frame_sets_when_a_build_is_found(qapp, project, monkeypatch):
+    monkeypatch.setattr(PoseEstimationPanel, "_spheresfm_status", _fake_spheresfm_status(True))
+    root, conn = project
+    _insert_source(conn, "s1")
+    _insert_source(conn, "flat", projection="perspective")
+    _insert_frame_set(conn, "s1", "s1~i1", "every 1s")
+    _insert_frame_set(conn, "flat", "flat~i1", "every 1s")
+    state = _state(root, conn, with_queue=True)
+    panel = PoseEstimationPanel(state)
+    panel.on_shown()
+    panel.engine_combo.setCurrentIndex(panel.engine_combo.findData(ENGINE_SPHERESFM))
+
+    assert [panel.source_combo.itemData(i) for i in range(panel.source_combo.count())] == ["s1~i1"]
+    assert panel.run_btn.isEnabled()
+    assert "/opt/spheresfm/colmap" in panel.engine_note.text()
+    assert panel._current_sfm_args() == ("frames", "s1~i1", "SPHERE", "spheresfm")
+
+    panel._on_add_to_queue()
+    job = state.queue_manager.jobs[-1]
+    assert job.params["engine"] == "spheresfm" and job.params["frame_set_id"] == "s1~i1"
+    assert job.depends_on == []  # frames already extracted
+
+
+def test_pose_panel_spheresfm_engine_is_disabled_without_a_build(qapp, project, monkeypatch):
+    monkeypatch.setattr(PoseEstimationPanel, "_spheresfm_status", _fake_spheresfm_status(False))
+    root, conn = project
+    _insert_source(conn, "s1")
+    _insert_frame_set(conn, "s1", "s1~i1", "every 1s")
+    panel = PoseEstimationPanel(_state(root, conn))
+    panel.on_shown()
+    panel.engine_combo.setCurrentIndex(panel.engine_combo.findData(ENGINE_SPHERESFM))
+
+    assert not panel.run_btn.isEnabled() and not panel.queue_btn.isEnabled()
+    assert "VINE360_SPHERESFM_COLMAP" in panel.engine_note.text()
+
+
+def _insert_frame_run(conn, run_id: str, frame_set_id: str, engine: str = "spheresfm") -> None:
+    conn.execute(
+        "INSERT INTO sfm_runs (run_id, image_set_hash, engine_version, config, model_stats, selected_model, created_at) "
+        "VALUES (?, 'h', 'v', ?, ?, 'sfm/sparse/x/0', '2026-01-01')",
+        (
+            run_id,
+            json.dumps({"engine": engine, "image_source": "frames", "frame_set_id": frame_set_id}),
+            json.dumps({"registered_images": 1, "total_images": 1}),
+        ),
+    )
+    conn.commit()
+
+
+def test_export_panel_needs_projections_to_export_a_360_run(qapp, project):
+    root, conn = project
+    _insert_source(conn, "s1")
+    _insert_frame_set(conn, "s1", "s1~i1", "every 1s")
+    _insert_frame_run(conn, "sfm-sphere", "s1~i1")
+    state = _state(root, conn, with_queue=True)
+    panel = ExportPanel(state)
+    panel.on_shown()  # poses mode by default
+
+    assert "SphereSfM" in panel.run_combo.itemText(0)
+    assert not panel.export_btn.isEnabled(), "no projected views for the run's frame set yet"
+    assert panel.output_dir == root / "exports" / "s1_i1" / "colmap"
+
+    panel._on_add_to_queue()
+    stages = [job.stage for job in state.queue_manager.jobs]
+    assert stages == ["projection", "export"], "Add to Queue projects the frame set first"
+    assert state.queue_manager.jobs[0].target_frame_set_id == "s1~i1"

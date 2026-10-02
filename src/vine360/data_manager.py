@@ -73,6 +73,13 @@ class SfmRunInfo:
     frame_set_id: str | None
     registered_images: int
     total_images: int
+    engine: str = "pycolmap"  # or "spheresfm" (docs/adr/0036)
+
+    @property
+    def engine_label(self) -> str:
+        if self.engine == "spheresfm":
+            return "SphereSfM (raw 360 frames)"
+        return "COLMAP equirectangular (raw frames)" if self.image_source == "frames" else "COLMAP six-face projections"
 
 
 @dataclass
@@ -214,6 +221,7 @@ def list_sfm_runs(conn: sqlite3.Connection) -> list[SfmRunInfo]:
                 frame_set_id=frame_set_id,
                 registered_images=stats.get("registered_images", 0),
                 total_images=stats.get("total_images", 0),
+                engine=config.get("engine", "pycolmap"),
             )
         )
     return result

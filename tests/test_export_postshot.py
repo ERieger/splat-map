@@ -253,18 +253,31 @@ def test_export_for_postshot_defaults_to_latest_run(project):
     assert result.num_images == len(names_2)
 
 
-def test_export_for_postshot_frames_engine_skips_masks(project):
+def test_export_for_postshot_frames_run_without_projections_raises_actionable_error(project):
+    """A raw-360-frame run now exports vine360's own projected views (with
+    poses converted from the frames' -- docs/adr/0036), not the raw
+    equirectangular frames it used to copy. With no projections for its
+    frame set there's nothing to export, and the error says what to do.
+    The real conversion is covered against real SphereSfM and pycolmap
+    reconstructions in tests/test_frame_poses.py."""
     root, conn = project
     model_dir, image_names = _build_real_model(root)
-    for name in image_names:
+    conn.execute(
+        "INSERT INTO sources (source_id, path, checksum, media_type, projection, timestamps) "
+        "VALUES ('s1', '/x.mp4', 'x', 'video', 'equirectangular', '{}')"
+    )
+    for i, name in enumerate(image_names):
         _write_dummy_image(root / "frames" / "s1" / name)
-    _insert_sfm_run(conn, root, model_dir, config={"image_source": "frames", "source_id": "s1"})
+        conn.execute(
+            "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
+            "VALUES (?, 's1', ?, '{}', ?, 'c', 's1')",
+            (f"s1:{i:06d}", float(i), f"frames/s1/{name}"),
+        )
+    conn.commit()
+    _insert_sfm_run(conn, root, model_dir, config={"image_source": "frames", "frame_set_id": "s1"})
 
-    result = export_for_postshot(conn, root, root / "exports" / "postshot")
-
-    assert result.num_images == len(image_names)
-    assert result.masks_dir is None
-    assert result.num_masks == 0
+    with pytest.raises(PostshotExportError, match="generate projections for this frame set"):
+        export_for_postshot(conn, root, root / "exports" / "postshot")
 
 
 def _insert_view_with_image(conn, root, frame_id, face_name, *, with_mask=False, source_id="s1"):

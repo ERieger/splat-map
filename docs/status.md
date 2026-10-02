@@ -176,6 +176,15 @@ Also:
 - Export resets a manually pinned output folder when another project is opened.
 - Export's folder dialog starts in the nearest existing folder, not the working directory.
 
+**SphereSfM engine and pinhole export of 360 runs (ADR 0036).** SphereSfM is built from
+source (CPU-only, `~/.local/spheresfm`) and is now a runnable Pose-estimation engine on
+equirectangular frame sets, from the Pose tab or the queue. Its adapter is verified against the
+real binary. Both 360 engines (SphereSfM and pycolmap EQUIRECTANGULAR) now export to Postshot
+as ordinary pinhole cameras over vine360's own projected views, with masks, instead of raw
+equirect frames. RealityScan camera priors work for both engines too. The frame-to-view pose
+conversion is pinned by real reconstructions of a synthetic ray-cast 360 room: median 0.11 px
+reprojection agreement, plus a cross-check against SphereSfM's own cube-face exporter.
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -243,6 +252,8 @@ Also:
 0034: frame sets -- several extraction configs per source, deterministic
       ids, legacy id == source_id migration, per-run COLMAP database.
 0035: Data manager tab -- list everything derived, delete with cascade.
+0036: SphereSfM engine (CLI via Runner, TXT models -- never pycolmap) and
+      pinhole export of 360 runs via measured frame->view pose conversion.
 
 ## Blockers / known gaps
 

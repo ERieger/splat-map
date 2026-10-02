@@ -103,9 +103,13 @@ COLMAP itself goes through `pycolmap` (COLMAP's official Python bindings), not a
 `colmap` binary (docs/adr/0007) — `vine360/sfm/colmap_adapter.py`'s function/argument names were
 confirmed against the actually-installed pycolmap source, not assumed from memory. **Adapter
 honesty discipline**: every adapter's docstring states plainly whether it was verified against
-real installed source/a real call, or is unverified — e.g. `training/nerfstudio_adapter.py` and
-`sfm/spheresfm_adapter.py` are explicitly unverified scaffolds (no install available to check
-against); don't treat their command shapes as trustworthy without re-verifying first.
+real installed source/a real call, or is unverified — e.g. `training/nerfstudio_adapter.py` is an
+explicitly unverified scaffold (no install available to check against); don't treat its command
+shapes as trustworthy without re-verifying first. `sfm/spheresfm_adapter.py` *is* verified against
+a real SphereSfM build (`~/.local/spheresfm/bin/colmap`, or `$VINE360_SPHERESFM_COLMAP`;
+docs/adr/0036) — and pycolmap must never load a SphereSfM model (its `SPHERE` camera model id
+collides with a different pycolmap model); 360-frame runs of either engine are read/exported
+through `sfm/frame_poses.py`.
 
 **Project layout & index** (docs/adr/0003, 0024, 0029): a project is a directory (`project.yaml` +
 `index.sqlite`) with fixed subdirectories (`frames/`, `projections/`, `masks/{classes, keep}/`,

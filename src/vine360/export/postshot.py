@@ -234,6 +234,8 @@ def _reset_managed_subdirs(output_dir: Path) -> None:
 
 def _write_camera_priors_csv(
     conn: sqlite3.Connection,
+    project_root: Path,
+    run_id: str,
     model_dir: Path,
     config: dict,
     output_dir: Path,
@@ -265,8 +267,10 @@ def _write_camera_priors_csv(
     path relative to projections/, so it maps to a flattened export name
     directly via _flatten_to_unique_filename -- no composition needed.
 
-    image_source="frames": COLMAP's registered image.name is a raw
-    equirect frame's filename relative to frames/<frame_set_id>/. Every
+    image_source="frames" (either engine, read through
+    vine360.sfm.frame_poses.load_frame_model -- never pycolmap directly,
+    which can't read a SphereSfM model, docs/adr/0036): every registered
+    raw equirect frame is matched back to its frame_id. Every
     cube-face view rendered from that frame shares the panorama's own
     optical center (zero-translation fixed_rotation, see
     vine360.projection.cubemap), so composing the frame's pose with a
@@ -277,26 +281,24 @@ def _write_camera_priors_csv(
     building this). Frame filenames are matched back to frame_id via the
     frames table's own `path` column (populated at extraction time),
     rather than by parsing the "frame_NNNNNN.png" naming convention."""
-    reconstruction = pycolmap.Reconstruction(model_dir)
     image_source = config.get("image_source", "projections")
     rows: list[tuple[str, float, float, float]] = []
 
     if image_source == "projections":
+        reconstruction = pycolmap.Reconstruction(model_dir)
         for image in reconstruction.images.values():
             flat_name = _flatten_to_unique_filename(Path(image.name))
             if flat_name in exported_flat_names:
                 x, y, z = image.projection_center()
                 rows.append((flat_name, x, y, z))
     elif image_source == "frames":
-        run_frame_set_id = _run_frame_set_id(config)
-        if not run_frame_set_id:
-            return None, 0, "camera priors: sfm run config missing frame_set_id for image_source='frames' -- skipped"
-        frame_id_by_path = {
-            Path(path).as_posix(): frame_id
-            for frame_id, path in conn.execute(
-                "SELECT frame_id, path FROM frames WHERE frame_set_id = ?", (run_frame_set_id,)
-            ).fetchall()
-        }
+        from vine360.sfm.frame_poses import FramePoseError, load_frame_model
+
+        try:
+            frame_model = load_frame_model(conn, project_root, run_id)
+        except FramePoseError as exc:
+            return None, 0, f"camera priors: {exc} -- skipped"
+        run_frame_set_id = frame_model.frame_set_id
         flat_names_by_frame_id: dict[str, list[str]] = {}
         for frame_id, image_path in conn.execute(
             "SELECT v.frame_id, v.image_path FROM views v JOIN frames f ON f.frame_id = v.frame_id "
@@ -307,12 +309,8 @@ def _write_camera_priors_csv(
             if flat_name in exported_flat_names:
                 flat_names_by_frame_id.setdefault(frame_id, []).append(flat_name)
 
-        for image in reconstruction.images.values():
-            full_rel = (Path("frames") / run_frame_set_id / image.name).as_posix()
-            frame_id = frame_id_by_path.get(full_rel)
-            if frame_id is None:
-                continue
-            x, y, z = image.projection_center()
+        for frame_id, pose in frame_model.poses.items():
+            x, y, z = (float(v) for v in pose.center)
             for flat_name in flat_names_by_frame_id.get(frame_id, []):
                 rows.append((flat_name, x, y, z))
     else:
@@ -477,14 +475,22 @@ def export_for_postshot(
 
     config = json.loads(config_json)
     image_source = config.get("image_source", "projections")
-    if image_source == "projections":
-        source_root = project_root / "projections"
-    elif image_source == "frames":
-        run_frame_set_id = _run_frame_set_id(config)
-        if not run_frame_set_id:
-            raise PostshotExportError(f"sfm run {found_run_id!r} used image_source='frames' with no frame_set_id")
-        source_root = project_root / "frames" / run_frame_set_id
-    else:
+    # Both kinds of run export vine360's own projected views: a six-face
+    # run reconstructed them directly; a raw-360-frame run (SphereSfM or
+    # pycolmap EQUIRECTANGULAR) gets its frame poses turned into view poses
+    # (vine360.sfm.frame_poses, docs/adr/0036) -- pinhole images a trainer
+    # can use, with masks, instead of raw equirectangular frames.
+    source_root = project_root / "projections"
+    reconstruction = None
+    if image_source == "frames":
+        from vine360.sfm.frame_poses import FramePoseError, build_view_reconstruction
+
+        notify("Converting 360 frame poses to view poses…", None, None)
+        try:
+            reconstruction, _model = build_view_reconstruction(conn, project_root, found_run_id)
+        except FramePoseError as exc:
+            raise PostshotExportError(str(exc)) from exc
+    elif image_source != "projections":
         raise PostshotExportError(f"unknown image_source in sfm run config: {image_source!r}")
 
     warnings: list[str] = []
@@ -495,7 +501,8 @@ def export_for_postshot(
     sparse_out.mkdir(parents=True, exist_ok=True)
     images_out.mkdir(parents=True, exist_ok=True)
 
-    reconstruction = pycolmap.Reconstruction(model_dir)
+    if reconstruction is None:
+        reconstruction = pycolmap.Reconstruction(model_dir)
     # (original COLMAP image name, flattened export filename), sorted by
     # the original name for a stable, predictable copy order.
     renames = sorted(
@@ -521,22 +528,22 @@ def export_for_postshot(
 
     masks_out: Path | None = None
     num_masks = 0
-    if image_source == "projections":
-        keep_root = project_root / "masks" / "keep"
-        if keep_root.exists() and any(keep_root.rglob("*.png")):
-            masks_out = output_dir / "masks"
-            masks_out.mkdir(parents=True, exist_ok=True)
-            for i, (original_name, flat_name) in enumerate(renames):
-                notify(f"Copying masks ({i + 1}/{len(renames)})…", i + 1, len(renames))
-                keep_src = colmap_mask_path(original_name, keep_root)
-                if not keep_src.exists():
-                    continue
-                shutil.copy2(keep_src, masks_out / flat_name)  # same flattened name as its color image
-                num_masks += 1
-            if num_masks == 0:
-                warnings.append("masks/keep/ exists but no mask matched any exported image")
-        else:
-            warnings.append("no masks have been built yet -- exporting poses and images only")
+    # Every export is of projected views now (see above), so masks always apply.
+    keep_root = project_root / "masks" / "keep"
+    if keep_root.exists() and any(keep_root.rglob("*.png")):
+        masks_out = output_dir / "masks"
+        masks_out.mkdir(parents=True, exist_ok=True)
+        for i, (original_name, flat_name) in enumerate(renames):
+            notify(f"Copying masks ({i + 1}/{len(renames)})…", i + 1, len(renames))
+            keep_src = colmap_mask_path(original_name, keep_root)
+            if not keep_src.exists():
+                continue
+            shutil.copy2(keep_src, masks_out / flat_name)  # same flattened name as its color image
+            num_masks += 1
+        if num_masks == 0:
+            warnings.append("masks/keep/ exists but no mask matched any exported image")
+    else:
+        warnings.append("no masks have been built yet -- exporting poses and images only")
     notify("Export complete.", None, None)
 
     return PostshotExportResult(
@@ -766,7 +773,7 @@ def export_for_realityscan(
                 )
             else:
                 priors_path, num_priors, priors_warning = _write_camera_priors_csv(
-                    conn, model_dir, config, output_dir, exported_flat_names
+                    conn, project_root, found_run_id, model_dir, config, output_dir, exported_flat_names
                 )
                 if priors_warning:
                     warnings.append(priors_warning)

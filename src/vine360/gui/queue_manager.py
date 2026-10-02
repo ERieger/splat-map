@@ -476,6 +476,11 @@ class QueueManager(QObject):
 
         if stage == STAGE_EXPORT:
             if params.get("mode") == "poses":
+                run_frame_set_id = self._frame_run_frame_set(params.get("run_id"))
+                if run_frame_set_id:
+                    # A raw-360-frame run exports its frame set's projected
+                    # views (vine360.sfm.frame_poses, docs/adr/0036).
+                    return self._require_views(run_frame_set_id)
                 if _has_any_sfm_run(conn):
                     return [], None
                 existing = next(
@@ -496,6 +501,18 @@ class QueueManager(QObject):
             return self._resolve_project_wide_projection_prerequisite(conn)
 
         return [], None
+
+    def _frame_run_frame_set(self, run_id: str | None) -> str | None:
+        """The frame set of a raw-frame (360) SfM run, else None."""
+        if not run_id:
+            return None
+        row = self.state.conn.execute("SELECT config FROM sfm_runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        config = json.loads(row[0])
+        if config.get("image_source") != "frames":
+            return None
+        return config.get("frame_set_id") or config.get("source_id")
 
     def _resolve_project_wide_projection_prerequisite(self, conn: sqlite3.Connection) -> tuple[list[str], str | None]:
         if _has_any_views(conn):
@@ -692,6 +709,7 @@ class QueueManager(QObject):
         elif job.stage == STAGE_POSE:
             fn, args = mw._run_sfm_worker, (
                 project_root, params["image_source"], _params_frame_set_id(params), params["camera_model"],
+                params.get("engine", "pycolmap"),
             )
         elif job.stage == STAGE_EXPORT:
             output_dir = Path(params["output_dir"])

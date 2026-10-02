@@ -2066,6 +2066,7 @@ def _run_sfm_worker(
     image_source: str,
     frame_set_id: str | None,
     camera_model: str,
+    engine: str = "pycolmap",
     progress_callback=None,
 ):
     from vine360.sfm.colmap_adapter import SfmConfig
@@ -2078,6 +2079,7 @@ def _run_sfm_worker(
             config=SfmConfig(camera_model=camera_model),
             image_source=image_source,
             frame_set_id=frame_set_id,
+            engine=engine,
             progress_callback=progress_callback,
         )
     finally:
@@ -2117,7 +2119,7 @@ class PoseEstimationPanel(QWidget):
         self.engine_combo.addItem(
             "COLMAP native equirectangular (raw frames)", userData=ENGINE_COLMAP_EQUIRECTANGULAR
         )
-        self.engine_combo.addItem("SphereSfM (external -- unverified)", userData=ENGINE_SPHERESFM)
+        self.engine_combo.addItem("SphereSfM (external build, raw frames)", userData=ENGINE_SPHERESFM)
         self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
         form.addRow("Engine:", self.engine_combo)
         self.source_combo = QComboBox()
@@ -2177,7 +2179,7 @@ class PoseEstimationPanel(QWidget):
         self._choices = {}
         if self.state.conn is not None:
             engine = self.engine_combo.currentData()
-            frames_engine = engine == ENGINE_COLMAP_EQUIRECTANGULAR
+            frames_engine = engine in (ENGINE_COLMAP_EQUIRECTANGULAR, ENGINE_SPHERESFM)
             if not frames_engine:
                 self.source_combo.addItem("All frame sets (every projected view in the project)", userData=None)
             self._choices = {
@@ -2197,7 +2199,6 @@ class PoseEstimationPanel(QWidget):
     def _on_engine_changed(self) -> None:
         engine = self.engine_combo.currentData()
         self._refresh_sources()
-        self.source_combo.setEnabled(engine != ENGINE_SPHERESFM)
         if engine == ENGINE_COLMAP_PROJECTIONS:
             self.engine_note.setText(
                 "Runs against the projected views of the chosen frame set -- or every projected view in "
@@ -2214,16 +2215,26 @@ class PoseEstimationPanel(QWidget):
                 "poles and across the seam is unproven. No masking support yet on this path."
             )
         else:
-            from vine360.sfm.spheresfm_adapter import SPHERESFM_REPO_URL, validate_installation as spheresfm_status
-
-            status = spheresfm_status()
+            status = self._spheresfm_status()
+            where = (
+                f"Using {status['path']} ({status['version']})."
+                if status["found"]
+                else "No SphereSfM build found -- looked in " + ", ".join(status["searched"])
+                + f". Set {status['env_var']} to its colmap binary."
+            )
             self.engine_note.setText(
-                f"SphereSfM ({SPHERESFM_REPO_URL}) is a separate COLMAP fork with its own spherical camera "
-                "model and sphere-aware matching/mapping. It must be compiled from C++ source -- no pip package "
-                "or prebuilt binary exists, and this environment cannot build it. "
-                f"colmap binary on PATH: {'yes, but ' + status['note'] if status['colmap_binary_found'] else 'no'}."
+                "SphereSfM is a separate COLMAP fork with a spherical camera model and sphere-aware matching "
+                "and bundle adjustment, run on the selected frame set's raw equirectangular frames (CPU only "
+                "here -- slow for thousands of frames). To export it for Postshot, also generate projections "
+                "for the same frame set: the export converts each frame's pose into its projected views' "
+                f"poses so masks come along (docs/adr/0036). {where}"
             )
         self._refresh_enabled()
+
+    def _spheresfm_status(self) -> dict:
+        from vine360.sfm.spheresfm_adapter import validate_installation
+
+        return validate_installation()
 
     def _refresh_enabled(self) -> None:
         if self.state.conn is None:
@@ -2231,13 +2242,15 @@ class PoseEstimationPanel(QWidget):
             return
         busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
         engine = self.engine_combo.currentData()
-        if engine == ENGINE_SPHERESFM:
+        spheresfm_missing = engine == ENGINE_SPHERESFM and not self._spheresfm_status()["found"]
+        self.queue_btn.setEnabled(not spheresfm_missing)
+        if spheresfm_missing:
             self.run_btn.setEnabled(False)
-            self.run_btn.setToolTip("Not runnable here -- SphereSfM needs a custom build; see the note above.")
+            self.run_btn.setToolTip("No SphereSfM build found -- see the note above.")
             return
         self.run_btn.setToolTip("")
         choice = self._choices.get(self.source_combo.currentData())
-        if engine == ENGINE_COLMAP_EQUIRECTANGULAR:
+        if engine in (ENGINE_COLMAP_EQUIRECTANGULAR, ENGINE_SPHERESFM):
             has_frames = choice is not None and choice.frame_count > 0
             self.run_btn.setEnabled(has_frames and not busy)
             if not has_frames:
@@ -2270,34 +2283,41 @@ class PoseEstimationPanel(QWidget):
             f"{stats['num_connected_models']} connected model(s)."
         )
 
-    def _current_sfm_args(self) -> tuple[str, str | None, str]:
+    def _current_sfm_args(self) -> tuple[str, str | None, str, str]:
+        """(image_source, frame_set_id, camera_model, engine)."""
         engine = self.engine_combo.currentData()
+        frame_set_id = self.source_combo.currentData()
+        if engine == ENGINE_SPHERESFM:
+            return "frames", frame_set_id, "SPHERE", "spheresfm"
         if engine == ENGINE_COLMAP_EQUIRECTANGULAR:
-            return "frames", self.source_combo.currentData(), "EQUIRECTANGULAR"
-        return "projections", self.source_combo.currentData(), "SIMPLE_RADIAL"
+            return "frames", frame_set_id, "EQUIRECTANGULAR", "pycolmap"
+        return "projections", frame_set_id, "SIMPLE_RADIAL", "pycolmap"
 
     def _on_add_to_queue(self) -> None:
-        if self.engine_combo.currentData() == ENGINE_SPHERESFM:
-            QMessageBox.warning(self, "Not runnable", "SphereSfM needs a custom build; see the note above.")
-            return
-        image_source, frame_set_id, camera_model = self._current_sfm_args()
+        image_source, frame_set_id, camera_model, engine = self._current_sfm_args()
         if image_source == "frames" and frame_set_id is None:
             QMessageBox.warning(self, "No frame set selected", "Choose an equirectangular frame set first.")
             return
-        engine_label = (
-            "COLMAP (equirectangular)" if image_source == "frames" else "COLMAP (six-face projections)"
-        )
+        engine_label = {
+            ENGINE_SPHERESFM: "SphereSfM",
+            ENGINE_COLMAP_EQUIRECTANGULAR: "COLMAP (equirectangular)",
+        }.get(self.engine_combo.currentData(), "COLMAP (six-face projections)")
         choice = self._choices.get(frame_set_id)
         scope = choice.name if choice else "all frame sets"
         self.state.queue_manager.add_job(
             QUEUE_STAGE_POSE,
             choice.source_id if choice else None,
-            {"image_source": image_source, "frame_set_id": frame_set_id, "camera_model": camera_model},
+            {
+                "image_source": image_source,
+                "frame_set_id": frame_set_id,
+                "camera_model": camera_model,
+                "engine": engine,
+            },
             f"Pose estimation — {engine_label}, {scope}",
         )
 
     def _on_run(self) -> None:
-        image_source, frame_set_id, camera_model = self._current_sfm_args()
+        image_source, frame_set_id, camera_model, engine = self._current_sfm_args()
 
         self.run_btn.setEnabled(False)
         self.progress_area.start("Running SfM…")
@@ -2308,6 +2328,7 @@ class PoseEstimationPanel(QWidget):
             image_source,
             frame_set_id,
             camera_model,
+            engine,
             on_success=self._on_run_success,
             on_error=self._on_run_error,
             on_progress=self.progress_area.update_progress,
@@ -2329,9 +2350,13 @@ class PoseEstimationPanel(QWidget):
         self.state.notify_change()
 
     def _on_run_error(self, exc: Exception) -> None:
+        from vine360.sfm.spheresfm_adapter import SphereSfmError
+
         self._refresh_enabled()
         self.progress_area.finish("")
-        if isinstance(exc, SfmRegistrationError):
+        if isinstance(exc, SphereSfmError):
+            QMessageBox.warning(self, "SphereSfM failed", str(exc))
+        elif isinstance(exc, SfmRegistrationError):
             QMessageBox.warning(
                 self,
                 "No usable reconstruction",
@@ -2581,6 +2606,7 @@ class ExportPanel(QWidget):
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow("Export:", self.mode_combo)
         self.run_combo = QComboBox()
+        self.run_combo.currentIndexChanged.connect(self._on_run_changed)
         form.addRow("SfM run:", self.run_combo)
         self.source_combo = QComboBox()
         self.source_combo.setToolTip(
@@ -2659,18 +2685,43 @@ class ExportPanel(QWidget):
             self._on_mode_changed()  # also updates output_dir as a side effect
 
     def _refresh_runs(self) -> None:
+        self.run_combo.blockSignals(True)
         self.run_combo.clear()
+        self._run_frame_sets: dict[str, str] = {}  # run_id -> frame set, for raw-360-frame runs only
         rows = self.state.conn.execute(
-            "SELECT run_id, created_at, model_stats FROM sfm_runs ORDER BY created_at DESC"
+            "SELECT run_id, created_at, model_stats, config FROM sfm_runs ORDER BY created_at DESC"
         ).fetchall()
-        for run_id, created_at, model_stats in rows:
+        for run_id, created_at, model_stats, config_json in rows:
             stats = json.loads(model_stats)
+            config = json.loads(config_json)
+            if config.get("image_source") == "frames":
+                engine = "SphereSfM" if config.get("engine") == "spheresfm" else "COLMAP equirectangular"
+                self._run_frame_sets[run_id] = config.get("frame_set_id") or config.get("source_id")
+            else:
+                engine = "COLMAP six-face"
             label = (
-                f"{created_at} -- {stats['registered_images']}/{stats['total_images']} registered "
+                f"{created_at} -- {engine}, {stats['registered_images']}/{stats['total_images']} registered "
                 f"({run_id[:12]})"
             )
             self.run_combo.addItem(label, userData=run_id)
+        self.run_combo.blockSignals(False)
         self._refresh_enabled()
+
+    def _on_run_changed(self) -> None:
+        self._exported = False  # a different run means the last export no longer matches this configuration
+        self._update_output_dir()
+        self._refresh_enabled()
+
+    def _run_frame_set_view_count(self, run_id: str | None) -> int | None:
+        """For a raw-360-frame run: how many projected views its frame set
+        has -- the export uses them (docs/adr/0036). None for other runs."""
+        frame_set_id = getattr(self, "_run_frame_sets", {}).get(run_id)
+        if frame_set_id is None or self.state.conn is None:
+            return None
+        return self.state.conn.execute(
+            "SELECT COUNT(*) FROM views v JOIN frames f ON f.frame_id = v.frame_id WHERE f.frame_set_id = ?",
+            (frame_set_id,),
+        ).fetchone()[0]
 
     def _refresh_sources(self) -> None:
         """"All frame sets" (the default, matching this panel's original
@@ -2714,7 +2765,10 @@ class ExportPanel(QWidget):
             self.mode_note.setText(
                 "Imports vine360's own already-computed COLMAP reconstruction into Postshot. Always "
                 "exports whatever the chosen SfM run covers -- the Frame set selector above doesn't "
-                "filter this mode (see docs/adr/0026)."
+                "filter this mode (see docs/adr/0026). For a 360 run (SphereSfM or COLMAP "
+                "equirectangular), each frame's pose is converted into the poses of that frame set's "
+                "projected views, which are exported with their masks as ordinary pinhole cameras -- "
+                "generate projections for the frame set first (docs/adr/0036)."
             )
         elif mode == "realityscan":
             self.mode_note.setText(
@@ -2797,8 +2851,9 @@ class ExportPanel(QWidget):
         busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
         mode = self.mode_combo.currentData()
         if mode == "poses":
-            configured = self.run_combo.count() > 0 and self.output_dir is not None
-            has_prereq = True
+            view_count = self._run_frame_set_view_count(self.run_combo.currentData())
+            has_prereq = view_count is None or view_count > 0
+            configured = self.run_combo.count() > 0 and self.output_dir is not None and has_prereq
         else:
             choice = self._choices.get(self.source_combo.currentData())
             has_prereq = choice is None or choice.view_count > 0
@@ -3178,9 +3233,8 @@ class DataManagerPanel(QWidget):
         set_names = {info.frame_set_id: info.display_name for info in frame_sets}
         self.runs_table.setRowCount(len(runs))
         for r, run in enumerate(runs):
-            engine = "Equirectangular (raw frames)" if run.image_source == "frames" else "Six-face projections"
             scope = set_names.get(run.frame_set_id, run.frame_set_id or "all frame sets")
-            cells = [run.created_at, engine, scope, f"{run.registered_images}/{run.total_images}", ""]
+            cells = [run.created_at, run.engine_label, scope, f"{run.registered_images}/{run.total_images}", ""]
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if c == 0:
