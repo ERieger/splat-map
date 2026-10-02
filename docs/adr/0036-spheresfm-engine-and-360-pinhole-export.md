@@ -82,8 +82,16 @@ centres through the same module, so they work for SphereSfM too.
 
 ## Consequences / known limits
 
-- **CPU-only.** SIFT extraction and matching on thousands of 8K frames will be slow. GPU needs
-  the CUDA toolkit, a separate and fussier install, and then a rebuild.
+- **GPU (added after first acceptance).** Both SIFT paths now use the GPU on this machine:
+  - **pycolmap:** the `pycolmap-cuda12` wheel (the `sfm-cuda` extra) replaces `pycolmap`. Its
+    default device choice picks the GPU, so vine360 needed no code change. Measured on six 2K
+    synthetic frames: 0.82 s on GPU vs 3.37 s on CPU.
+  - **SphereSfM:** rebuilt with CUDA 12.8 (NVIDIA's WSL-Ubuntu `cuda-toolkit-12-8`, no driver
+    package), `-DCMAKE_CUDA_ARCHITECTURES=89`. Its CUDA code already uses texture objects, so it
+    builds unchanged against CUDA 12. The adapter only passes `--SiftExtraction.use_gpu 1` and
+    `--SiftMatching.use_gpu 1` when the binary's version banner says "with CUDA" (`has_cuda`).
+    A CPU-only build would otherwise fall back to OpenGL SiftGPU, which needs a display.
+  - The mapper's bundle adjustment stays on the CPU either way.
 - **No masking during 360 SfM**, on either engine. A static camera mask (`--ImageReader.
   camera_mask_path`) covering the operator or tripod at the nadir is a possible follow-up.
 - **No GPS/POS priors yet.** `spatial_matcher` and `--ImageReader.pose_path` would pair

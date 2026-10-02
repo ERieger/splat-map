@@ -22,6 +22,12 @@ dev = [
 sfm = [
     "pycolmap>=4.0",
 ]
+# The same bindings built with CUDA 12 -- GPU SIFT extraction/matching,
+# picked automatically (pycolmap's Device.auto). Use INSTEAD of `sfm`, never
+# both: the two packages install the same `pycolmap` module.
+sfm-cuda = [
+    "pycolmap-cuda12>=4.2",
+]
 # Bundles real ffmpeg/ffprobe binaries with no system install needed.
 ingest-ffmpeg = [
     "static-ffmpeg",

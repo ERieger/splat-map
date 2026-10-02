@@ -221,6 +221,7 @@ def _run_spheresfm(
             + f" (set {sph.BINARY_ENV_VAR} to its colmap binary)"
         )
     runner = runner or LocalRunner()
+    use_gpu = sph.has_cuda(sph.validate_installation()["version"])  # GPU SIFT only on a CUDA build
     with Image.open(image_dir / image_names[0]) as first:
         width, height = first.size
 
@@ -232,15 +233,21 @@ def _run_spheresfm(
     image_list_path.write_text("\n".join(image_names) + "\n")
 
     steps = 4
-    notify(f"SphereSfM: extracting features from {len(image_names)} frames…", 0, steps)
+    notify(
+        f"SphereSfM: extracting features from {len(image_names)} frames ({'GPU' if use_gpu else 'CPU'})…", 0, steps
+    )
     sph.run_command(
         runner,
-        sph.build_feature_extraction_command(binary, database_path, image_dir, image_list_path, width=width, height=height),
+        sph.build_feature_extraction_command(
+            binary, database_path, image_dir, image_list_path, width=width, height=height, use_gpu=use_gpu
+        ),
         "feature extraction",
     )
     notify("SphereSfM: matching frames…", 1, steps)
     sph.run_command(
-        runner, sph.build_matcher_command(binary, database_path, overlap=config.sequential_overlap), "matching"
+        runner,
+        sph.build_matcher_command(binary, database_path, overlap=config.sequential_overlap, use_gpu=use_gpu),
+        "matching",
     )
     notify("SphereSfM: mapping (this is the slow part)…", 2, steps)
     sph.run_command(runner, sph.build_mapper_command(binary, database_path, image_dir, run_dir), "mapping")

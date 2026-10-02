@@ -2224,8 +2224,10 @@ class PoseEstimationPanel(QWidget):
             )
             self.engine_note.setText(
                 "SphereSfM is a separate COLMAP fork with a spherical camera model and sphere-aware matching "
-                "and bundle adjustment, run on the selected frame set's raw equirectangular frames (CPU only "
-                "here -- slow for thousands of frames). To export it for Postshot, also generate projections "
+                "and bundle adjustment, run on the selected frame set's raw equirectangular frames "
+                + ("(GPU feature extraction and matching). " if status.get("cuda") else
+                   "(CPU only -- slow for thousands of frames). ")
+                + "To export it for Postshot, also generate projections "
                 "for the same frame set: the export converts each frame's pose into its projected views' "
                 f"poses so masks come along (docs/adr/0036). {where}"
             )

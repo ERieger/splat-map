@@ -93,12 +93,19 @@ def find_binary() -> Path | None:
     return None
 
 
+def has_cuda(version: str | None) -> bool:
+    """COLMAP's own version banner says "with CUDA" or "without CUDA"."""
+    return bool(version) and "with CUDA" in version and "without CUDA" not in version
+
+
 def validate_installation() -> dict:
     binary = find_binary()
+    version = _probe(str(binary)) if binary else None
     return {
         "found": binary is not None,
         "path": str(binary) if binary else None,
-        "version": _probe(str(binary)) if binary else None,
+        "version": version,
+        "cuda": has_cuda(version),
         "searched": [str(p) for p in candidate_binaries()],
         "env_var": BINARY_ENV_VAR,
     }
@@ -108,8 +115,17 @@ def validate_installation() -> dict:
 
 
 def build_feature_extraction_command(
-    binary: Path, database_path: Path, image_path: Path, image_list_path: Path, *, width: int, height: int
+    binary: Path,
+    database_path: Path,
+    image_path: Path,
+    image_list_path: Path,
+    *,
+    width: int,
+    height: int,
+    use_gpu: bool = False,
 ) -> list[str]:
+    """use_gpu only for a CUDA build (has_cuda): a CPU-only build's GPU SIFT
+    would fall back to OpenGL SiftGPU, which needs a display."""
     return [
         str(binary),
         "feature_extractor",
@@ -119,16 +135,16 @@ def build_feature_extraction_command(
         "--ImageReader.camera_model", "SPHERE",
         "--ImageReader.camera_params", f"1,{width / 2:g},{height / 2:g}",
         "--ImageReader.single_camera", "1",
-        "--SiftExtraction.use_gpu", "0",
+        "--SiftExtraction.use_gpu", "1" if use_gpu else "0",
     ]
 
 
-def build_matcher_command(binary: Path, database_path: Path, *, overlap: int) -> list[str]:
+def build_matcher_command(binary: Path, database_path: Path, *, overlap: int, use_gpu: bool = False) -> list[str]:
     return [
         str(binary),
         "sequential_matcher",
         "--database_path", str(database_path),
-        "--SiftMatching.use_gpu", "0",
+        "--SiftMatching.use_gpu", "1" if use_gpu else "0",
         "--SequentialMatching.overlap", str(overlap),
     ]
 

@@ -38,14 +38,15 @@ python3 -m venv --without-pip ~/.venvs/vine360   # NOT under /mnt/e or any Windo
                                                    # venv needs symlinks DrvFs can't make (docs/adr/0005)
 curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
 ~/.venvs/vine360/bin/python3 /tmp/get-pip.py
-~/.venvs/vine360/bin/python3 -m pip install -e ".[dev,sfm,masking]"
+~/.venvs/vine360/bin/python3 -m pip install -e ".[dev,sfm-cuda,masking]"
 ~/.venvs/vine360/bin/python3 -m pip install static-ffmpeg PySide6
 ```
 
 If `pip`/`venv` already work normally: `python3 -m venv .venv && source .venv/bin/activate && pip
 install -e ".[dev,sfm,masking]" static-ffmpeg ffmpeg PySide6`.
 
-`pyproject.toml` extras: `dev` (pytest), `sfm` (pycolmap), `masking` (torch/transformers/SAM 3 —
+`pyproject.toml` extras: `dev` (pytest), `sfm` (pycolmap, CPU) or `sfm-cuda` (pycolmap-cuda12,
+GPU SIFT -- this machine uses it; install one or the other, never both), `masking` (torch/transformers/SAM 3 —
 large, gated weights, see below), `ingest-ffmpeg` (bundles ffmpeg/ffprobe binaries, no system
 install needed). PySide6 (GUI) isn't yet in an extra; install it directly.
 

@@ -92,3 +92,16 @@ def test_read_text_model_parses_colmaps_txt_format(tmp_path):
     assert model.images[1].points2d == [(10.5, 20.5, 7), (30.0, 40.0, -1)]
     assert model.images[2].points2d == []
     assert model.points[7].track == [(1, 0)] and model.points[7].rgb == (10, 20, 30)
+
+
+def test_gpu_sift_only_for_a_cuda_build():
+    assert sph.has_cuda("COLMAP 3.8 (Commit 6b40b2d on 2026-02-24 with CUDA)")
+    assert not sph.has_cuda("COLMAP 3.8 (Commit 6b40b2d on 2026-02-24 without CUDA)")
+    assert not sph.has_cuda(None)
+    p = Path("/p")
+    cpu = sph.build_feature_extraction_command(B, p / "db", p / "img", p / "l", width=64, height=32)
+    gpu = sph.build_feature_extraction_command(B, p / "db", p / "img", p / "l", width=64, height=32, use_gpu=True)
+    assert cpu[cpu.index("--SiftExtraction.use_gpu") + 1] == "0"
+    assert gpu[gpu.index("--SiftExtraction.use_gpu") + 1] == "1"
+    matcher = sph.build_matcher_command(B, p / "db", overlap=5, use_gpu=True)
+    assert matcher[matcher.index("--SiftMatching.use_gpu") + 1] == "1"
