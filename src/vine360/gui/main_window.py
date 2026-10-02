@@ -29,8 +29,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
+from PIL import Image
 from PySide6.QtCore import QObject, QPoint, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -41,6 +43,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -100,9 +103,28 @@ from vine360.ingest.sources import (
     add_source,
     remove_source,
 )
-from vine360.masking.build import MaskBuildError, build_masks_for_frame_set, set_view_flagged
+from vine360.masking.build import build_masks_for_frame_set
+from vine360.masking.layers import (
+    LAYER_EXCLUDED_VIEW,
+    LAYER_OVEREXPOSED,
+    LAYER_PERSON,
+    LAYER_SKY,
+    LAYER_SPECS,
+    MaskLayerError,
+    SuspiciousView,
+    build_layers_for_frame_set,
+    find_suspicious_views,
+    frame_set_view_ids,
+    keep_mask_path,
+    layer_summary,
+    register_legacy_layers,
+    render_overlay,
+    set_layer_enabled,
+    set_view_excluded,
+    view_layers,
+)
 from vine360.masking.sam3_adapter import validate_installation as sam3_validate_installation
-from vine360.masking.semantics import is_keep_fraction_anomalous
+from vine360.masking.semantics import load_mask
 from vine360.models import Project
 from vine360.project import (
     ProjectAlreadyExistsError,
@@ -554,26 +576,6 @@ def _status_dot(status: str) -> QPixmap:
 
 def _job_status_dot(status: str) -> QPixmap:
     return _dot_pixmap(JOB_STATUS_COLOR[status])
-
-
-def _flag_icon(size: int = 14) -> QPixmap:
-    """A small drawn flag glyph -- used instead of the Unicode flag emoji
-    (U+1F6A9), which renders as an empty box here: this machine has no
-    emoji font installed at all (confirmed: `fc-match "Noto Color Emoji"`
-    falls back to plain DejaVu Sans). Drawing icons with QPainter, like
-    the sidebar status dots already do, has no font dependency at all."""
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.Antialiasing)
-    pole_color = QColor(90, 90, 90)
-    painter.setPen(pole_color)
-    painter.drawLine(2, 1, 2, size - 1)
-    painter.setBrush(QColor(210, 60, 50))
-    painter.setPen(Qt.NoPen)
-    painter.drawPolygon([QPoint(3, 1), QPoint(size - 1, 4), QPoint(3, 7)])
-    painter.end()
-    return pixmap
 
 
 class StageIndicator(QWidget):
@@ -1793,9 +1795,26 @@ class ProjectionPanel(QWidget):
             QMessageBox.critical(self, "Unexpected error generating projections", f"{type(exc).__name__}: {exc}")
 
 
-@logged_operation("masks.build", "Masks", target=lambda p: p.get("frame_set_id"), summarize=_summarize_count("masks"))
+def _summarize_mask_build(summary, _conn) -> str:
+    parts = [
+        f"{LAYER_SPECS[layer].label.lower()}: {summary.built[layer]} built, present in {summary.nonempty[layer]}"
+        + (f", {summary.skipped_edited[layer]} hand-edited kept" if summary.skipped_edited.get(layer) else "")
+        for layer in summary.built
+    ]
+    return f"{summary.views} views; " + "; ".join(parts)
+
+
+@logged_operation("masks.build", "Masks", target=lambda p: p.get("frame_set_id"), summarize=_summarize_mask_build)
 def _build_masks_worker(
-    project_root: Path, frame_set_id: str, use_sam3_person: bool, use_sam3_sky: bool, progress_callback=None
+    project_root: Path,
+    frame_set_id: str,
+    use_sam3_person: bool,
+    use_sam3_sky: bool,
+    mask_sky: bool = True,
+    mask_overexposure: bool = False,
+    overexposure_clip: int = 250,
+    overexposure_bloom_radius: int = 40,
+    progress_callback=None,
 ):
     conn = open_index_db(project_root)
     try:
@@ -1805,16 +1824,85 @@ def _build_masks_worker(
             frame_set_id,
             use_sam3_person=use_sam3_person,
             use_sam3_sky=use_sam3_sky,
+            mask_sky=mask_sky,
+            mask_overexposure=mask_overexposure,
+            overexposure_params={"clip_threshold": overexposure_clip, "bloom_radius_px": overexposure_bloom_radius},
             progress_callback=progress_callback,
         )
     finally:
         conn.close()
 
 
+@logged_operation(
+    "masks.layer",
+    "Mask layer",
+    target=lambda p: f"{p.get('layer')} @ {p.get('frame_set_id')}",
+    summarize=_summarize_mask_build,
+)
+def _build_mask_layer_worker(
+    project_root: Path, frame_set_id: str, layer: str, params: dict, overwrite_edited: bool = False, progress_callback=None
+):
+    """Regenerates one layer for a whole frame set, leaving every other
+    layer's files untouched (docs/adr/0038)."""
+    conn = open_index_db(project_root)
+    try:
+        return build_layers_for_frame_set(
+            conn, project_root, frame_set_id, {layer: params},
+            overwrite_edited=overwrite_edited, progress_callback=progress_callback,
+        )
+    finally:
+        conn.close()
+
+
+def _numpy_to_pixmap(image: np.ndarray, max_size: int) -> QPixmap:
+    image = np.ascontiguousarray(image)
+    height, width = image.shape[:2]
+    if image.ndim == 2:
+        qimage = QImage(image.data, width, height, width, QImage.Format_Grayscale8).copy()
+    else:
+        qimage = QImage(image.data, width, height, 3 * width, QImage.Format_RGB888).copy()
+    return QPixmap.fromImage(qimage).scaled(max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
+class _LayerRow:
+    """One row of the Layers box: include-in-build checkbox, its options,
+    a set-wide merge toggle, coverage summary and a Regenerate button."""
+
+    def __init__(self, spec, panel: "MasksPanel"):
+        self.spec = spec
+        self.include = QCheckBox(spec.label)
+        swatch = QPixmap(12, 12)
+        swatch.fill(QColor(*spec.color))
+        self.include.setIcon(QIcon(swatch))
+        self.options = QHBoxLayout()
+        self.merged = QCheckBox("merged")
+        self.merged.setTristate(True)
+        self.merged.setToolTip(
+            "Whether this layer is merged into the keep-mask. Partially checked = on in some views only "
+            "(toggle per view below). Clicking switches it on/off for every view in the frame set "
+            "without regenerating it."
+        )
+        self.merged.clicked.connect(lambda: panel._on_layer_merged_clicked(spec.name))
+        self.coverage = QLabel("not built")
+        self.coverage.setStyleSheet("color: palette(mid);")
+        self.regenerate = QPushButton("Regenerate")
+        self.regenerate.setToolTip(
+            f"Rebuild only the {spec.label.lower()} layer for this frame set with the options on this row; "
+            "other layers are left exactly as they are."
+        )
+        self.regenerate.clicked.connect(lambda: panel._on_regenerate_layer(spec.name))
+
+
 class MasksPanel(QWidget):
-    """Real masking: vine360.masking.build.build_masks_for_frame_set, run off
-    the GUI thread. SAM 3, if requested, loads once for the whole batch
-    (not once per view)."""
+    """Layered masking (docs/adr/0038): each class -- sky, person,
+    overexposure, whole-view exclusion -- is its own layer, merged into the
+    keep-mask that SfM/export read. Layers can be (re)built for a frame set
+    together ("Build Masks") or one at a time ("Regenerate"), and switched
+    on/off per view or for the whole set without rebuilding. Builds run off
+    the GUI thread; SAM 3, if requested, loads once per batch."""
+
+    PREVIEW_SIZE = 560
+    PREVIEW_MODES = ("Overlay", "Original", "Keep mask")
 
     def __init__(self, state: AppState):
         super().__init__()
@@ -1823,9 +1911,18 @@ class MasksPanel(QWidget):
         # torch/transformers to check availability is expensive (roughly
         # 140MB -> 700MB+ RSS observed) and shouldn't cost anything at app
         # startup for users who never open this panel.
+        self._sam3_available = False
         self._choices: dict[str, FrameSetChoice] = {}
+        # The face being reviewed ("front", "left", ...) -- kept across frame
+        # changes so one perspective can be scrubbed through time.
+        self._sticky_face: str | None = None
         layout = QVBoxLayout(self)
-        _panel_header("Masks", "Segment person/sky and build the keep-mask for each view.", layout)
+        _panel_header(
+            "Masks",
+            "Build mask layers (sky, person, overexposure) for each view; they're merged into the keep-mask "
+            "used by pose estimation and export.",
+            layout,
+        )
 
         self.no_project_label = QLabel("Generate projections first (see the Projection stage).")
         layout.addWidget(self.no_project_label)
@@ -1834,7 +1931,7 @@ class MasksPanel(QWidget):
         controls_layout = QVBoxLayout(self.controls)
         controls_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.stage_indicator = StageIndicator(["Build masks", "Review flagged"])
+        self.stage_indicator = StageIndicator(["Build masks", "Review"])
         controls_layout.addWidget(self.stage_indicator)
 
         form = QFormLayout()
@@ -1844,26 +1941,64 @@ class MasksPanel(QWidget):
         form.addRow("Frame set:", self.source_combo)
         controls_layout.addLayout(form)
 
-        sam3_row = QHBoxLayout()
-        self.sam3_person_check = QCheckBox("SAM 3: exclude person")
-        self.sam3_sky_check = QCheckBox("SAM 3: exclude sky (real segmentation)")
-        self.sam3_person_check.setEnabled(False)
-        self.sam3_sky_check.setEnabled(False)
-        sam3_row.addWidget(self.sam3_person_check)
-        sam3_row.addWidget(self.sam3_sky_check)
-        controls_layout.addLayout(sam3_row)
-        self.sam3_note = QLabel(
-            "Sky is always masked -- via real SAM 3 if checked, a classical brightness/color heuristic "
-            "otherwise (coarser; see vine360.masking.classical_sky). Person exclusion has no non-SAM-3 "
-            "fallback: no color/brightness heuristic reliably separates a person from vineyard foliage. "
-            "(Checking SAM 3 availability…)"
+        layers_box = QGroupBox("Layers")
+        grid = QGridLayout(layers_box)
+        self.layer_rows: dict[str, _LayerRow] = {}
+        for row_index, name in enumerate((LAYER_SKY, LAYER_PERSON, LAYER_OVEREXPOSED)):
+            row = _LayerRow(LAYER_SPECS[name], self)
+            self.layer_rows[name] = row
+            grid.addWidget(row.include, row_index, 0)
+            grid.addLayout(row.options, row_index, 1)
+            grid.addWidget(row.merged, row_index, 2)
+            grid.addWidget(row.coverage, row_index, 3)
+            grid.addWidget(row.regenerate, row_index, 4)
+        grid.setColumnStretch(3, 1)
+
+        self.sky_method_combo = QComboBox()
+        self.sky_method_combo.addItem("Classical (brightness/colour)", userData="classical")
+        self.sky_method_combo.addItem("SAM 3 (real segmentation)", userData="sam3")
+        self.layer_rows[LAYER_SKY].options.addWidget(self.sky_method_combo)
+        self.layer_rows[LAYER_SKY].include.setChecked(True)
+        self.layer_rows[LAYER_SKY].include.setToolTip(
+            "The classical sky heuristic treats bright or blue pixels in the upper part of a view as sky -- "
+            "uncheck it for tunnels/indoor captures, where it would cut out white walls and ceilings."
         )
+        person_note = QLabel("SAM 3 only")
+        person_note.setStyleSheet("color: palette(mid);")
+        self.layer_rows[LAYER_PERSON].options.addWidget(person_note)
+
+        over = self.layer_rows[LAYER_OVEREXPOSED]
+        over.include.setToolTip(
+            "Excludes blown-out light sources (e.g. the bright end of a tunnel) and the bloom around them, "
+            "which training otherwise fills with floaters. Only large regions where all three channels are "
+            "clipped count, so properly exposed white surfaces are kept."
+        )
+        over.options.addWidget(QLabel("clip ≥"))
+        self.clip_spin = QSpinBox()
+        self.clip_spin.setRange(200, 255)
+        self.clip_spin.setValue(LAYER_SPECS[LAYER_OVEREXPOSED].default_params["clip_threshold"])
+        self.clip_spin.setToolTip(
+            "A pixel is 'clipped' when all of R, G and B are at least this. Lower it to also catch "
+            "washed-out-but-not-quite-white areas (and risk catching white walls)."
+        )
+        over.options.addWidget(self.clip_spin)
+        over.options.addWidget(QLabel("bloom"))
+        self.bloom_spin = QSpinBox()
+        self.bloom_spin.setRange(0, 300)
+        self.bloom_spin.setSuffix(" px")
+        self.bloom_spin.setValue(LAYER_SPECS[LAYER_OVEREXPOSED].default_params["bloom_radius_px"])
+        self.bloom_spin.setToolTip("How far from a clipped region its bright halo is also excluded.")
+        over.options.addWidget(self.bloom_spin)
+
+        self.sam3_note = QLabel("(Checking SAM 3 availability…)")
         self.sam3_note.setWordWrap(True)
         self.sam3_note.setStyleSheet("color: palette(mid);")
-        controls_layout.addWidget(self.sam3_note)
+        grid.addWidget(self.sam3_note, len(self.layer_rows), 0, 1, 5)
+        controls_layout.addWidget(layers_box)
 
         build_btn_row = QHBoxLayout()
         self.build_btn = QPushButton("Build Masks")
+        self.build_btn.setToolTip("Builds every checked layer for this frame set, then merges them.")
         self.build_btn.clicked.connect(self._on_build)
         build_btn_row.addWidget(self.build_btn)
         self.queue_btn = QPushButton("Add to Queue")
@@ -1875,53 +2010,99 @@ class MasksPanel(QWidget):
         self.progress_area = ProgressArea()
         controls_layout.addWidget(self.progress_area)
 
-        self.flags_summary_label = QLabel("")
-        self.flags_summary_label.setWordWrap(True)
-        controls_layout.addWidget(self.flags_summary_label)
-        self.flags_list = QListWidget()
-        self.flags_list.setMaximumHeight(120)
-        self.flags_list.setVisible(False)
-        self.flags_list.itemDoubleClicked.connect(self._on_flags_list_double_clicked)
-        controls_layout.addWidget(self.flags_list)
-
-        controls_layout.addWidget(QLabel("Preview frame:"))
+        review_box = QGroupBox("Review")
+        review_layout = QVBoxLayout(review_box)
         self.frame_selector = TemporalFrameSelector()
         self.frame_selector.frame_changed.connect(self._refresh_face_combo)
-        controls_layout.addWidget(self.frame_selector)
+        review_layout.addWidget(self.frame_selector)
 
-        review_row = QHBoxLayout()
-        review_row.addWidget(QLabel("View:"))
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel("View:"))
         self.face_combo = QComboBox()
-        self.face_combo.currentIndexChanged.connect(self._refresh_preview)
-        review_row.addWidget(self.face_combo)
-        self.prev_flagged_btn = QPushButton("Previous Flagged")
-        self.prev_flagged_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowLeft))
-        self.prev_flagged_btn.clicked.connect(lambda: self._jump_to_flagged(-1))
-        review_row.addWidget(self.prev_flagged_btn)
-        self.flag_btn = QPushButton("Flag for Review")
-        self.flag_btn.setIcon(QIcon(_flag_icon()))
-        self.flag_btn.setCheckable(True)
-        self.flag_btn.toggled.connect(self._on_flag_toggled)
-        review_row.addWidget(self.flag_btn)
-        self.next_flagged_btn = QPushButton("Next Flagged")
-        self.next_flagged_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowRight))
-        self.next_flagged_btn.clicked.connect(lambda: self._jump_to_flagged(1))
-        review_row.addWidget(self.next_flagged_btn)
-        controls_layout.addLayout(review_row)
+        self.face_combo.setToolTip(
+            "Stays on the same face as you change frame. Keys: ←/→ frame, ↑/↓ face."
+        )
+        self.face_combo.currentIndexChanged.connect(self._on_face_changed)
+        view_row.addWidget(self.face_combo)
+        view_row.addWidget(QLabel("Show:"))
+        self.preview_mode_combo = QComboBox()
+        self.preview_mode_combo.addItems(self.PREVIEW_MODES)
+        self.preview_mode_combo.currentIndexChanged.connect(self._refresh_preview)
+        view_row.addWidget(self.preview_mode_combo)
+        self.exclude_view_btn = QPushButton("Exclude this view")
+        self.exclude_view_btn.setCheckable(True)
+        self.exclude_view_btn.setToolTip(
+            "Drops this whole view from pose estimation and training (its keep-mask becomes all-excluded). "
+            "Toggle again to restore it."
+        )
+        self.exclude_view_btn.toggled.connect(self._on_exclude_view_toggled)
+        view_row.addWidget(self.exclude_view_btn)
+        view_row.addStretch()
+        review_layout.addLayout(view_row)
 
-        self.preview = PreviewGallery("No views generated yet.")
-        controls_layout.addWidget(self.preview)
+        self.view_layers_row = QHBoxLayout()
+        self.view_layers_label = QLabel("Layers in this view:")
+        self.view_layers_row.addWidget(self.view_layers_label)
+        self._view_layer_checks: dict[str, QCheckBox] = {}
+        for name in (LAYER_SKY, LAYER_PERSON, LAYER_OVEREXPOSED):
+            check = QCheckBox(LAYER_SPECS[name].label)
+            check.setToolTip("Merge this layer into this view's keep-mask (doesn't rebuild it).")
+            check.toggled.connect(lambda on, n=name: self._on_view_layer_toggled(n, on))
+            self._view_layer_checks[name] = check
+            self.view_layers_row.addWidget(check)
+        self.view_layers_row.addStretch()
+        review_layout.addLayout(self.view_layers_row)
+
+        self.preview_label = QLabel("No views generated yet.")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumHeight(240)
+        review_layout.addWidget(self.preview_label)
+        self.preview_caption = QLabel("")
+        self.preview_caption.setAlignment(Qt.AlignCenter)
+        self.preview_caption.setStyleSheet("color: palette(mid);")
+        review_layout.addWidget(self.preview_caption)
+
+        suspicious_row = QHBoxLayout()
+        self.suspicious_label = QLabel("")
+        self.suspicious_label.setWordWrap(True)
+        suspicious_row.addWidget(self.suspicious_label, 1)
+        self.prev_suspicious_btn = QPushButton("Previous")
+        self.prev_suspicious_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowLeft))
+        self.prev_suspicious_btn.clicked.connect(lambda: self._jump_to_suspicious(-1))
+        suspicious_row.addWidget(self.prev_suspicious_btn)
+        self.next_suspicious_btn = QPushButton("Next")
+        self.next_suspicious_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowRight))
+        self.next_suspicious_btn.clicked.connect(lambda: self._jump_to_suspicious(1))
+        suspicious_row.addWidget(self.next_suspicious_btn)
+        review_layout.addLayout(suspicious_row)
+        self.suspicious_list = QListWidget()
+        self.suspicious_list.setMaximumHeight(110)
+        self.suspicious_list.itemDoubleClicked.connect(self._on_suspicious_double_clicked)
+        review_layout.addWidget(self.suspicious_list)
+        controls_layout.addWidget(review_box)
 
         layout.addWidget(self.controls)
         self.controls.setVisible(False)
         layout.addStretch()
-        # (frame_id, view_id, keep_fraction, flagged) across the whole
-        # selected source, ordered by (frame time, view_id) -- backs the
-        # previous/next-flagged navigation buttons.
-        self._flat_views: list[tuple[str, str, float | None, bool]] = []
+        # (frame_id, view_id, keep_fraction) across the selected frame set,
+        # ordered by (frame time, view_id).
+        self._flat_views: list[tuple[str, str, float | None]] = []
+        self._suspicious: list[SuspiciousView] = []
+
+        for keys, slot in (
+            ("Left", lambda: self.frame_selector._step(-1)),
+            ("Right", lambda: self.frame_selector._step(1)),
+            ("Up", lambda: self._step_face(-1)),
+            ("Down", lambda: self._step_face(1)),
+        ):
+            shortcut = QShortcut(QKeySequence(keys), review_box)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(slot)
 
         if self.state.queue_manager is not None:
             self.state.queue_manager.queue_changed.connect(self._refresh_run_enabled)
+
+    # -- setup / refresh ------------------------------------------------------
 
     def on_project_changed(self) -> None:
         self.on_shown()
@@ -1930,16 +2111,16 @@ class MasksPanel(QWidget):
         if not self._sam3_checked:
             self._sam3_checked = True
             status = sam3_validate_installation()
-            available = status.torch_installed and status.transformers_installed
-            self.sam3_person_check.setEnabled(available)
-            self.sam3_sky_check.setEnabled(available)
-            if not available:
-                self.sam3_note.setText(
-                    self.sam3_note.text().replace(" (Checking SAM 3 availability…)", "")
-                    + " (SAM 3 unavailable in this environment: torch/transformers not installed.)"
-                )
-            else:
-                self.sam3_note.setText(self.sam3_note.text().replace(" (Checking SAM 3 availability…)", ""))
+            self._sam3_available = status.torch_installed and status.transformers_installed
+            self.sam3_note.setText(
+                "Person exclusion needs SAM 3: no colour/brightness heuristic reliably separates a person "
+                "from foliage. "
+                + ("" if self._sam3_available else "SAM 3 is unavailable here (torch/transformers not installed).")
+            )
+            self.layer_rows[LAYER_PERSON].include.setEnabled(self._sam3_available)
+            self.layer_rows[LAYER_PERSON].regenerate.setEnabled(self._sam3_available)
+            sam3_index = self.sky_method_combo.findData("sam3")
+            self.sky_method_combo.model().item(sam3_index).setEnabled(self._sam3_available)
 
         have_project = self.state.conn is not None
         self.no_project_label.setVisible(not have_project)
@@ -1949,8 +2130,10 @@ class MasksPanel(QWidget):
 
     def refresh_sources(self) -> None:
         previous = self.source_combo.currentData()
+        self.source_combo.blockSignals(True)
         self.source_combo.clear()
         if self.state.conn is None:
+            self.source_combo.blockSignals(False)
             return
         self._choices = {c.frame_set_id: c for c in frame_set_choices(self.state)}
         for choice in self._choices.values():
@@ -1961,6 +2144,7 @@ class MasksPanel(QWidget):
                 detail = f"{choice.view_count} views, {masked}"
             self.source_combo.addItem(f"{choice.name} — {detail}", userData=choice.frame_set_id)
         _restore_combo_selection(self.source_combo, previous)
+        self.source_combo.blockSignals(False)
         has_sources = self.source_combo.count() > 0
         self._has_sources = has_sources
         self.queue_btn.setEnabled(has_sources)
@@ -1968,23 +2152,29 @@ class MasksPanel(QWidget):
         self.progress_area.label.setText("" if has_sources else "No video sources registered yet -- add one on Import.")
         self._refresh_frame_list()
 
+    def _busy(self) -> bool:
+        return bool(self.state.queue_manager and self.state.queue_manager.is_running)
+
     def _refresh_run_enabled(self) -> None:
-        busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
         choice = self._choices.get(self.source_combo.currentData())
         has_views = choice is not None and choice.view_count > 0
-        self.build_btn.setEnabled(has_views and not busy)
+        self.build_btn.setEnabled(has_views and not self._busy())
         self.build_btn.setToolTip(
-            ""
+            "Builds every checked layer for this frame set, then merges them."
             if has_views
             else 'This frame set has no projected views yet -- use "Add to Queue" instead; it will queue '
             "projection automatically ahead of this masking job."
         )
+        for name, row in self.layer_rows.items():
+            needs_sam3 = name == LAYER_PERSON
+            row.regenerate.setEnabled(has_views and not self._busy() and (self._sam3_available or not needs_sam3))
 
     def _refresh_frame_list(self) -> None:
         frame_set_id = self.source_combo.currentData()
         self._flat_views = []
         frames: list[tuple[str, float, int]] = []
         if self.state.conn is not None and frame_set_id is not None:
+            register_legacy_layers(self.state.conn, self.state.project_root, frame_set_id)
             frame_rows = self.state.conn.execute(
                 "SELECT f.frame_id, f.source_time, COUNT(v.view_id) AS view_count "
                 "FROM frames f JOIN views v ON v.frame_id = f.frame_id "
@@ -1993,196 +2183,362 @@ class MasksPanel(QWidget):
             ).fetchall()
             frames = [(fid, t, vc) for fid, t, vc in frame_rows]
             self._flat_views = self.state.conn.execute(
-                "SELECT f.frame_id, v.view_id, m.keep_fraction, COALESCE(m.flagged_for_review, 0) "
+                "SELECT f.frame_id, v.view_id, m.keep_fraction "
                 "FROM views v JOIN frames f ON f.frame_id = v.frame_id LEFT JOIN masks m ON m.view_id = v.view_id "
                 "WHERE f.frame_set_id = ? ORDER BY f.source_time, v.view_id",
                 (frame_set_id,),
             ).fetchall()
-        self.frame_selector.set_frames(frames)  # emits frame_changed -> _refresh_face_combo
+        current_frame = self.frame_selector.current_frame_id()
+        self.frame_selector.blockSignals(True)
+        self.frame_selector.set_frames(frames)
+        if current_frame:
+            self.frame_selector.jump_to_frame_id(current_frame)
+        self.frame_selector.blockSignals(False)
+        self._refresh_layer_summary()
+        self._refresh_suspicious()
         self._update_stage_indicator()
+        self._refresh_face_combo()
+
+    def _refresh_layer_summary(self) -> None:
+        frame_set_id = self.source_combo.currentData()
+        summary = (
+            layer_summary(self.state.conn, frame_set_id)
+            if self.state.conn is not None and frame_set_id is not None
+            else {}
+        )
+        total = len(self._flat_views)
+        for name, row in self.layer_rows.items():
+            info = summary.get(name)
+            row.merged.blockSignals(True)
+            if info is None:
+                row.coverage.setText("not built")
+                row.merged.setCheckState(Qt.Unchecked)
+                row.merged.setEnabled(False)
+            else:
+                edited = f", {info['edited']} hand-edited" if info["edited"] else ""
+                row.coverage.setText(f"built for {info['views']}/{total} views, present in {info['nonempty']}{edited}")
+                row.merged.setEnabled(True)
+                if info["enabled"] == info["views"]:
+                    row.merged.setCheckState(Qt.Checked)
+                elif info["enabled"] == 0:
+                    row.merged.setCheckState(Qt.Unchecked)
+                else:
+                    row.merged.setCheckState(Qt.PartiallyChecked)
+            row.merged.blockSignals(False)
+
+    def _refresh_suspicious(self) -> None:
+        frame_set_id = self.source_combo.currentData()
+        self._suspicious = (
+            find_suspicious_views(self.state.conn, frame_set_id)
+            if self.state.conn is not None and frame_set_id is not None
+            else []
+        )
+        self.suspicious_list.clear()
+        for item in self._suspicious:
+            entry = QListWidgetItem(f"{item.view_id.split(':', 1)[-1]}: {item.reason}")
+            entry.setData(Qt.UserRole, (item.frame_id, item.view_id))
+            self.suspicious_list.addItem(entry)
+        has_any = bool(self._suspicious)
+        self.suspicious_list.setVisible(has_any)
+        self.prev_suspicious_btn.setEnabled(has_any)
+        self.next_suspicious_btn.setEnabled(has_any)
+        has_masks = any(kf is not None for _f, _v, kf in self._flat_views)
+        if has_any:
+            self.suspicious_label.setText(
+                f"{len(self._suspicious)} suspicious view(s): a layer's coverage jumps compared with the same "
+                "view in nearby frames. Double-click to jump; exclude the view or switch the layer off for it if "
+                "it's wrong."
+            )
+        else:
+            self.suspicious_label.setText("No suspicious views." if has_masks else "")
 
     def _update_stage_indicator(self) -> None:
-        has_masks = any(keep_fraction is not None for _, _, keep_fraction, _ in self._flat_views)
+        has_masks = any(keep_fraction is not None for _, _, keep_fraction in self._flat_views)
         if not has_masks:
             self.stage_indicator.set_stages([ACTIVE, PENDING])
         else:
-            any_flagged = any(flagged for _, _, _, flagged in self._flat_views)
-            self.stage_indicator.set_stages([DONE, ACTIVE if any_flagged else DONE])
+            self.stage_indicator.set_stages([DONE, ACTIVE if self._suspicious else DONE])
+
+    # -- review -----------------------------------------------------------------
 
     def _refresh_face_combo(self) -> None:
         self.face_combo.blockSignals(True)
         self.face_combo.clear()
         frame_id = self.frame_selector.current_frame_id()
-        for f_id, view_id, keep_fraction, flagged in self._flat_views:
+        excluded = self._excluded_view_ids()
+        for f_id, view_id, keep_fraction in self._flat_views:
             if f_id != frame_id:
                 continue
             face_name = view_id.split(":")[-1]
-            status = f"keep {keep_fraction:.0%}" if keep_fraction is not None else "unmasked"
-            icon = QIcon(_flag_icon()) if flagged else QIcon()
-            self.face_combo.addItem(icon, f"{face_name} ({status})", userData=view_id)
+            if view_id in excluded:
+                status = "excluded"
+            else:
+                status = f"keep {keep_fraction:.0%}" if keep_fraction is not None else "unmasked"
+            self.face_combo.addItem(f"{face_name} ({status})", userData=view_id)
+        if self._sticky_face is not None:
+            for i in range(self.face_combo.count()):
+                if self.face_combo.itemData(i).split(":")[-1] == self._sticky_face:
+                    self.face_combo.setCurrentIndex(i)
+                    break
         self.face_combo.blockSignals(False)
         self._refresh_preview()
+
+    def _excluded_view_ids(self) -> set[str]:
+        if self.state.conn is None:
+            return set()
+        return {
+            r[0]
+            for r in self.state.conn.execute(
+                "SELECT view_id FROM mask_layers WHERE layer = ? AND enabled = 1", (LAYER_EXCLUDED_VIEW,)
+            )
+        }
+
+    def _on_face_changed(self) -> None:
+        view_id = self._current_view_id()
+        if view_id is not None:
+            self._sticky_face = view_id.split(":")[-1]
+        self._refresh_preview()
+
+    def _step_face(self, delta: int) -> None:
+        count = self.face_combo.count()
+        if count:
+            self.face_combo.setCurrentIndex((self.face_combo.currentIndex() + delta) % count)
 
     def _current_view_id(self) -> str | None:
         return self.face_combo.currentData()
 
     def _refresh_preview(self) -> None:
         view_id = self._current_view_id()
-        self.flag_btn.blockSignals(True)
-        if view_id is None:
-            self.flag_btn.setChecked(False)
-            self.flag_btn.setEnabled(False)
-        else:
-            flagged = any(v == view_id and f for _fr, v, _kf, f in self._flat_views)
-            self.flag_btn.setChecked(bool(flagged))
-            self.flag_btn.setEnabled(any(v == view_id for _fr, v, _kf, _f in self._flat_views))
-        self.flag_btn.blockSignals(False)
+        conn = self.state.conn
+        layers = view_layers(conn, view_id) if conn is not None and view_id is not None else []
+        by_name = {row["layer"]: row for row in layers}
 
-        if self.state.conn is None or view_id is None:
-            self.preview.set_items([])
+        self.exclude_view_btn.blockSignals(True)
+        excluded = by_name.get(LAYER_EXCLUDED_VIEW, {}).get("enabled", False)
+        self.exclude_view_btn.setChecked(bool(excluded))
+        self.exclude_view_btn.setEnabled(view_id is not None)
+        self.exclude_view_btn.blockSignals(False)
+        for name, check in self._view_layer_checks.items():
+            row = by_name.get(name)
+            check.blockSignals(True)
+            check.setVisible(row is not None)
+            if row is not None:
+                check.setChecked(row["enabled"])
+                coverage = f" {row['coverage']:.0%}" if row["coverage"] is not None else ""
+                check.setText(f"{LAYER_SPECS[name].label}{coverage}" + (" (edited)" if row["edited"] else ""))
+            check.blockSignals(False)
+        self.view_layers_label.setText("Layers in this view:" if by_name else "No mask layers built for this view.")
+
+        if conn is None or view_id is None:
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("No views generated yet.")
+            self.preview_caption.setText("")
             return
-        row = self.state.conn.execute("SELECT image_path FROM views WHERE view_id = ?", (view_id,)).fetchone()
-        items = []
-        if row is not None:
-            items.append((self.state.project_root / row[0], "original view"))
-            keep_path = self.state.project_root / "masks" / "keep" / (Path(row[0]).relative_to("projections").as_posix() + ".png")
-            if keep_path.exists():
-                items.append((keep_path, "keep mask"))
-        self.preview.set_items(items)
+        mode = self.preview_mode_combo.currentText()
+        row = conn.execute("SELECT image_path FROM views WHERE view_id = ?", (view_id,)).fetchone()
+        try:
+            if mode == "Overlay":
+                image = render_overlay(conn, self.state.project_root, view_id)
+            elif mode == "Keep mask":
+                keep_path = keep_mask_path(self.state.project_root, Path(row[0]))
+                if not keep_path.exists():
+                    raise FileNotFoundError(keep_path)
+                image = load_mask(keep_path)
+            else:
+                with Image.open(self.state.project_root / row[0]) as img:
+                    image = np.asarray(img.convert("RGB"))
+        except (OSError, MaskLayerError) as exc:
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText(f"Can't show {mode.lower()}: {exc}")
+            self.preview_caption.setText("")
+            return
+        self.preview_label.setText("")
+        self.preview_label.setPixmap(_numpy_to_pixmap(image, self.PREVIEW_SIZE))
+        legend = ", ".join(
+            f"{LAYER_SPECS[r['layer']].label} = {_COLOR_NAMES.get(r['layer'], '')}"
+            for r in layers
+            if r["enabled"] and r["layer"] != LAYER_EXCLUDED_VIEW
+        )
+        self.preview_caption.setText(f"{view_id}" + (f"  —  {legend}" if mode == "Overlay" and legend else ""))
 
-    def _on_flag_toggled(self, checked: bool) -> None:
+    def _after_view_change(self, view_id: str) -> None:
+        """Re-read this view's keep fraction after a toggle and refresh
+        everything that shows it, without rebuilding the frame list."""
+        kf = self.state.conn.execute("SELECT keep_fraction FROM masks WHERE view_id = ?", (view_id,)).fetchone()
+        for i, (frame_id, v, _kf) in enumerate(self._flat_views):
+            if v == view_id:
+                self._flat_views[i] = (frame_id, v, kf[0] if kf else None)
+        self._refresh_layer_summary()
+        self._refresh_suspicious()
+        self._update_stage_indicator()
+        self._refresh_face_combo()
+        self.state.notify_change()
+
+    def _on_exclude_view_toggled(self, checked: bool) -> None:
         view_id = self._current_view_id()
         if self.state.conn is None or view_id is None:
             return
-        try:
-            set_view_flagged(self.state.conn, view_id, checked)
-        except MaskBuildError as exc:
-            QMessageBox.warning(self, "Could not update flag", str(exc))
-            return
-        for i, (frame_id, v, kf, _f) in enumerate(self._flat_views):
-            if v == view_id:
-                self._flat_views[i] = (frame_id, v, kf, checked)
-                break
-        self._refresh_face_combo_labels_only()
-        self._update_stage_indicator()
+        set_view_excluded(self.state.conn, self.state.project_root, view_id, checked)
+        self._after_view_change(view_id)
 
-    def _refresh_face_combo_labels_only(self) -> None:
-        """Updates the face combo's item text/icon (flag marker) without
-        emitting currentIndexChanged / disturbing the current preview."""
-        self.face_combo.blockSignals(True)
-        for i in range(self.face_combo.count()):
-            view_id = self.face_combo.itemData(i)
-            match = next((v for v in self._flat_views if v[1] == view_id), None)
-            if match:
-                _frame_id, _v, keep_fraction, flagged = match
-                face_name = view_id.split(":")[-1]
-                status = f"keep {keep_fraction:.0%}" if keep_fraction is not None else "unmasked"
-                self.face_combo.setItemText(i, f"{face_name} ({status})")
-                self.face_combo.setItemIcon(i, QIcon(_flag_icon()) if flagged else QIcon())
-        self.face_combo.blockSignals(False)
-
-    def _jump_to_flagged(self, direction: int) -> None:
-        flagged_views = [(frame_id, view_id) for frame_id, view_id, _kf, flagged in self._flat_views if flagged]
-        if not flagged_views:
-            QMessageBox.information(self, "No flagged views", "No views are currently flagged for review.")
+    def _on_view_layer_toggled(self, layer: str, enabled: bool) -> None:
+        view_id = self._current_view_id()
+        if self.state.conn is None or view_id is None:
             return
-        current_view_id = self._current_view_id()
-        ids = [v for _f, v in flagged_views]
-        if current_view_id in ids:
-            start = ids.index(current_view_id)
-            target_frame_id, target_view_id = flagged_views[(start + direction) % len(flagged_views)]
-        else:
-            target_frame_id, target_view_id = flagged_views[0]
-        self.frame_selector.jump_to_frame_id(target_frame_id)  # triggers _refresh_face_combo
-        index = self.face_combo.findData(target_view_id)
-        if index >= 0:
-            self.face_combo.setCurrentIndex(index)
+        set_layer_enabled(self.state.conn, self.state.project_root, [view_id], layer, enabled)
+        self._after_view_change(view_id)
+
+    def _on_layer_merged_clicked(self, layer: str) -> None:
+        frame_set_id = self.source_combo.currentData()
+        if self.state.conn is None or frame_set_id is None:
+            return
+        row = self.layer_rows[layer]
+        # A click on a partial/unchecked box turns the layer on everywhere;
+        # on a fully checked box, off everywhere.
+        enable = row.merged.checkState() != Qt.Unchecked
+        set_layer_enabled(
+            self.state.conn, self.state.project_root, frame_set_view_ids(self.state.conn, frame_set_id), layer, enable
+        )
+        self._refresh_frame_list()
+        self.state.notify_change()
+
+    def _jump_to_view(self, frame_id: str, view_id: str) -> None:
+        self._sticky_face = view_id.split(":")[-1]
+        already_there = self.frame_selector.current_frame_id() == frame_id
+        self.frame_selector.jump_to_frame_id(frame_id)  # emits frame_changed -> _refresh_face_combo
+        if already_there:
+            self._refresh_face_combo()
+
+    def _jump_to_suspicious(self, direction: int) -> None:
+        if not self._suspicious:
+            return
+        ids = [s.view_id for s in self._suspicious]
+        current = self._current_view_id()
+        index = (ids.index(current) + direction) % len(ids) if current in ids else 0
+        self.suspicious_list.setCurrentRow(index)
+        target = self._suspicious[index]
+        self._jump_to_view(target.frame_id, target.view_id)
+
+    def _on_suspicious_double_clicked(self, item: QListWidgetItem) -> None:
+        frame_id, view_id = item.data(Qt.UserRole)
+        self._jump_to_view(frame_id, view_id)
+
+    # -- build ----------------------------------------------------------------
+
+    def _build_options(self) -> dict:
+        """The explicit, JSON-friendly arguments _build_masks_worker takes
+        (also the queue job's params)."""
+        sky_method = self.sky_method_combo.currentData()
+        sky_on = self.layer_rows[LAYER_SKY].include.isChecked()
+        return {
+            "use_sam3_person": self.layer_rows[LAYER_PERSON].include.isChecked() and self._sam3_available,
+            "use_sam3_sky": sky_on and sky_method == "sam3",
+            "mask_sky": sky_on,
+            "mask_overexposure": self.layer_rows[LAYER_OVEREXPOSED].include.isChecked(),
+            "overexposure_clip": self.clip_spin.value(),
+            "overexposure_bloom_radius": self.bloom_spin.value(),
+        }
+
+    def _layer_params(self, layer: str) -> dict:
+        if layer == LAYER_SKY:
+            return {"method": self.sky_method_combo.currentData()}
+        if layer == LAYER_OVEREXPOSED:
+            return {"clip_threshold": self.clip_spin.value(), "bloom_radius_px": self.bloom_spin.value()}
+        return {}
+
+    def _options_label(self, options: dict) -> str:
+        parts = []
+        if options["mask_sky"]:
+            parts.append("sky (SAM 3)" if options["use_sam3_sky"] else "sky")
+        if options["use_sam3_person"]:
+            parts.append("person")
+        if options["mask_overexposure"]:
+            parts.append(f"overexposed ≥{options['overexposure_clip']}, bloom {options['overexposure_bloom_radius']}px")
+        return ", ".join(parts) or "nothing"
 
     def _on_add_to_queue(self) -> None:
         choice = self._choices.get(self.source_combo.currentData())
         if choice is None:
             return
-        use_person = self.sam3_person_check.isChecked()
-        use_sky = self.sam3_sky_check.isChecked()
+        options = self._build_options()
+        if not (options["mask_sky"] or options["use_sam3_person"] or options["mask_overexposure"]):
+            QMessageBox.information(self, "No layers selected", "Check at least one layer to build.")
+            return
         self.state.queue_manager.add_job(
             QUEUE_STAGE_MASKS,
             choice.source_id,
-            {"use_sam3_person": use_person, "use_sam3_sky": use_sky},
-            f"Masks — {choice.name} (SAM 3 person={use_person}, sky={use_sky})",
+            options,
+            f"Masks — {choice.name} ({self._options_label(options)})",
             target_frame_set_id=choice.frame_set_id,
+        )
+
+    def _start(self, message: str, worker, *args) -> None:
+        self.build_btn.setEnabled(False)
+        for row in self.layer_rows.values():
+            row.regenerate.setEnabled(False)
+        self.progress_area.start(message)
+        run_in_background(
+            self,
+            worker,
+            self.state.project_root,
+            *args,
+            on_success=self._on_build_success,
+            on_error=self._on_build_error,
+            on_progress=self.progress_area.update_progress,
         )
 
     def _on_build(self) -> None:
         frame_set_id = self.source_combo.currentData()
         if frame_set_id is None:
             return
-        self.build_btn.setEnabled(False)
-        self.flags_summary_label.setText("")
-        self.flags_list.setVisible(False)
-        self.progress_area.start("Building masks…")
-        run_in_background(
-            self,
-            _build_masks_worker,
-            self.state.project_root,
+        options = self._build_options()
+        if not (options["mask_sky"] or options["use_sam3_person"] or options["mask_overexposure"]):
+            QMessageBox.information(self, "No layers selected", "Check at least one layer to build.")
+            return
+        self._start(f"Building masks ({self._options_label(options)})…", _build_masks_worker, frame_set_id, *options.values())
+
+    def _on_regenerate_layer(self, layer: str) -> None:
+        frame_set_id = self.source_combo.currentData()
+        if frame_set_id is None or self.state.conn is None:
+            return
+        overwrite_edited = False
+        info = layer_summary(self.state.conn, frame_set_id).get(layer)
+        if info and info["edited"]:
+            answer = QMessageBox.question(
+                self,
+                "Hand-edited layers",
+                f"{info['edited']} view(s) have a hand-edited {LAYER_SPECS[layer].label.lower()} layer. "
+                "Overwrite those too?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            )
+            if answer == QMessageBox.Cancel:
+                return
+            overwrite_edited = answer == QMessageBox.Yes
+        self._start(
+            f"Regenerating the {LAYER_SPECS[layer].label.lower()} layer…",
+            _build_mask_layer_worker,
             frame_set_id,
-            self.sam3_person_check.isChecked(),
-            self.sam3_sky_check.isChecked(),
-            on_success=self._on_build_success,
-            on_error=self._on_build_error,
-            on_progress=self.progress_area.update_progress,
+            layer,
+            self._layer_params(layer),
+            overwrite_edited,
         )
 
-    def _on_build_success(self, masks) -> None:
+    def _on_build_success(self, summary) -> None:
         self._refresh_run_enabled()
-        self.progress_area.finish(f"Masked {len(masks)} views.")
-
-        flagged = [
-            (m.view_id, is_keep_fraction_anomalous(m.keep_fraction))
-            for m in masks
-            if m.keep_fraction is not None and is_keep_fraction_anomalous(m.keep_fraction)
-        ]
-        self.flags_list.clear()
-        if flagged:
-            self.flags_summary_label.setText(
-                f"{len(flagged)} view(s) auto-flagged for review -- double-click one to jump to it "
-                "(or use Previous/Next Flagged below):"
-            )
-            for view_id, reason in flagged:
-                item = QListWidgetItem(f"{view_id}: {reason}")
-                item.setData(Qt.UserRole, view_id)
-                self.flags_list.addItem(item)
-            self.flags_list.setVisible(True)
-        else:
-            self.flags_summary_label.setText("")
-            self.flags_list.setVisible(False)
-
-        current_frame_id = self.frame_selector.current_frame_id()
-        current_view_id = self._current_view_id()
+        self.progress_area.finish(_summarize_mask_build(summary, None))
         self.refresh_sources()
-        if current_frame_id and self.frame_selector.jump_to_frame_id(current_frame_id) and current_view_id:
-            index = self.face_combo.findData(current_view_id)
-            if index >= 0:
-                self.face_combo.setCurrentIndex(index)
         self.state.notify_change()
-
-    def _on_flags_list_double_clicked(self, item: QListWidgetItem) -> None:
-        view_id = item.data(Qt.UserRole)
-        match = next((v for v in self._flat_views if v[1] == view_id), None)
-        if match is None:
-            return
-        frame_id, _v, _kf, _flagged = match
-        self.frame_selector.jump_to_frame_id(frame_id)
-        index = self.face_combo.findData(view_id)
-        if index >= 0:
-            self.face_combo.setCurrentIndex(index)
 
     def _on_build_error(self, exc: Exception) -> None:
         self._refresh_run_enabled()
         self.progress_area.finish("")
-        if isinstance(exc, MaskBuildError):
+        if isinstance(exc, MaskLayerError):
             QMessageBox.warning(self, "Masking failed", str(exc))
         else:
             QMessageBox.critical(self, "Unexpected error building masks", f"{type(exc).__name__}: {exc}")
+
+
+_COLOR_NAMES = {LAYER_SKY: "blue", LAYER_PERSON: "red", LAYER_OVEREXPOSED: "magenta"}
 
 
 ENGINE_COLMAP_PROJECTIONS = "colmap_projections"

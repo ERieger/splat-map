@@ -9,7 +9,6 @@ from vine360.masking.build import (
     MaskBuildError,
     build_mask_for_view,
     build_masks_for_frame_set,
-    set_view_flagged,
 )
 from vine360.project import create_project, open_index_db
 
@@ -51,14 +50,16 @@ def test_build_mask_for_view_classical_writes_files_and_row(project):
 
     mask = build_mask_for_view(conn, root, view_id)
 
-    assert mask.model == "classical-sky"
+    assert mask.model == "layers:classical"
+    assert mask.prompts == ["sky"]
     assert 0.0 < mask.keep_fraction < 1.0
     keep_path = root / "masks" / "keep" / "frame-1" / "front.png.png"
     assert keep_path.exists()
     assert (root / "masks" / "classes" / view_id / "exclude.png").exists()
 
     row = conn.execute("SELECT model, keep_fraction FROM masks WHERE view_id = ?", (view_id,)).fetchone()
-    assert row[0] == "classical-sky"
+    assert row[0] == "layers:classical"
+    assert (root / "masks" / "classes" / view_id / "sky.png").exists()
     assert row[1] == pytest.approx(mask.keep_fraction)
 
 
@@ -68,60 +69,33 @@ def test_build_mask_for_view_unknown_view_raises(project):
         build_mask_for_view(conn, root, "no-such-view")
 
 
-def test_build_mask_for_view_does_not_flag_normal_keep_fraction(project):
-    root, conn = project
-    view_id = _insert_fake_view(conn, root)  # ~60% kept, within normal range
-
-    mask = build_mask_for_view(conn, root, view_id)
-
-    assert mask.flagged_for_review is False
-    row = conn.execute("SELECT flagged_for_review FROM masks WHERE view_id = ?", (view_id,)).fetchone()
-    assert row[0] == 0
-
-
-def test_build_mask_for_view_auto_flags_anomalous_keep_fraction(project):
-    root, conn = project
-    image_path = root / "projections" / "frame-1" / "front.png"
-    image_path.parent.mkdir(parents=True, exist_ok=True)
-    # No sky-like color anywhere -> the classical heuristic excludes ~nothing,
-    # so keep_fraction lands above the "too much kept" anomaly threshold (0.98).
-    image = np.full((100, 100, 3), fill_value=[34, 90, 34], dtype=np.uint8)
-    Image.fromarray(image, "RGB").save(image_path)
-    conn.execute(
-        "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "
-        "VALUES ('frame-1', 's1', 0.0, '{}', 'x', 'y', 's1')"
-    )
-    conn.execute(
-        "INSERT INTO views (view_id, frame_id, projection_id, width, height, intrinsics, fixed_rotation, image_path) "
-        "VALUES ('frame-1:front', 'frame-1', 'six-face', 100, 100, '{}', '{}', ?)",
-        (str(image_path.relative_to(root)),),
-    )
-    conn.commit()
-
-    mask = build_mask_for_view(conn, root, "frame-1:front")
-
-    assert mask.keep_fraction > 0.98
-    assert mask.flagged_for_review is True
-    row = conn.execute("SELECT flagged_for_review FROM masks WHERE view_id = ?", ("frame-1:front",)).fetchone()
-    assert row[0] == 1
-
-
-def test_set_view_flagged_toggles(project):
+def test_build_mask_for_view_with_sky_off_and_nothing_else_raises(project):
     root, conn = project
     view_id = _insert_fake_view(conn, root)
-    build_mask_for_view(conn, root, view_id)
-
-    set_view_flagged(conn, view_id, True)
-    assert conn.execute("SELECT flagged_for_review FROM masks WHERE view_id = ?", (view_id,)).fetchone()[0] == 1
-
-    set_view_flagged(conn, view_id, False)
-    assert conn.execute("SELECT flagged_for_review FROM masks WHERE view_id = ?", (view_id,)).fetchone()[0] == 0
-
-
-def test_set_view_flagged_unknown_view_raises(project):
-    root, conn = project
     with pytest.raises(MaskBuildError):
-        set_view_flagged(conn, "no-such-view", True)
+        build_mask_for_view(conn, root, view_id, mask_sky=False)
+
+
+def test_build_mask_for_view_overexposure_only_keeps_white_but_unclipped_regions(project):
+    """A tunnel-style view: a clipped exit (255) at the top, a white wall
+    (230) below it. With sky off and overexposure on, only the exit goes."""
+    root, conn = project
+    view_id = _insert_fake_view(conn, root)
+    image = np.full((100, 100, 3), 230, dtype=np.uint8)
+    image[0:30, 30:70] = 255
+    image[60:, :] = [80, 80, 80]
+    Image.fromarray(image, "RGB").save(root / "projections" / "frame-1" / "front.png")
+
+    mask = build_mask_for_view(
+        conn, root, view_id, mask_sky=False, mask_overexposure=True,
+        overexposure_params={"bloom_radius_px": 0, "dilation_px": 0},
+    )
+
+    assert mask.prompts == ["overexposed"]
+    keep = np.asarray(Image.open(root / "masks" / "keep" / "frame-1" / "front.png.png"))
+    assert keep[10, 50] == 0  # clipped exit excluded
+    assert keep[45, 10] == 255  # white-but-unclipped wall kept
+    assert not (root / "masks" / "classes" / view_id / "sky.png").exists()
 
 
 def test_keep_mask_excludes_sky_region(project):
@@ -148,11 +122,14 @@ def test_build_masks_for_frame_set_processes_all_views_and_reports_progress(proj
     conn.commit()
 
     messages = []
-    masks = build_masks_for_frame_set(conn, root, "s1", progress_callback=lambda m, c, t: messages.append((m, c, t)))
+    summary = build_masks_for_frame_set(conn, root, "s1", progress_callback=lambda m, c, t: messages.append((m, c, t)))
 
-    assert len(masks) == 2
-    assert messages[0] == ("Masking view 1/2…", 0, 2)
+    assert summary.views == 2
+    assert summary.built == {"sky": 2}
+    assert messages[0] == ("Masking (sky): view 1/2", 0, 2)
     assert messages[-1][1:] == (2, 2)
+    assert messages[-1][0].startswith("Masked 2 views")
+    assert conn.execute("SELECT COUNT(*) FROM masks").fetchone()[0] == 2
 
 
 def test_build_masks_for_frame_set_no_views_raises(project):
@@ -171,6 +148,6 @@ def test_build_mask_for_view_with_real_sam3_sky(project):
 
     mask = build_mask_for_view(conn, root, view_id, use_sam3_sky=True)
 
-    assert mask.model == "sam3"
+    assert mask.model == "layers:sam3"
     keep = np.asarray(Image.open(root / "masks" / "keep" / "frame-1" / "front.png.png"))
     assert keep[10, 50] == 0, "sky region should be excluded by real SAM3 inference"

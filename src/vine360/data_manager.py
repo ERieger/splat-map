@@ -192,6 +192,11 @@ def delete_masks_for_frame_set(conn: sqlite3.Connection, project_root: Path, fra
         (frame_set_id,),
     ):
         by_frame.setdefault(frame_id, []).append(view_id)
+    conn.execute(
+        "DELETE FROM mask_layers WHERE view_id IN (SELECT v.view_id FROM views v JOIN frames f "
+        "ON f.frame_id = v.frame_id WHERE f.frame_set_id = ?)",
+        (frame_set_id,),
+    )
     cursor = conn.execute(
         "DELETE FROM masks WHERE view_id IN (SELECT v.view_id FROM views v JOIN frames f "
         "ON f.frame_id = v.frame_id WHERE f.frame_set_id = ?)",

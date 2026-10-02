@@ -120,6 +120,9 @@ def run_sfm_for_project(
             ).fetchall()
             missing_message = f"no projected views found for frame set {frame_set_id}; generate projections first"
         image_names = [Path(r[0]).relative_to("projections").as_posix() for r in rows]
+        from vine360.masking.layers import ensure_composites_current  # numpy/Pillow; projections path only
+
+        ensure_composites_current(conn, project_root, frame_set_id)  # merge mask layers (docs/adr/0038)
         mask_dir = project_root / "masks" / "keep"
         mask_dir_arg = mask_dir if mask_dir.exists() and any(mask_dir.rglob("*.png")) else None
     elif image_source == "frames":
