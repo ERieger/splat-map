@@ -112,6 +112,7 @@ def test_delete_frame_set_cascades_and_leaves_the_sibling_alone(project):
     assert _count(conn, "SELECT COUNT(*) FROM frames WHERE frame_set_id = 's1~i0.5'") == 0
     assert {r[0] for r in conn.execute("SELECT view_id FROM views")} == set(kept_views)
     assert {r[0] for r in conn.execute("SELECT view_id FROM masks")} == set(kept_views)
+    assert {r[0] for r in conn.execute("SELECT DISTINCT view_id FROM mask_layers")} == set(kept_views)
     assert not (root / "frames" / "s1~i0.5").exists()
     for frame_id in doomed:
         assert not (root / "projections" / frame_id).exists()
@@ -133,6 +134,7 @@ def test_delete_views_keeps_frames_and_removes_their_masks(project):
     assert _count(conn, "SELECT COUNT(*) FROM frames") == len(frames)
     assert _count(conn, "SELECT COUNT(*) FROM views") == 0
     assert _count(conn, "SELECT COUNT(*) FROM masks") == 0
+    assert _count(conn, "SELECT COUNT(*) FROM mask_layers") == 0
     assert all(not (root / "projections" / f).exists() for f in frames)
     assert all(not (root / "masks" / "keep" / f).exists() for f in frames)
     assert all(not (root / "masks" / "classes" / v).exists() for v in view_ids)
@@ -150,6 +152,7 @@ def test_delete_masks_keeps_frames_and_views(project):
 
     assert _count(conn, "SELECT COUNT(*) FROM views") == len(view_ids) + len(other_views)
     assert {r[0] for r in conn.execute("SELECT view_id FROM masks")} == set(other_views)
+    assert {r[0] for r in conn.execute("SELECT DISTINCT view_id FROM mask_layers")} == set(other_views)
     assert all((root / "projections" / f).exists() for f in frames)
     assert all(not (root / "masks" / "keep" / f).exists() for f in frames)
     assert all(not (root / "masks" / "classes" / v).exists() for v in view_ids)

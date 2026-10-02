@@ -2022,6 +2022,8 @@ class MasksPanel(QWidget):
         self.face_combo.setToolTip(
             "Stays on the same face as you change frame. Keys: ←/→ frame, ↑/↓ face."
         )
+        self.face_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.face_combo.setMinimumContentsLength(18)
         self.face_combo.currentIndexChanged.connect(self._on_face_changed)
         view_row.addWidget(self.face_combo)
         view_row.addWidget(QLabel("Show:"))

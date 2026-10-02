@@ -197,6 +197,19 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
   (CLAUDE.md). pycolmap and SphereSfM both use the GPU (`sfm-cuda` extra; CUDA build of
   SphereSfM).
 
+**Layered masks, overexposure layer, review fixes (ADR 0038).**
+- Each mask class (sky, person, overexposure, excluded view) is its own layer under
+  `masks/classes/<view_id>/`, merged into `masks/keep` on every change and re-checked before
+  SfM and export.
+- A layer can be regenerated, switched on/off per view or per set, or hand-edited outside the
+  app without rebuilding the others.
+- The new overexposure layer masks large fully clipped regions and their bloom while keeping white
+  surfaces. It was checked by eye on real FMC-Tunnel1 views.
+- Classical sky is now optional.
+- Review keeps the selected face across frames and shows a colour overlay.
+- "Flag for review" is replaced by "Exclude this view" and a list of suspicious views (coverage
+  jumps compared with the same face in nearby frames).
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -268,6 +281,8 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
       native log capture -- never DB polling) and a per-project activity log.
 0036: SphereSfM engine (CLI via Runner, TXT models -- never pycolmap) and
       pinhole export of 360 runs via measured frame->view pose conversion.
+0038: layered masks (per-class PNG + mask_layers row, composite keep-mask
+      rebuilt on change), clipping-based overexposure layer, review that acts.
 
 ## Blockers / known gaps
 
