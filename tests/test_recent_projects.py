@@ -19,9 +19,33 @@ from vine360.recent_projects import (
 def test_config_dir_honours_override_then_xdg(monkeypatch, tmp_path):
     monkeypatch.setenv("VINE360_CONFIG_DIR", str(tmp_path / "override"))
     assert config_dir() == tmp_path / "override"
+    assert config_dir("win32") == tmp_path / "override"  # override wins on every OS
     monkeypatch.delenv("VINE360_CONFIG_DIR")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-    assert config_dir() == tmp_path / "xdg" / "vine360"
+    assert config_dir("linux") == tmp_path / "xdg" / "vine360"
+
+
+def test_config_dir_linux_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("VINE360_CONFIG_DIR")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert config_dir("linux") == tmp_path / ".config" / "vine360"
+
+
+def test_config_dir_windows(monkeypatch, tmp_path):
+    monkeypatch.delenv("VINE360_CONFIG_DIR")
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    assert config_dir("win32") == tmp_path / "Roaming" / "vine360"
+    monkeypatch.delenv("APPDATA")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert config_dir("win32") == tmp_path / "AppData" / "Roaming" / "vine360"
+
+
+def test_config_dir_macos(monkeypatch, tmp_path):
+    monkeypatch.delenv("VINE360_CONFIG_DIR")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "ignored"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert config_dir("darwin") == tmp_path / "Library" / "Application Support" / "vine360"
 
 
 def test_empty_when_no_file():

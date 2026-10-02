@@ -1,8 +1,10 @@
 """Per-device list of recently opened projects (docs/adr/0038).
 
 Stored as JSON in the user's config directory, never inside a project or
-the repository: ``$VINE360_CONFIG_DIR`` if set, else
-``$XDG_CONFIG_HOME/vine360``, else ``~/.config/vine360``. Stdlib-only, like
+the repository: ``$VINE360_CONFIG_DIR`` if set, else the OS convention --
+``%APPDATA%\\vine360`` on Windows, ``~/Library/Application Support/vine360``
+on macOS, ``$XDG_CONFIG_HOME/vine360`` (default ``~/.config/vine360``)
+elsewhere. Stdlib-only, like
 ``vine360.config``, so it carries no Qt dependency and is tested directly.
 
 A missing or corrupt file reads as an empty list -- this is a convenience,
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,12 +34,21 @@ class RecentProject:
         return (Path(self.path) / "project.yaml").is_file()
 
 
-def config_dir() -> Path:
+def config_dir(platform: str | None = None) -> Path:
+    """The per-user config directory for this OS. ``platform`` defaults to
+    ``sys.platform`` and exists so each branch can be tested anywhere."""
     override = os.environ.get("VINE360_CONFIG_DIR")
     if override:
         return Path(override)
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg) if xdg else Path.home() / ".config"
+    platform = platform or sys.platform
+    if platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    elif platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        base = Path(xdg) if xdg else Path.home() / ".config"
     return base / "vine360"
 
 

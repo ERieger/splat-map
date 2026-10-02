@@ -18,10 +18,23 @@ list" forgets an entry without touching the folder. An entry whose folder no lon
 `project.yaml` stays listed, greyed and marked "(missing)", rather than silently disappearing,
 since a drive that isn't mounted yet is a normal reason for it.
 
-**Stored as JSON in the user's config directory**: `$VINE360_CONFIG_DIR` if set, else
-`$XDG_CONFIG_HOME/vine360`, else `~/.config/vine360/recent_projects.json`. That's outside every
-project and the repo, so it is never committed. Paths are stored resolved, so the same project
-opened through two spellings is one entry.
+**Stored as `recent_projects.json` in the user's config directory**, following each OS's
+convention so the app behaves the same wherever it's installed:
+
+| OS      | Directory                                                        |
+|---------|------------------------------------------------------------------|
+| Windows | `%APPDATA%\vine360` (fallback `~\AppData\Roaming\vine360`)       |
+| macOS   | `~/Library/Application Support/vine360`                          |
+| Linux   | `$XDG_CONFIG_HOME/vine360` (default `~/.config/vine360`)         |
+
+`$VINE360_CONFIG_DIR` overrides all of them (e.g. a per-checkout `./.vine360/` for development,
+gitignored). That's outside every project and the repo, so it is never committed. Paths are
+stored resolved, so the same project opened through two spellings is one entry.
+
+**Considered and rejected: a gitignored file inside the repo.** An installed copy (pip, a
+packaged Windows build) has no repo and its install directory may be read-only; every checkout or
+worktree would keep a separate list; and `git clean -fdx` or a reinstall would wipe it. The list
+belongs to the user, not to a copy of the source.
 
 **Logic is in the Qt-free, stdlib-only `vine360.recent_projects`**, tested directly. QSettings
 was the alternative; a plain module keeps the file location explicit and testable without Qt.
