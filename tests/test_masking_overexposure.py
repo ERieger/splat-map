@@ -41,9 +41,29 @@ def test_white_walls_are_not_masked():
 
 
 def test_small_glints_are_ignored():
-    image = np.full((200, 200, 3), 120, dtype=np.uint8)
-    image[50:54, 50:54] = 255  # 16 px, well under 0.2% of 40000 px
+    image = np.full((400, 400, 3), 120, dtype=np.uint8)
+    image[50:54, 50:54] = 255  # 16 px, well under 0.02% of 160000 px
+    image[200:203, 300:303] = 255
     assert not (classify_overexposed(image) > 127).any()
+
+
+def test_distant_tunnel_end_is_masked():
+    # A far exit ~0.05% of a 1024^2 view: the 0.2% minimum of ADR 0038
+    # dropped these as glints, along with the glow around them.
+    image = np.full((1024, 1024, 3), 120, dtype=np.uint8)
+    image[500:523, 500:523] = 255
+    assert (classify_overexposed(image, NO_DILATION) > 127)[511, 511]
+
+
+def test_fragmented_clipped_area_counts_as_one_core():
+    # Sky through leaves / an exit behind railings: many clipped pieces,
+    # each under the minimum, a couple of pixels apart.
+    image = np.full((1024, 1024, 3), 120, dtype=np.uint8)
+    for y in range(400, 460, 6):
+        for x in range(400, 460, 6):
+            image[y : y + 4, x : x + 4] = 255  # 16 px each, 100 pieces
+    mask = classify_overexposed(image, NO_DILATION) > 127
+    assert mask[401, 401] and mask[455, 455]
 
 
 def test_evenly_lit_bright_wall_beside_an_opening_is_kept():

@@ -1,7 +1,7 @@
 """A weights-free mask for blown-out light sources and their bloom -- e.g.
 the overexposed end of a tunnel, or a sun-washed opening in a building --
 which 3DGS training otherwise tries to explain with floaters strung along
-every ray that saw the glare (docs/adr/0038, 0042).
+every ray that saw the glare (docs/adr/0038, 0042, 0043).
 
 The point is to exclude *clipped* regions without excluding merely *white*
 ones. A white wall in a usable exposure sits around 200-245 and still has
@@ -11,9 +11,15 @@ bright halo (bloom) that fades away from it. So:
 
 1. Core: pixels where min(R, G, B) >= clip_threshold -- every channel
    clipped, not just bright.
-2. Drop cores smaller than min_core_fraction of the view -- specular glints
-   on a wall, a sunlit post -- they don't produce floaters worth losing
-   pixels over.
+2. Drop cores smaller than min_core_fraction of the view (0.02%, ~14x14 px
+   at 1024^2) -- specular glints on a wall -- they don't produce floaters
+   worth losing pixels over. Clipped fragments within _CORE_GROUP_PX of each
+   other count as one core, so a blown area broken up by the scene in front
+   of it (sky through leaves, a far tunnel end behind a railing) isn't
+   dropped piece by piece -- as long as at least _CORE_MIN_DENSITY of the
+   group is clipped, so specks scattered through sunlit texture don't
+   add up to a core. ADR 0038's 0.2% also dropped distant tunnel ends
+   and light fixtures, and with them the glow around them (ADR 0043).
 3. Glare: pixels with luma >= _GLARE_THRESHOLD (230) within
    _GLARE_RADIUS_PX (40, capped at bloom_radius_px) of a core, in a bright
    component touching it -- the washed-out rim of the opening and whatever
@@ -56,7 +62,7 @@ from vine360.masking.semantics import MASK_FALSE, MASK_TRUE
 
 # Bumped whenever the algorithm changes, so a layer's method_version says
 # which one built it.
-METHOD_VERSION = "2"
+METHOD_VERSION = "3"
 
 # Bloom is low-frequency, so it's flooded at reduced resolution: fast, and
 # the averaging suppresses codec noise and brick mortar lines.
@@ -66,12 +72,17 @@ _BLOOM_MIN_FALLOFF = 0.1  # luma drop required per reduced-resolution step
 _TEXTURE_WINDOW_PX = 9
 _GLARE_THRESHOLD = 230
 _GLARE_RADIUS_PX = 40
+_CORE_GROUP_PX = 4
+# A group must be mostly clipped: real blown areas measured 0.35-0.87 on
+# FMC-Tunnel1, while clipped specks scattered through sunlit texture form
+# big but sparse groups.
+_CORE_MIN_DENSITY = 0.3
 
 
 @dataclass(frozen=True)
 class OverexposureConfig:
     clip_threshold: int = 250
-    min_core_fraction: float = 0.002
+    min_core_fraction: float = 0.0002
     bloom_threshold: int = 185
     bloom_radius_px: int = 160
     bloom_max_texture: float = 12.0
@@ -150,16 +161,17 @@ def classify_overexposed(image: np.ndarray, config: OverexposureConfig = Overexp
     height, width = image.shape[:2]
     core = image.min(axis=-1) >= config.clip_threshold
 
-    labeled, count = ndimage.label(core)
-    if count == 0:
+    if not core.any():
         return np.zeros((height, width), dtype=np.uint8)
-    sizes = np.bincount(labeled.ravel())
+    groups, count = ndimage.label(ndimage.binary_dilation(core, structure=_disc(_CORE_GROUP_PX)))
+    sizes = np.bincount(groups[core], minlength=count + 1)  # clipped pixels per group
     sizes[0] = 0
+    density = sizes / np.maximum(np.bincount(groups.ravel(), minlength=count + 1), 1)
     min_area = config.min_core_fraction * height * width
-    big = np.flatnonzero(sizes >= min_area)
+    big = np.flatnonzero((sizes >= min_area) & (density >= _CORE_MIN_DENSITY))
     if big.size == 0:
         return np.zeros((height, width), dtype=np.uint8)
-    core = np.isin(labeled, big)
+    core &= np.isin(groups, big)
 
     mask = core
     if config.bloom_radius_px > 0:

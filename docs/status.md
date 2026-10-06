@@ -244,6 +244,13 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
   Nothing the old mask covered is lost. Existing masks change only when rebuilt (layer
   `method_version` 2).
 
+**Overexposure: small and fragmented blown areas (ADR 0043).**
+- Distant tunnel ends and light fittings were dropped as "glints" (0.2% minimum), and so was the
+  glow around them. The minimum is now 0.02% of the view, and clipped pieces within 4 px of each
+  other count as one area if at least 30% of it is clipped.
+- On 500 FMC-Tunnel1 views, views with clipped pixels but an empty layer drop from 74 to 5, and
+  unmasked near-clipped area per view roughly halves (layer `method_version` 3).
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -323,6 +330,8 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
       graphical direction picker drawn over the frame's own panorama.
 0042: overexposure bloom as a quarter-res flood that follows the halo's falloff, limited by
       a luma floor, reach and texture; ADR 0038's bloom kept as the seed.
+0043: overexposure cores down to 0.02% of a view, clipped fragments grouped within 4 px
+      (groups must be >= 30% clipped) -- far tunnel ends and light fittings.
 
 ## Blockers / known gaps
 
