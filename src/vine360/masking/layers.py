@@ -39,6 +39,7 @@ import numpy as np
 from PIL import Image
 
 from vine360.masking.classical_sky import classify_sky_classical
+from vine360.masking.overexposure import METHOD_VERSION as OVEREXPOSURE_METHOD_VERSION
 from vine360.masking.overexposure import OverexposureConfig, classify_overexposed
 from vine360.masking.semantics import (
     MASK_FALSE,
@@ -99,6 +100,7 @@ LAYER_SPECS: dict[str, LayerSpec] = {
             "min_core_fraction": OverexposureConfig.min_core_fraction,
             "bloom_threshold": OverexposureConfig.bloom_threshold,
             "bloom_radius_px": OverexposureConfig.bloom_radius_px,
+            "bloom_max_texture": OverexposureConfig.bloom_max_texture,
             "dilation_px": OverexposureConfig.dilation_px,
         },
     ),
@@ -164,6 +166,7 @@ def compute_layer(image: np.ndarray, layer: str, params: dict, sam3_adapter=None
             min_core_fraction=float(params["min_core_fraction"]),
             bloom_threshold=int(params["bloom_threshold"]),
             bloom_radius_px=int(params["bloom_radius_px"]),
+            bloom_max_texture=float(params.get("bloom_max_texture", OverexposureConfig.bloom_max_texture)),
             dilation_px=int(params["dilation_px"]),
         )
         return classify_overexposed(image, config)
@@ -329,7 +332,12 @@ def build_layers_for_views(
                 with Image.open(project_root / _view_image_path(conn, view_id)) as img:
                     image = np.asarray(img.convert("RGB"))
             mask = compute_layer(image, layer, params, sam3_adapter)
-            version = getattr(sam3_adapter, "model_id", "1") if params.get("method") == "sam3" else "1"
+            if params.get("method") == "sam3":
+                version = getattr(sam3_adapter, "model_id", "1")
+            elif layer == LAYER_OVEREXPOSED:
+                version = OVEREXPOSURE_METHOD_VERSION
+            else:
+                version = "1"
             enabled = bool(row[0]) if row is not None else True
             coverage = _write_layer(
                 conn, project_root, view_id, layer, mask, params["method"], str(version), params, enabled=enabled

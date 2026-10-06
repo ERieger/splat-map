@@ -235,6 +235,15 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
 - Not yet tried on a real tunnel capture through SfM -- whether the tunnel preset actually
   registers better than the cardinal faces is still to be measured.
 
+**Overexposure halo flood (ADR 0042).**
+- The overexposure layer now also masks the glow around a blown light source, not just the
+  clipped core and a 40 px rim. It floods outward from the core over smooth areas that keep
+  getting darker away from the light (default reach 160 px). Textured bright surfaces, such as a
+  sunlit hillside, and evenly lit walls stop the flood.
+- On FMC-Tunnel1 tunnel exits, coverage roughly doubles or triples (frame 60 front 1.8% → 4.7%).
+  Nothing the old mask covered is lost. Existing masks change only when rebuilt (layer
+  `method_version` 2).
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -312,6 +321,8 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
       generated from OPTION_SPECS, defaults == each engine's own defaults.
 0041: 26-direction view catalog (45° yaw steps, tilted rings, legacy six unchanged) and a
       graphical direction picker drawn over the frame's own panorama.
+0042: overexposure bloom as a quarter-res flood that follows the halo's falloff, limited by
+      a luma floor, reach and texture; ADR 0038's bloom kept as the seed.
 
 ## Blockers / known gaps
 

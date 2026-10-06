@@ -1,7 +1,7 @@
 """A weights-free mask for blown-out light sources and their bloom -- e.g.
 the overexposed end of a tunnel, or a sun-washed opening in a building --
 which 3DGS training otherwise tries to explain with floaters strung along
-every ray that saw the glare (docs/adr/0038).
+every ray that saw the glare (docs/adr/0038, 0042).
 
 The point is to exclude *clipped* regions without excluding merely *white*
 ones. A white wall in a usable exposure sits around 200-245 and still has
@@ -14,18 +14,35 @@ bright halo (bloom) that fades away from it. So:
 2. Drop cores smaller than min_core_fraction of the view -- specular glints
    on a wall, a sunlit post -- they don't produce floaters worth losing
    pixels over.
-3. Bloom: pixels with luma >= bloom_threshold that lie within
-   bloom_radius_px of a surviving core *and* belong to a bright connected
-   region that touches it. A white wall is never masked on its own account,
-   and the halo can't run the length of an adjoining bright wall.
-4. Dilate the result by dilation_px to catch the soft edge of the bloom.
+3. Glare: pixels with luma >= _GLARE_THRESHOLD (230) within
+   _GLARE_RADIUS_PX (40, capped at bloom_radius_px) of a core, in a bright
+   component touching it -- the washed-out rim of the opening and whatever
+   is seen, barely, through it. (This was all of "bloom" in ADR 0038.)
+4. Halo: flood outward from core + glare, on a smoothed quarter-
+   resolution luma image, into pixels that are
+   - at least bloom_threshold bright,
+   - within bloom_radius_px of a core,
+   - smooth (local luma std <= bloom_max_texture: glare washes detail out,
+     while a sunlit hillside or a lit textured wall keeps it), and
+   - darker than the neighbour the flood came from by at least
+     _BLOOM_MIN_FALLOFF -- bloom fades away from the light, so the flood
+     follows that falloff and stops on a plateau. An evenly lit white wall
+     beside an opening isn't swallowed just for being bright and close.
+   Then fill any holes the flood encloses.
+5. Dilate the result by dilation_px (a disc, not a square) to catch the
+   soft edge of the bloom.
+
+The first version (ADR 0038) stopped at step 3. On real tunnel footage the
+halo is a long, gentle ramp (~235 down to ~190 over 150+ px on a ~170 wall)
+broken up by brick texture, so it masked little more than the clipped
+opening itself (ADR 0042).
 
 Known limits: a white surface that is itself fully clipped over a large
 area (direct sun on white render) *is* masked -- but clipped pixels carry no
-information for training anyway. Bloom fainter than bloom_threshold is left
-in; raise bloom_radius_px / lower bloom_threshold for heavier blooming.
-Verified only against synthetic images in tests/test_masking_overexposure.py
-and by eye on real tunnel views; there is no ground truth for "bloom".
+information for training anyway. Tuned and checked by eye against real
+FMC-Tunnel1 views (tunnel exits, light fixtures, sunlit stairs under a
+blown sky) and synthetic images in tests/test_masking_overexposure.py;
+there is no ground truth for "bloom".
 """
 
 from __future__ import annotations
@@ -37,18 +54,42 @@ from scipy import ndimage
 
 from vine360.masking.semantics import MASK_FALSE, MASK_TRUE
 
+# Bumped whenever the algorithm changes, so a layer's method_version says
+# which one built it.
+METHOD_VERSION = "2"
+
+# Bloom is low-frequency, so it's flooded at reduced resolution: fast, and
+# the averaging suppresses codec noise and brick mortar lines.
+_BLOOM_SCALE = 4
+_BLOOM_SMOOTHING_SIGMA = 2.0  # in reduced-resolution pixels
+_BLOOM_MIN_FALLOFF = 0.1  # luma drop required per reduced-resolution step
+_TEXTURE_WINDOW_PX = 9
+_GLARE_THRESHOLD = 230
+_GLARE_RADIUS_PX = 40
+
 
 @dataclass(frozen=True)
 class OverexposureConfig:
     clip_threshold: int = 250
     min_core_fraction: float = 0.002
-    bloom_threshold: int = 230
-    bloom_radius_px: int = 40
+    bloom_threshold: int = 185
+    bloom_radius_px: int = 160
+    bloom_max_texture: float = 12.0
     dilation_px: int = 6
 
 
 def _luma(rgb: np.ndarray) -> np.ndarray:
     return 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+
+
+def _disc(radius: int) -> np.ndarray:
+    yy, xx = np.ogrid[-radius : radius + 1, -radius : radius + 1]
+    return xx * xx + yy * yy <= radius * radius
+
+
+def _downsample(values: np.ndarray, scale: int) -> np.ndarray:
+    height, width = values.shape[0] // scale, values.shape[1] // scale
+    return values[: height * scale, : width * scale].reshape(height, scale, width, scale).mean(axis=(1, 3))
 
 
 def _components_touching(candidate: np.ndarray, seed: np.ndarray) -> np.ndarray:
@@ -58,6 +99,50 @@ def _components_touching(candidate: np.ndarray, seed: np.ndarray) -> np.ndarray:
     hit = np.unique(labeled[seed & candidate])
     hit = hit[hit != 0]
     return np.isin(labeled, hit)
+
+
+def _glare(luma: np.ndarray, core: np.ndarray, radius: float) -> np.ndarray:
+    near = ndimage.distance_transform_edt(~core) <= radius
+    return _components_touching(((luma >= _GLARE_THRESHOLD) & near) | core, core)
+
+
+def _bloom(luma: np.ndarray, core: np.ndarray, config: OverexposureConfig) -> np.ndarray:
+    """Full-resolution boolean glare + halo region grown from core (core included)."""
+    seed = _glare(luma, core, min(_GLARE_RADIUS_PX, config.bloom_radius_px))
+    height, width = core.shape
+    scale = _BLOOM_SCALE
+    if height < scale or width < scale:
+        return seed
+    mean = ndimage.uniform_filter(luma, _TEXTURE_WINDOW_PX)
+    mean_sq = ndimage.uniform_filter(luma * luma, _TEXTURE_WINDOW_PX)
+    texture = np.sqrt(np.maximum(mean_sq - mean * mean, 0.0))
+
+    small_luma = ndimage.gaussian_filter(_downsample(luma, scale), _BLOOM_SMOOTHING_SIGMA)
+    small_texture = ndimage.gaussian_filter(_downsample(texture, scale), _BLOOM_SMOOTHING_SIGMA)
+    small_core = _downsample(core.astype(np.float32), scale) > 0  # any clipped pixel: keeps thin tubes
+    small_seed = _downsample(seed.astype(np.float32), scale) >= 0.5
+    if not small_seed.any():
+        return seed
+    radius = config.bloom_radius_px / scale
+    allowed = (
+        (small_luma >= config.bloom_threshold)
+        & (small_texture <= config.bloom_max_texture)
+        & (ndimage.distance_transform_edt(~small_core) <= radius)  # reach is from the clipped core itself
+    )
+
+    region = small_seed.copy()
+    neighbourhood = np.ones((3, 3), dtype=bool)
+    for _ in range(int(np.ceil(radius)) * 2):  # a path can wind; the distance cap still bounds it
+        brightest_neighbour = ndimage.maximum_filter(np.where(region, small_luma, -np.inf), footprint=neighbourhood)
+        grow = allowed & ~region & (small_luma <= brightest_neighbour - _BLOOM_MIN_FALLOFF)
+        if not grow.any():
+            break
+        region |= grow
+
+    full = np.zeros((height, width), dtype=bool)
+    upsampled = np.kron(region, np.ones((scale, scale), dtype=bool))
+    full[: upsampled.shape[0], : upsampled.shape[1]] = upsampled
+    return ndimage.binary_fill_holes(full | seed)
 
 
 def classify_overexposed(image: np.ndarray, config: OverexposureConfig = OverexposureConfig()) -> np.ndarray:
@@ -78,11 +163,8 @@ def classify_overexposed(image: np.ndarray, config: OverexposureConfig = Overexp
 
     mask = core
     if config.bloom_radius_px > 0:
-        bright = _luma(image.astype(np.float32)) >= config.bloom_threshold
-        near = ndimage.distance_transform_edt(~core) <= config.bloom_radius_px
-        mask = _components_touching((bright & near) | core, core)
+        mask = _bloom(_luma(image.astype(np.float32)), core, config)
 
     if config.dilation_px > 0:
-        structure = np.ones((2 * config.dilation_px + 1, 2 * config.dilation_px + 1), dtype=bool)
-        mask = ndimage.binary_dilation(mask, structure=structure)
+        mask = ndimage.binary_dilation(mask, structure=_disc(config.dilation_px))
     return np.where(mask, MASK_TRUE, MASK_FALSE).astype(np.uint8)

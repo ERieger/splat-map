@@ -96,5 +96,5 @@ def test_build_options_are_explicit_worker_arguments(panel):
         "mask_sky": True,
         "mask_overexposure": True,
         "overexposure_clip": 245,
-        "overexposure_bloom_radius": 40,
+        "overexposure_bloom_radius": 160,
     }

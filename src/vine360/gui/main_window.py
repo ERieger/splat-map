@@ -2141,7 +2141,7 @@ def _build_masks_worker(
     mask_sky: bool = True,
     mask_overexposure: bool = False,
     overexposure_clip: int = 250,
-    overexposure_bloom_radius: int = 40,
+    overexposure_bloom_radius: int = LAYER_SPECS[LAYER_OVEREXPOSED].default_params["bloom_radius_px"],
     progress_callback=None,
 ):
     conn = open_index_db(project_root)
@@ -2346,7 +2346,11 @@ class MasksPanel(QWidget):
         self.bloom_spin.setRange(0, 300)
         self.bloom_spin.setSuffix(" px")
         self.bloom_spin.setValue(LAYER_SPECS[LAYER_OVEREXPOSED].default_params["bloom_radius_px"])
-        self.bloom_spin.setToolTip("How far from a clipped region its bright halo is also excluded.")
+        self.bloom_spin.setToolTip(
+            "How far from a clipped region its halo can reach. The halo only spreads over smooth areas that "
+            "keep getting darker away from the light, so a longer reach doesn't swallow evenly lit or "
+            "textured surfaces."
+        )
         over.options.addWidget(self.bloom_spin)
 
         self.sam3_note = QLabel("(Checking SAM 3 availability…)")

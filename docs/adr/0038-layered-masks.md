@@ -51,7 +51,8 @@ edited, coverage, updated_at`). The layers are `sky` (classical | sam3), `person
 to layer names and registers them. Each row is dated by the file's own mtime, so registering
 doesn't make the composite, or a Pose run built on it, look stale.
 
-**Overexposure (`masking/overexposure.py`).** Masking is driven by *clipping*, not brightness:
+**Overexposure (`masking/overexposure.py`).** Bloom detection was superseded by ADR 0042. Masking
+is driven by *clipping*, not brightness:
 - The core is pixels with `min(R,G,B) >= 250`. Cores smaller than 0.2% of the view are dropped,
   which removes glints.
 - Bloom is pixels with luma ≥ 230 that lie within `bloom_radius_px` (40) of a core *and* belong
