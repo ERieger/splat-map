@@ -399,6 +399,26 @@ def extract_frames(
         raise FrameExtractionError(f"ffmpeg reported success but produced no frames for {source_id}")
 
     frames: list[Frame] = []
+    pending_rows: list[tuple] = []
+
+    def flush_pending() -> None:
+        # Rows are written in short batches, never left pending across the
+        # slow per-frame thumbnail/checksum work: an open write transaction
+        # holds the database lock, and holding it for ~20 thumbnails let a
+        # GUI queue edit time this whole extraction out with "database is
+        # locked" (docs/adr/0044). Batches still keep partial progress.
+        if not pending_rows:
+            return
+        conn.executemany(
+            """
+            INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            pending_rows,
+        )
+        conn.commit()
+        pending_rows.clear()
+
     for index, frame_path in enumerate(frame_files):
         if generate_thumbnails:
             notify(f"Generating thumbnails ({index + 1}/{len(frame_files)})…", index + 1, len(frame_files))
@@ -421,11 +441,7 @@ def extract_frames(
             frame_set_id=frame_set_id,
         )
         frames.append(frame)
-        conn.execute(
-            """
-            INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
+        pending_rows.append(
             (
                 frame.frame_id,
                 frame.source_id,
@@ -434,9 +450,9 @@ def extract_frames(
                 frame.path,
                 frame.checksum,
                 frame.frame_set_id,
-            ),
+            )
         )
         if (index + 1) % 20 == 0:
-            conn.commit()  # incremental, so an interrupted run keeps partial progress
-    conn.commit()
+            flush_pending()  # incremental, so an interrupted run keeps partial progress
+    flush_pending()
     return frames

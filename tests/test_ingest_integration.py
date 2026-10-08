@@ -271,3 +271,43 @@ def test_re_extracting_frames_cascades_to_views_and_masks(tmp_path):
     assert not old_keep_dir.exists()
     assert not old_classes_dir.exists()
     conn.close()
+
+
+@requires_ffmpeg
+def test_extraction_never_holds_the_db_lock_across_thumbnailing(tmp_path):
+    """Another connection (e.g. the GUI saving a queue edit) can write while
+    thumbnails are being made -- the frame rows are batched, not left in an
+    open transaction across the slow per-frame work. Holding it there failed
+    a real 888-frame extraction with "database is locked" (docs/adr/0044)."""
+    import sqlite3
+
+    from vine360.project import index_db_path
+
+    clip_path = tmp_path / "source_clip.mp4"
+    _make_synthetic_clip(clip_path)
+    project_root = tmp_path / "project"
+    create_project(project_root, "Lock Test", CaptureMode.THREE_SIXTY)
+    conn = open_index_db(project_root)
+    source = add_source(
+        conn, clip_path, LocalRunner(), media_type_override=MediaType.VIDEO, added_at="2026-01-01T00:00:00+00:00"
+    )
+
+    other_writes = []
+
+    class GuiWritingRunner(LocalRunner):
+        def run(self, command, **kwargs):
+            if any(str(part).endswith(".jpg") for part in command):  # a thumbnail command
+                other = sqlite3.connect(index_db_path(project_root), timeout=0.2)
+                try:
+                    other.execute(
+                        "INSERT INTO activity_log (operation, label, params, status, started_at) VALUES ('t', 't', '{}', 'done', 'x')"
+                    )
+                    other.commit()
+                    other_writes.append(True)
+                finally:
+                    other.close()
+            return super().run(command, **kwargs)
+
+    frames = extract_frames(conn, project_root, source.source_id, GuiWritingRunner(), interval_seconds=0.5)
+    assert len(other_writes) == len(frames) >= 3
+    assert conn.execute("SELECT COUNT(*) FROM frames").fetchone()[0] == len(frames)

@@ -247,7 +247,7 @@ def create_project(root: Path, name: str, capture_mode: CaptureMode) -> Project:
         capture_mode=capture_mode,
     )
     _write_project_yaml(root, project)
-    conn = sqlite3.connect(root / INDEX_FILE)
+    conn = connect_index_db(root / INDEX_FILE)
     try:
         _ensure_schema(conn)
     finally:
@@ -274,11 +274,21 @@ def index_db_path(root: Path) -> Path:
     return Path(root) / INDEX_FILE
 
 
+# How long a connection waits for another connection's lock before raising
+# "database is locked". sqlite3's default is 5s, which a GUI-thread queue
+# edit colliding with a worker's write could exceed (docs/adr/0044).
+DB_BUSY_TIMEOUT_SECONDS = 30.0
+
+
+def connect_index_db(path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(path, timeout=DB_BUSY_TIMEOUT_SECONDS)
+
+
 def open_index_db(root: Path) -> sqlite3.Connection:
     path = index_db_path(root)
     if not path.exists():
         raise ProjectNotFoundError(f"no {INDEX_FILE} found under {root}")
     _ensure_layout_dirs(Path(root))
-    conn = sqlite3.connect(path)
+    conn = connect_index_db(path)
     _ensure_schema(conn)
     return conn

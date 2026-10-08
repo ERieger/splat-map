@@ -130,3 +130,33 @@ def test_log_action_never_breaks_the_action(project):
     _root, conn = project
     conn.execute("DROP TABLE activity_log")
     assert log_action(conn, "masks.view_layer", "x") is None
+
+
+def test_finish_is_retried_when_the_database_is_briefly_locked(project, monkeypatch):
+    """The finish write retries rather than leaving the entry "running" when
+    another connection holds the lock -- the same lock that often just
+    failed the work itself (docs/adr/0044)."""
+    import sqlite3
+    import threading
+
+    import vine360.activity_log as activity_log
+    from vine360.project import index_db_path
+
+    root, conn = project
+    monkeypatch.setattr(activity_log, "FINISH_RETRY_DELAY_SECONDS", 0.3)
+    locker = sqlite3.connect(index_db_path(root), check_same_thread=False)
+
+    def short_timeout_open(project_root):
+        return sqlite3.connect(index_db_path(project_root), timeout=0.05)
+
+    @logged_operation("demo.locked", "Demo", open_conn=short_timeout_open)
+    def worker(project_root):
+        locker.execute("BEGIN EXCLUSIVE")  # held while the finish is first attempted
+        threading.Timer(0.2, locker.rollback).start()
+        raise RuntimeError("database is locked")
+
+    with pytest.raises(RuntimeError):
+        worker(root)
+    locker.close()
+    (entry,) = list_entries(conn)
+    assert entry.status == STATUS_FAILED and entry.error == "RuntimeError: database is locked"

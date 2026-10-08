@@ -323,6 +323,11 @@ def build_layers_for_views(
     for index, view_id in enumerate(view_ids):
         notify(f"Masking ({names}{where}): view {index + 1}/{total}", index, total)
         image = None
+        # Every layer is computed before any is written: a write opens a
+        # transaction that holds the database lock, and holding it across a
+        # second layer's SAM 3 inference can time out another connection
+        # (docs/adr/0044).
+        computed = []
         for layer, params in resolved.items():
             row = _layer_row(conn, view_id, layer)
             if row is not None and row[1] and not overwrite_edited:
@@ -339,6 +344,8 @@ def build_layers_for_views(
             else:
                 version = "1"
             enabled = bool(row[0]) if row is not None else True
+            computed.append((layer, params, mask, version, enabled))
+        for layer, params, mask, version, enabled in computed:
             coverage = _write_layer(
                 conn, project_root, view_id, layer, mask, params["method"], str(version), params, enabled=enabled
             )

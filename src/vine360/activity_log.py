@@ -213,20 +213,32 @@ def _default_open(project_root: Path) -> sqlite3.Connection:
     return open_index_db(project_root)
 
 
+# A failed finish write would leave the entry "running" for the rest of the
+# session -- and the likeliest cause, "database is locked", is often the very
+# error the work itself just failed with -- so it's retried (docs/adr/0044).
+FINISH_ATTEMPTS = 3
+FINISH_RETRY_DELAY_SECONDS = 2.0
+
+
 def _finish_quietly(opener, project_root, entry_id, *, status, duration, error=None, result_obj=None, summarize=None):
     if entry_id is None:
         return
-    try:
-        conn = opener(project_root)
+    for attempt in range(FINISH_ATTEMPTS):
         try:
-            summary = None
-            if summarize is not None and status == STATUS_DONE:
-                try:
-                    summary = summarize(result_obj, conn)
-                except Exception:
-                    summary = None
-            finish_entry(conn, entry_id, status=status, duration_seconds=duration, result=summary, error=error)
-        finally:
-            conn.close()
-    except Exception:
-        pass
+            conn = opener(project_root)
+            try:
+                summary = None
+                if summarize is not None and status == STATUS_DONE:
+                    try:
+                        summary = summarize(result_obj, conn)
+                    except Exception:
+                        summary = None
+                finish_entry(conn, entry_id, status=status, duration_seconds=duration, result=summary, error=error)
+            finally:
+                conn.close()
+            return
+        except sqlite3.OperationalError:
+            if attempt + 1 < FINISH_ATTEMPTS:
+                time.sleep(FINISH_RETRY_DELAY_SECONDS)
+        except Exception:
+            return
