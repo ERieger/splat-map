@@ -591,6 +591,42 @@ def _job_status_dot(status: str) -> QPixmap:
     return _dot_pixmap(JOB_STATUS_COLOR[status])
 
 
+# The queue panel's status key: what each JOB_STATUS_COLOR dot means.
+JOB_STATUS_KEY = (
+    (QUEUED, "Queued", "Waiting its turn"),
+    (JOB_RUNNING, "Running", "Running now"),
+    (JOB_DONE, "Done", "Finished successfully"),
+    (FAILED, "Failed", "Failed -- hover for the error; Retry or Skip it"),
+    (BLOCKED, "Blocked", "Waiting on a job that failed, was skipped or is blocked itself"),
+    (SKIPPED, "Skipped", "Skipped -- won't run"),
+)
+
+
+def _job_status_key() -> QWidget:
+    """A compact two-row legend of the queue's job-status dots."""
+    key = QWidget()
+    grid = QGridLayout(key)
+    grid.setContentsMargins(2, 4, 2, 0)
+    grid.setHorizontalSpacing(10)
+    grid.setVerticalSpacing(2)
+    columns = 3
+    for index, (status, text, tooltip) in enumerate(JOB_STATUS_KEY):
+        cell = QWidget()
+        cell.setToolTip(tooltip)
+        cell_layout = QHBoxLayout(cell)
+        cell_layout.setContentsMargins(0, 0, 0, 0)
+        cell_layout.setSpacing(4)
+        dot = QLabel()
+        dot.setPixmap(_job_status_dot(status))
+        cell_layout.addWidget(dot)
+        label = QLabel(text)
+        label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        cell_layout.addWidget(label)
+        cell_layout.addStretch(1)
+        grid.addWidget(cell, index // columns, index % columns)
+    return key
+
+
 class StageIndicator(QWidget):
     """A small horizontal step row for a panel that has more than one
     distinct action to move through in sequence (e.g. build a mask, then
@@ -3348,6 +3384,7 @@ class QueuePanel(QWidget):
         self.list_widget.setDefaultDropAction(Qt.MoveAction)
         self.list_widget.model().rowsMoved.connect(self._on_rows_moved)
         layout.addWidget(self.list_widget, stretch=1)
+        layout.addWidget(_job_status_key())
 
         self._manager: QueueManager | None = None
 

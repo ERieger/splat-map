@@ -38,3 +38,15 @@ def test_main_window_constructs_with_no_project_open(qapp):
     # "no project" placeholder rather than having crashed mid-construction
     assert len(window._panels) == 9  # 7 pipeline stages + Data manager + Activity log
     assert window.queue_manager is not None
+
+
+def test_queue_panel_has_a_key_for_every_job_status(qapp):
+    """The status key under the queue lists every dot colour a job row can show."""
+    from PySide6.QtWidgets import QLabel
+
+    from vine360.gui.main_window import JOB_STATUS_COLOR, JOB_STATUS_KEY, AppState, QueuePanel
+
+    assert {status for status, _text, _tip in JOB_STATUS_KEY} == set(JOB_STATUS_COLOR)
+    panel = QueuePanel(AppState())
+    texts = {label.text() for label in panel.findChildren(QLabel)}
+    assert {text for _status, text, _tip in JOB_STATUS_KEY} <= texts
