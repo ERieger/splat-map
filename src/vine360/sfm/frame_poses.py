@@ -61,6 +61,7 @@ class SparsePoint:
     xyz: np.ndarray
     rgb: tuple[int, int, int]
     frame_ids: list[str] = field(default_factory=list)  # frames that observed it
+    error: float = -1.0  # the engine's own mean reprojection error, px (-1 = unknown, COLMAP's convention)
 
 
 @dataclass
@@ -153,7 +154,7 @@ def load_frame_model(conn: sqlite3.Connection, project_root: Path, run_id: str) 
         for point in model.points.values():
             frames = sorted({frame_by_image_id[i] for i, _ in point.track if i in frame_by_image_id})
             if frames:
-                points.append(SparsePoint(np.asarray(point.xyz), point.rgb, frames))
+                points.append(SparsePoint(np.asarray(point.xyz), point.rgb, frames, point.error))
     elif engine == ENGINE_PYCOLMAP:
         import pycolmap
 
@@ -174,7 +175,9 @@ def load_frame_model(conn: sqlite3.Connection, project_root: Path, run_id: str) 
                 {frame_by_image_id[e.image_id] for e in point.track.elements if e.image_id in frame_by_image_id}
             )
             if frames:
-                points.append(SparsePoint(np.asarray(point.xyz), tuple(int(c) for c in point.color), frames))
+                points.append(
+                    SparsePoint(np.asarray(point.xyz), tuple(int(c) for c in point.color), frames, float(point.error))
+                )
     else:
         raise FramePoseError(f"unknown SfM engine {engine!r} for run {run_id!r}")
 
@@ -299,5 +302,10 @@ def build_view_reconstruction(conn: sqlite3.Connection, project_root: Path, run_
         track = pycolmap.Track()
         for view_id, point2d_idx in elements:
             track.add_element(image_ids[view_id], point2d_idx)
-        reconstruction.add_point3D(point.xyz, track, np.asarray(point.rgb, dtype=np.uint8))
+        point_id = reconstruction.add_point3D(point.xyz, track, np.asarray(point.rgb, dtype=np.uint8))
+        # add_point3D leaves error at -1 ("not computed"), and every exported
+        # point then looked unusable: Postshot imported the poses of such an
+        # export but reported "No Sparse Points Available". The engine's
+        # own reprojection error is the real measure of the point.
+        reconstruction.points3D[point_id].error = point.error
     return reconstruction, model

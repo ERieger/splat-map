@@ -212,6 +212,11 @@ def test_build_view_reconstruction_is_a_standard_pinhole_model(scene, engine, tm
     for point in reread.points3D.values():
         for element in point.track.elements:
             assert element.image_id in reread.images
+    # Each point carries the engine's own error, never COLMAP's -1 "not
+    # computed" -- Postshot finds no sparse points in a model of those.
+    errors = [point.error for point in reread.points3D.values()]
+    assert min(errors) >= 0 and 0 < sum(errors) / len(errors) < 4.0
+    reread.update_point_3d_errors()  # the views' own geometric error
     assert reread.compute_mean_reprojection_error() < 1e-6
 
 
