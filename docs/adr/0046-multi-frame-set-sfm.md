@@ -37,8 +37,9 @@ How each image source handles several sets:
   and SphereSfM's verified behaviour don't change. `project_run.frame_image_name` is the one
   place this naming rule is defined, and both the run and `frame_poses.load_frame_model` use it.
 
-**One camera per frame set on the raw-frame engines.** The two sources are different cameras,
-usually at different resolutions (8K Insta360 vs 5.7K A1).
+**One camera per frame set on the raw-frame engines.** The two sources are different cameras and
+may record at different resolutions. (The EstoWines A1 and Insta360 frames happen to share
+7680×3840, but a SPHERE camera is only right for one image size, so this can't be assumed.)
 
 - **SphereSfM:** SPHERE's params are the image centre and are passed on the command line. So
   `feature_extractor` runs once per set into the shared database, each call with its own
