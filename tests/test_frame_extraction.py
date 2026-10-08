@@ -24,6 +24,8 @@ def test_build_frame_extraction_command():
         "fps=1/2.0",
         "-vsync",
         "0",
+        "-pix_fmt",
+        "rgb24",
         "/proj/frames/s1/frame_%06d.png",
     ]
 
@@ -91,6 +93,8 @@ def test_build_frame_extraction_command_with_range():
         "fps=1/2.0",
         "-vsync",
         "0",
+        "-pix_fmt",
+        "rgb24",
         "/proj/frames/s1/frame_%06d.png",
     ]
 

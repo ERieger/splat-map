@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import requires_spheresfm
+from conftest import requires_ffmpeg, requires_spheresfm
 from vine360.sfm import spheresfm_adapter as sph
 from vine360.sfm.options import SfmConfig
 
@@ -188,3 +188,52 @@ def test_default_options_pass_the_binarys_own_defaults(command):
             assert float(value) == pytest.approx(float(defaults[flag])), f"{flag}: {value} != binary default {defaults[flag]}"
             checked += 1
     assert checked >= 5
+
+
+def _write_png(path: Path, pix_fmt: str) -> Path:
+    """A small real PNG at the given ffmpeg pixel format (rgb48be = the
+    16-bit RGB a 10-bit HEVC source used to produce, docs/adr/0045)."""
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=640x320:duration=1",
+         "-frames:v", "1", "-pix_fmt", pix_fmt, str(path)],
+        check=True,
+    )
+    return path
+
+
+@requires_ffmpeg
+def test_png_bit_depth_reads_the_header(tmp_path):
+    assert sph.png_bit_depth(_write_png(tmp_path / "a.png", "rgb24")) == 8
+    assert sph.png_bit_depth(_write_png(tmp_path / "b.png", "rgb48be")) == 16
+    (tmp_path / "c.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\0" * 40)
+    assert sph.png_bit_depth(tmp_path / "c.jpg") is None
+
+
+@requires_ffmpeg
+def test_16_bit_frames_are_refused_before_the_run_starts(tmp_path):
+    _write_png(tmp_path / "frame_000001.png", "rgb24")
+    sph.check_readable_images(tmp_path, ["frame_000001.png"])  # 8-bit: fine
+    _write_png(tmp_path / "frame_000002.png", "rgb48be")
+    with pytest.raises(sph.SphereSfmError, match="16-bit PNG.*re-extract"):
+        sph.check_readable_images(tmp_path, ["frame_000001.png", "frame_000002.png"])
+
+
+@requires_ffmpeg
+@requires_spheresfm
+def test_the_real_binary_cant_read_16_bit_pngs_and_the_parser_counts_it(tmp_path):
+    """The reason for the preflight above, checked against the real build:
+    the 16-bit frame is reported unreadable, the 8-bit one isn't."""
+    images = tmp_path / "images"
+    images.mkdir()
+    _write_png(images / "a8.png", "rgb24")
+    _write_png(images / "b16.png", "rgb48be")
+    parser = sph.ProgressParser("", 2, lambda *a: None)
+    result = subprocess.run(
+        [str(sph.find_binary()), "feature_extractor", "--database_path", str(tmp_path / "db.db"),
+         "--image_path", str(images), "--SiftExtraction.use_gpu", "0"],
+        capture_output=True, text=True, env=sph._env(),
+    )
+    for line in (result.stdout + result.stderr).splitlines():
+        parser.feed(line)
+    assert result.returncode == 0  # it "succeeds" regardless
+    assert parser.unreadable == 1

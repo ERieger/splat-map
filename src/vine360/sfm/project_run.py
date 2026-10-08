@@ -253,6 +253,7 @@ def _run_spheresfm(
     match_gpu = use_gpu and config.use_gpu
     extract_gpu = match_gpu and not (config.estimate_affine_shape or config.domain_size_pooling)  # CPU-only SIFT
     matcher_command = sph.MATCHER_COMMANDS[config.matcher]  # also names its log file
+    sph.check_readable_images(image_dir, image_names)
     with Image.open(image_dir / image_names[0]) as first:
         width, height = first.size
 
@@ -271,6 +272,7 @@ def _run_spheresfm(
         return sph.ProgressParser(f"SphereSfM step {step}/4 ({label}): ", n, notify)
 
     notify(f"SphereSfM step 1/4 (features, {extract_device}): starting on {n} frames…", 0, n)
+    extraction_parser = parser(1, f"features, {extract_device}")
     sph.run_command(
         runner,
         sph.build_feature_extraction_command(
@@ -278,9 +280,18 @@ def _run_spheresfm(
             config=config,
         ),
         "feature extraction",
-        on_line=parser(1, f"features, {extract_device}").feed,
+        on_line=extraction_parser.feed,
         log_path=run_dir / "1_feature_extractor.log",
     )
+    if extraction_parser.unreadable >= n:
+        # Extraction exits 0 even when it read nothing; the matcher would
+        # then abort on the empty database with an opaque cache error.
+        raise sph.SphereSfmError(
+            f"SphereSfM couldn't read any of the {n} frames (\"Failed to read image file format\") -- "
+            f"see {run_dir / '1_feature_extractor.log'}"
+        )
+    if extraction_parser.unreadable:
+        notify(f"SphereSfM step 1/4: {extraction_parser.unreadable}/{n} frames were unreadable and skipped", n, n)
     notify(f"SphereSfM step 2/4 (matching, {device}): {config.matcher}, starting…", 0, n)
     sph.run_command(
         runner,

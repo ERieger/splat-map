@@ -291,6 +291,35 @@ _INITIAL_PAIR = re.compile(r"Initializing with image pair #(\d+) and #(\d+)")
 _REGISTERING = re.compile(r"Registering image #(\d+) \((\d+)\)")
 
 
+def png_bit_depth(path: Path) -> int | None:
+    """Bits per channel of a PNG, read from its IHDR header (byte 24), or
+    None if the file isn't a PNG. Cheap: reads 25 bytes, not the image."""
+    with open(path, "rb") as f:
+        header = f.read(25)
+    if len(header) < 25 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+        return None
+    return header[24]
+
+
+def check_readable_images(image_dir: Path, image_names: list[str]) -> None:
+    """Raises SphereSfmError before a run starts if its images are 16-bit
+    PNGs. Verified against the real build: COLMAP 3.8's FreeImage reader
+    logs "Failed to read image file format" for every 16-bit RGB PNG (an
+    8-bit copy of the same frame gives ~12k features), extraction still
+    exits 0 after reading every file, and the matcher then aborts on an
+    empty database -- a real 888-frame run spent 96 minutes getting there
+    (docs/adr/0045). Checks the first and last image only: one frame set
+    comes from one extraction, so its frames share a format."""
+    for name in {image_names[0], image_names[-1]}:
+        depth = png_bit_depth(image_dir / name)
+        if depth is not None and depth > 8:
+            raise SphereSfmError(
+                f"{name} is a {depth}-bit PNG, which SphereSfM can't read. These frames were extracted "
+                "from a high-bit-depth (e.g. 10-bit HEVC) source before frame extraction forced 8-bit "
+                "output -- re-extract this frame set, then run pose estimation again."
+            )
+
+
 class ProgressParser:
     """Turns SphereSfM's (COLMAP 3.8's) own log lines into
     (message, current, total) progress -- the exact strings come from its
@@ -306,9 +335,12 @@ class ProgressParser:
         self.notify = notify
         self.registered = 0
         self.phase = ""
+        self.unreadable = 0  # feature extraction's "Failed to read image file format" count
 
     def feed(self, line: str) -> None:
-        if match := _PROCESSED_FILE.search(line):
+        if "Failed to read image file format" in line:
+            self.unreadable += 1
+        elif match := _PROCESSED_FILE.search(line):
             i, n = int(match.group(1)), int(match.group(2))
             self.notify(f"{self.prefix}frame {i}/{n}", i, n)
         elif match := _MATCHING_IMAGE.search(line):

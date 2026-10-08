@@ -46,7 +46,10 @@ def build_frame_extraction_command(
     command += ["-i", str(source)]
     if duration_limit is not None:
         command += ["-t", str(duration_limit)]
-    command += ["-vf", f"fps=1/{interval_seconds}", "-vsync", "0", str(output_pattern)]
+    # -pix_fmt rgb24: always 8-bit PNGs. A 10-bit source (e.g. Insta360
+    # HEVC, yuv420p10le) otherwise yields 16-bit PNGs, which SphereSfM's
+    # COLMAP 3.8 can't read at all, at ~4x the size (docs/adr/0045).
+    command += ["-vf", f"fps=1/{interval_seconds}", "-vsync", "0", "-pix_fmt", "rgb24", str(output_pattern)]
     return command
 
 
