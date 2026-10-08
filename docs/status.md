@@ -251,6 +251,20 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
 - On 500 FMC-Tunnel1 views, views with clipped pixels but an empty layer drop from 74 to 5, and
   unmasked near-clipped area per view roughly halves (layer `method_version` 3).
 
+**Pose estimation over several frame sets (ADR 0046).**
+- The Pose panel's frame-set dropdown has a "Several frame sets…" checklist. It combines the
+  checked sets, e.g. the A1 aerial and Insta360 ground captures, into one reconstruction on any
+  engine, SphereSfM included.
+- Raw-frame runs give each set its own camera:
+  - SphereSfM runs one feature extraction per set, each with that set's SPHERE params;
+  - pycolmap uses one camera per folder.
+- Export, camera priors, the queue and the Data manager all read a run's scope from the new
+  `frame_set_ids` list.
+- The panel and the run warn that sequential matching won't connect the sets; use exhaustive or
+  vocabulary-tree matching instead.
+- Verified on two synthetic captures at different heights and resolutions with both engines. Not
+  yet tried on the real A1 + Insta360 footage.
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -332,6 +346,8 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
       a luma floor, reach and texture; ADR 0038's bloom kept as the seed.
 0043: overexposure cores down to 0.02% of a view, clipped fragments grouped within 4 px
       (groups must be >= 30% clipped) -- far tunnel ends and light fittings.
+0046: one Pose run over several chosen frame sets (any engine); one camera per set on raw
+      frames (SphereSfM: one extraction per set); scope recorded as frame_set_ids.
 
 ## Blockers / known gaps
 

@@ -39,7 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
-from vine360.sfm.project_run import ENGINE_PYCOLMAP, ENGINE_SPHERESFM, run_engine
+from vine360.sfm.project_run import ENGINE_PYCOLMAP, ENGINE_SPHERESFM, frame_image_name, run_engine, run_frame_set_ids
 
 F = np.diag([1.0, -1.0, 1.0])
 BEARING_CONVENTION = {ENGINE_SPHERESFM: F, ENGINE_PYCOLMAP: F}  # measured -- see module docstring
@@ -67,9 +67,14 @@ class SparsePoint:
 class FrameModel:
     run_id: str
     engine: str
-    frame_set_id: str
+    frame_set_ids: list[str]  # more than one for a multi-frame-set run (docs/adr/0046)
     poses: dict[str, FramePose]
     points: list[SparsePoint]
+
+    @property
+    def frame_set_id(self) -> str | None:
+        """The run's frame set, or None for a multi-frame-set run."""
+        return self.frame_set_ids[0] if len(self.frame_set_ids) == 1 else None
 
 
 def quaternion_to_matrix(qvec) -> np.ndarray:
@@ -101,22 +106,31 @@ def is_frame_run(config: dict) -> bool:
 
 def load_frame_model(conn: sqlite3.Connection, project_root: Path, run_id: str) -> FrameModel:
     """A frame-based run's registered frames (keyed by frame_id, matched
-    through frames.path) and its sparse points, from either engine."""
+    through frames.path -- as "<frame_set_id>/<file name>" for a
+    multi-frame-set run, project_run.frame_image_name) and its sparse
+    points, from either engine."""
     project_root = Path(project_root)
     selected_model, config = _run_row(conn, run_id)
     if not is_frame_run(config):
         raise FramePoseError(f"sfm run {run_id!r} isn't a raw-frame (360) run")
-    frame_set_id = config.get("frame_set_id") or config.get("source_id")
-    if not frame_set_id:
+    frame_set_ids = run_frame_set_ids(config)
+    if not frame_set_ids:
         raise FramePoseError(f"sfm run {run_id!r} has no frame_set_id")
     model_dir = project_root / selected_model
     if not model_dir.exists():
         raise FramePoseError(f"sfm run {run_id!r}'s model is missing on disk at {model_dir}")
 
     frame_id_by_name = {
-        Path(path).name: frame_id
-        for frame_id, path in conn.execute("SELECT frame_id, path FROM frames WHERE frame_set_id = ?", (frame_set_id,))
+        frame_image_name(frame_set_ids, fs_id, path): frame_id
+        for fs_id in frame_set_ids
+        for frame_id, path in conn.execute("SELECT frame_id, path FROM frames WHERE frame_set_id = ?", (fs_id,))
     }
+
+    def frame_for(image_name: str) -> str | None:
+        # A single-set model's image names are bare file names; a
+        # multi-set model's carry their frame set.
+        return frame_id_by_name.get(image_name if len(frame_set_ids) > 1 else Path(image_name).name)
+
     engine = run_engine(config)
     poses: dict[str, FramePose] = {}
     points: list[SparsePoint] = []
@@ -130,7 +144,7 @@ def load_frame_model(conn: sqlite3.Connection, project_root: Path, run_id: str) 
         model = read_text_model(txt_dir)
         frame_by_image_id = {}
         for image in model.images.values():
-            frame_id = frame_id_by_name.get(Path(image.name).name)
+            frame_id = frame_for(image.name)
             if frame_id is None:
                 continue
             rotation = quaternion_to_matrix(image.qvec)
@@ -148,7 +162,7 @@ def load_frame_model(conn: sqlite3.Connection, project_root: Path, run_id: str) 
         for image_id, image in reconstruction.images.items():
             if not image.has_pose:
                 continue
-            frame_id = frame_id_by_name.get(Path(image.name).name)
+            frame_id = frame_for(image.name)
             if frame_id is None:
                 continue
             cam_from_world = image.cam_from_world()
@@ -165,8 +179,8 @@ def load_frame_model(conn: sqlite3.Connection, project_root: Path, run_id: str) 
         raise FramePoseError(f"unknown SfM engine {engine!r} for run {run_id!r}")
 
     if not poses:
-        raise FramePoseError(f"sfm run {run_id!r} registered none of frame set {frame_set_id!r}'s frames")
-    return FrameModel(run_id, engine, frame_set_id, poses, points)
+        raise FramePoseError(f"sfm run {run_id!r} registered none of frame set {', '.join(frame_set_ids)!r}'s frames")
+    return FrameModel(run_id, engine, frame_set_ids, poses, points)
 
 
 def view_cam_from_world(pose: FramePose, fixed_rotation: np.ndarray, engine: str) -> tuple[np.ndarray, np.ndarray]:
@@ -190,11 +204,14 @@ class ViewRecord:
     fixed_rotation: np.ndarray
 
 
-def views_for_frame_set(conn: sqlite3.Connection, frame_set_id: str) -> list[ViewRecord]:
+def views_for_frame_set(conn: sqlite3.Connection, frame_set_id: str | list[str]) -> list[ViewRecord]:
+    """Every projected view of one frame set, or of each of a list of them."""
+    ids = [frame_set_id] if isinstance(frame_set_id, str) else list(frame_set_id)
     rows = conn.execute(
         "SELECT v.view_id, v.frame_id, v.image_path, v.width, v.height, v.intrinsics, v.fixed_rotation "
-        "FROM views v JOIN frames f ON f.frame_id = v.frame_id WHERE f.frame_set_id = ? ORDER BY v.view_id",
-        (frame_set_id,),
+        "FROM views v JOIN frames f ON f.frame_id = v.frame_id "
+        f"WHERE f.frame_set_id IN ({', '.join('?' * len(ids))}) ORDER BY v.view_id",
+        ids,
     ).fetchall()
     records = []
     for view_id, frame_id, image_path, width, height, intrinsics_json, rotation_json in rows:
@@ -222,11 +239,11 @@ def build_view_reconstruction(conn: sqlite3.Connection, project_root: Path, run_
     import pycolmap
 
     model = load_frame_model(conn, project_root, run_id)
-    views = [v for v in views_for_frame_set(conn, model.frame_set_id) if v.frame_id in model.poses]
+    views = [v for v in views_for_frame_set(conn, model.frame_set_ids) if v.frame_id in model.poses]
     if not views:
         raise FramePoseError(
-            f"no projected views for frame set {model.frame_set_id!r} -- generate projections for this frame "
-            "set first (the export uses vine360's own projected views, so masks can come along)"
+            f"no projected views for frame set {', '.join(model.frame_set_ids)!r} -- generate projections for "
+            "this frame set first (the export uses vine360's own projected views, so masks can come along)"
         )
 
     reconstruction = pycolmap.Reconstruction()

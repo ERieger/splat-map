@@ -2982,9 +2982,15 @@ _COLOR_NAMES = {LAYER_SKY: "blue", LAYER_PERSON: "red", LAYER_OVEREXPOSED: "mage
 ENGINE_COLMAP_PROJECTIONS = VARIANT_PROJECTIONS
 ENGINE_COLMAP_EQUIRECTANGULAR = VARIANT_EQUIRECT
 ENGINE_SPHERESFM = VARIANT_SPHERESFM
+# The Pose panel's "Several frame sets…" entry (docs/adr/0046).
+SEVERAL_FRAME_SETS = "__several_frame_sets__"
 
 
-@logged_operation("sfm.run", "Pose estimation", target=lambda p: p.get("frame_set_id") or "all frame sets", summarize=_summarize_sfm)
+def _sfm_target(params: dict) -> str:
+    return " + ".join(params.get("frame_set_ids") or []) or params.get("frame_set_id") or "all frame sets"
+
+
+@logged_operation("sfm.run", "Pose estimation", target=_sfm_target, summarize=_summarize_sfm)
 def _run_sfm_worker(
     project_root: Path,
     image_source: str,
@@ -2992,10 +2998,13 @@ def _run_sfm_worker(
     camera_model: str,
     engine: str = "pycolmap",
     options: dict | None = None,
+    frame_set_ids: list[str] | None = None,
     progress_callback=None,
 ):
     """options: the non-default SfmConfig fields (docs/adr/0040) -- absent
-    for jobs queued before options existed, which then run as before."""
+    for jobs queued before options existed, which then run as before.
+    frame_set_ids: several frame sets in one run (docs/adr/0046), with
+    frame_set_id None."""
     config = SfmConfig.from_dict(options).replace(camera_model=camera_model)
     conn = open_index_db(project_root)
     try:
@@ -3005,6 +3014,7 @@ def _run_sfm_worker(
             config=config,
             image_source=image_source,
             frame_set_id=frame_set_id,
+            frame_set_ids=frame_set_ids,
             engine=engine,
             progress_callback=progress_callback,
         )
@@ -3048,10 +3058,23 @@ class PoseEstimationPanel(QWidget):
         self.engine_combo.addItem("SphereSfM (external build, raw frames)", userData=ENGINE_SPHERESFM)
         self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
         form.addRow("Engine:", self.engine_combo)
+        self._choices = {}
         self.source_combo = QComboBox()
-        self.source_combo.currentIndexChanged.connect(self._refresh_enabled)
+        self.source_combo.currentIndexChanged.connect(self._on_scope_changed)
         form.addRow("Frame set:", self.source_combo)
         controls_layout.addLayout(form)
+
+        # "Several frame sets…": one reconstruction over the checked sets,
+        # e.g. aerial + ground capture of one block (docs/adr/0046).
+        self.multi_list = QListWidget()
+        self.multi_list.setMaximumHeight(150)
+        self.multi_list.itemChanged.connect(self._refresh_enabled)
+        self.multi_list.setVisible(False)
+        controls_layout.addWidget(self.multi_list)
+        self.multi_note = QLabel("")
+        self.multi_note.setWordWrap(True)
+        self.multi_note.setVisible(False)
+        controls_layout.addWidget(self.multi_note)
 
         self.engine_note = QLabel("")
         self.engine_note.setWordWrap(True)
@@ -3119,11 +3142,16 @@ class PoseEstimationPanel(QWidget):
 
     def _refresh_sources(self) -> None:
         """The six-face engine can run project-wide ("All frame sets") or
-        on one frame set's views; the native-equirectangular engine always
-        needs one equirectangular frame set (docs/adr/0034)."""
+        on one frame set's views; the raw-frame engines always need at
+        least one equirectangular frame set (docs/adr/0034). Every engine
+        can also run on several chosen frame sets at once ("Several frame
+        sets…", docs/adr/0046), offered once there are two to choose from."""
         previous = self.source_combo.currentData()
+        checked = set(self._checked_frame_set_ids())
         self.source_combo.blockSignals(True)
+        self.multi_list.blockSignals(True)
         self.source_combo.clear()
+        self.multi_list.clear()
         self._choices = {}
         if self.state.conn is not None:
             engine = self.engine_combo.currentData()
@@ -3141,8 +3169,39 @@ class PoseEstimationPanel(QWidget):
                 else:
                     detail = f"{choice.view_count} views" if choice.view_count else "no views yet"
                 self.source_combo.addItem(f"{choice.name} — {detail}", userData=choice.frame_set_id)
+                item = QListWidgetItem(f"{choice.name} — {detail}")
+                item.setData(Qt.UserRole, choice.frame_set_id)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if choice.frame_set_id in checked else Qt.Unchecked)
+                self.multi_list.addItem(item)
+            if len(self._choices) >= 2:
+                self.source_combo.addItem("Several frame sets… (one combined reconstruction)", userData=SEVERAL_FRAME_SETS)
             _restore_combo_selection(self.source_combo, previous)
+        self.multi_list.blockSignals(False)
         self.source_combo.blockSignals(False)
+        self._on_scope_changed()
+
+    def _checked_frame_set_ids(self) -> list[str]:
+        return [
+            self.multi_list.item(i).data(Qt.UserRole)
+            for i in range(self.multi_list.count())
+            if self.multi_list.item(i).checkState() == Qt.Checked
+        ]
+
+    def _several(self) -> bool:
+        return self.source_combo.currentData() == SEVERAL_FRAME_SETS
+
+    def _selected_frame_set_ids(self) -> list[str]:
+        """The frame sets a run would use: [] for "All frame sets", the
+        checked ones for "Several frame sets…", else the one chosen."""
+        if self._several():
+            return self._checked_frame_set_ids()
+        frame_set_id = self.source_combo.currentData()
+        return [frame_set_id] if frame_set_id else []
+
+    def _on_scope_changed(self) -> None:
+        self.multi_list.setVisible(self._several())
+        self._refresh_enabled()
 
     def _on_engine_changed(self) -> None:
         engine = self.engine_combo.currentData()
@@ -3153,7 +3212,8 @@ class PoseEstimationPanel(QWidget):
                 "project/projections/ for \"All frame sets\" -- using masks from project/masks/keep/ if any "
                 "have been built. The handover doc's originally recommended pipeline. If a source has more "
                 "than one frame set, pick one: \"All\" would feed COLMAP near-duplicate images of the same "
-                "moments."
+                "moments. \"Several frame sets…\" combines just the ones you check -- e.g. one aerial and one "
+                "ground capture -- into one reconstruction."
             )
         elif engine == ENGINE_COLMAP_EQUIRECTANGULAR:
             self.engine_note.setText(
@@ -3207,6 +3267,10 @@ class PoseEstimationPanel(QWidget):
             return
         self.queue_btn.setToolTip("Adds this exact configuration as a queued job instead of running it now.")
         self.run_btn.setToolTip("")
+        self._refresh_multi_note()
+        if self._several():
+            self._refresh_several_enabled(engine, busy)
+            return
         choice = self._choices.get(self.source_combo.currentData())
         if engine in (ENGINE_COLMAP_EQUIRECTANGULAR, ENGINE_SPHERESFM):
             has_frames = choice is not None and choice.frame_count > 0
@@ -3226,6 +3290,52 @@ class PoseEstimationPanel(QWidget):
         else:
             n_views = self.state.conn.execute("SELECT COUNT(*) FROM views").fetchone()[0]
             self.run_btn.setEnabled(n_views > 0 and not busy)
+
+    def _refresh_several_enabled(self, engine: str, busy: bool) -> None:
+        ids = self._checked_frame_set_ids()
+        if len(ids) < 2:
+            self.run_btn.setEnabled(False)
+            self.queue_btn.setEnabled(False)
+            self.run_btn.setToolTip("Check at least two frame sets to combine.")
+            self.queue_btn.setToolTip(self.run_btn.toolTip())
+            return
+        frames_engine = engine in (ENGINE_COLMAP_EQUIRECTANGULAR, ENGINE_SPHERESFM)
+        not_ready = [
+            self._choices[i].name
+            for i in ids
+            if (self._choices[i].frame_count if frames_engine else self._choices[i].view_count) == 0
+        ]
+        self.run_btn.setEnabled(not not_ready and not busy)
+        if not_ready:
+            what = "extracted frames" if frames_engine else "projected views"
+            self.run_btn.setToolTip(
+                f"No {what} yet for: {', '.join(not_ready)} -- use \"Add to Queue\" instead; it will queue "
+                "what's missing first."
+            )
+
+    def _refresh_multi_note(self) -> None:
+        """Warnings for a combined run that would probably come out as
+        separate models, or as near-duplicate images (docs/adr/0046)."""
+        if not self._several():
+            self.multi_note.setVisible(False)
+            return
+        from vine360.sfm.project_run import multi_set_matcher_warning
+
+        ids = self._checked_frame_set_ids()
+        notes = []
+        warning = multi_set_matcher_warning(ids, self.options_editor.config())
+        if warning:
+            notes.append("⚠ " + warning[0].upper() + warning[1:] + " (Advanced options → Matching).")
+        by_source: dict[str, list[str]] = {}
+        for i in ids:
+            by_source.setdefault(self._choices[i].source_id, []).append(i)
+        if any(len(sets) > 1 for sets in by_source.values()):
+            notes.append(
+                "⚠ Two of the checked frame sets come from the same clip -- COLMAP would get near-duplicate "
+                "images of the same moments. Check one frame set per clip."
+            )
+        self.multi_note.setText("\n".join(notes))
+        self.multi_note.setVisible(bool(notes))
 
     def _show_latest_run(self) -> None:
         row = self.state.conn.execute(
@@ -3252,7 +3362,7 @@ class PoseEstimationPanel(QWidget):
         the chosen engine (SfmConfig.for_variant), camera model excluded
         (it's its own argument)."""
         variant = self.engine_combo.currentData()
-        frame_set_id = self.source_combo.currentData()
+        frame_set_id = None if self._several() else self.source_combo.currentData()  # several: _selected_frame_set_ids
         config = self.options_editor.config().for_variant(variant)
         options = {k: v for k, v in config.non_default().items() if k != "camera_model"}
         if variant == ENGINE_SPHERESFM:
@@ -3263,7 +3373,11 @@ class PoseEstimationPanel(QWidget):
 
     def _on_add_to_queue(self) -> None:
         image_source, frame_set_id, camera_model, engine, options = self._current_sfm_args()
-        if image_source == "frames" and frame_set_id is None:
+        frame_set_ids = self._selected_frame_set_ids()
+        if self._several() and len(frame_set_ids) < 2:
+            QMessageBox.warning(self, "Too few frame sets", "Check at least two frame sets to combine.")
+            return
+        if image_source == "frames" and not frame_set_ids:
             QMessageBox.warning(self, "No frame set selected", "Choose an equirectangular frame set first.")
             return
         engine_label = {
@@ -3271,25 +3385,29 @@ class PoseEstimationPanel(QWidget):
             ENGINE_COLMAP_EQUIRECTANGULAR: "COLMAP (equirectangular)",
         }.get(self.engine_combo.currentData(), "COLMAP (perspective projections)")
         choice = self._choices.get(frame_set_id)
-        scope = choice.name if choice else "all frame sets"
+        scope = " + ".join(self._choices[i].name for i in frame_set_ids) or "all frame sets"
         changed = describe_sfm_options(SfmConfig.from_dict(options))
         if camera_model != SfmConfig().camera_model and image_source == "projections":
             changed = ", ".join(filter(None, [f"camera model {camera_model}", changed]))
+        params = {
+            "image_source": image_source,
+            "frame_set_id": frame_set_id,
+            "camera_model": camera_model,
+            "engine": engine,
+            "options": options,
+        }
+        if len(frame_set_ids) > 1:
+            params["frame_set_ids"] = frame_set_ids
         self.state.queue_manager.add_job(
             QUEUE_STAGE_POSE,
             choice.source_id if choice else None,
-            {
-                "image_source": image_source,
-                "frame_set_id": frame_set_id,
-                "camera_model": camera_model,
-                "engine": engine,
-                "options": options,
-            },
+            params,
             f"Pose estimation — {engine_label}, {scope}" + (f" ({changed})" if changed else ""),
         )
 
     def _on_run(self) -> None:
         image_source, frame_set_id, camera_model, engine, options = self._current_sfm_args()
+        frame_set_ids = self._selected_frame_set_ids()
 
         self.run_btn.setEnabled(False)
         self.progress_area.start("Running SfM…")
@@ -3302,6 +3420,7 @@ class PoseEstimationPanel(QWidget):
             camera_model,
             engine,
             options,
+            frame_set_ids if len(frame_set_ids) > 1 else None,
             on_success=self._on_run_success,
             on_error=self._on_run_error,
             on_progress=self.progress_area.update_progress,
@@ -3679,7 +3798,7 @@ class ExportPanel(QWidget):
     def _refresh_runs(self) -> None:
         self.run_combo.blockSignals(True)
         self.run_combo.clear()
-        self._run_frame_sets: dict[str, str] = {}  # run_id -> frame set, for raw-360-frame runs only
+        self._run_frame_sets: dict[str, list[str]] = {}  # run_id -> frame sets, for raw-360-frame runs only
         rows = self.state.conn.execute(
             "SELECT run_id, created_at, model_stats, config FROM sfm_runs ORDER BY created_at DESC"
         ).fetchall()
@@ -3688,9 +3807,12 @@ class ExportPanel(QWidget):
             config = json.loads(config_json)
             if config.get("image_source") == "frames":
                 engine = "SphereSfM" if config.get("engine") == "spheresfm" else "COLMAP equirectangular"
-                self._run_frame_sets[run_id] = config.get("frame_set_id") or config.get("source_id")
+                single = config.get("frame_set_id") or config.get("source_id")
+                self._run_frame_sets[run_id] = list(config.get("frame_set_ids") or ([single] if single else []))
             else:
                 engine = "COLMAP perspective"
+            if len(config.get("frame_set_ids") or []) > 1:
+                engine += f" ({len(config['frame_set_ids'])} frame sets combined)"
             label = (
                 f"{created_at} -- {engine}, {stats['registered_images']}/{stats['total_images']} registered "
                 f"({run_id[:12]})"
@@ -3705,14 +3827,15 @@ class ExportPanel(QWidget):
         self._refresh_enabled()
 
     def _run_frame_set_view_count(self, run_id: str | None) -> int | None:
-        """For a raw-360-frame run: how many projected views its frame set
-        has -- the export uses them (docs/adr/0036). None for other runs."""
-        frame_set_id = getattr(self, "_run_frame_sets", {}).get(run_id)
-        if frame_set_id is None or self.state.conn is None:
+        """For a raw-360-frame run: how many projected views its frame
+        sets have -- the export uses them (docs/adr/0036). None for other runs."""
+        frame_set_ids = getattr(self, "_run_frame_sets", {}).get(run_id)
+        if not frame_set_ids or self.state.conn is None:
             return None
         return self.state.conn.execute(
-            "SELECT COUNT(*) FROM views v JOIN frames f ON f.frame_id = v.frame_id WHERE f.frame_set_id = ?",
-            (frame_set_id,),
+            "SELECT COUNT(*) FROM views v JOIN frames f ON f.frame_id = v.frame_id "
+            f"WHERE f.frame_set_id IN ({', '.join('?' * len(frame_set_ids))})",
+            frame_set_ids,
         ).fetchone()[0]
 
     def _refresh_sources(self) -> None:
@@ -4226,7 +4349,7 @@ class DataManagerPanel(QWidget):
         set_names = {info.frame_set_id: info.display_name for info in frame_sets}
         self.runs_table.setRowCount(len(runs))
         for r, run in enumerate(runs):
-            scope = set_names.get(run.frame_set_id, run.frame_set_id or "all frame sets")
+            scope = " + ".join(set_names.get(i, i) for i in run.frame_set_ids) or "all frame sets"
             cells = [run.created_at, run.engine_label, scope, f"{run.registered_images}/{run.total_images}", ""]
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
@@ -4353,7 +4476,11 @@ class DataManagerPanel(QWidget):
             1
             for job in queue.jobs
             if job.status in ("queued", "blocked")
-            and (job.target_frame_set_id == frame_set_id or job.params.get("frame_set_id") == frame_set_id)
+            and (
+                job.target_frame_set_id == frame_set_id
+                or job.params.get("frame_set_id") == frame_set_id
+                or frame_set_id in (job.params.get("frame_set_ids") or [])
+            )
         )
 
     def _delete_frame_set_part(self, action: str) -> None:

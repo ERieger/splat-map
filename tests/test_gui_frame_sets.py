@@ -11,12 +11,14 @@ import pytest
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from vine360.config import FRAME_PRESET_INTERVALS, CaptureMode, FramePreset
 from vine360.gui.main_window import (
     ENGINE_COLMAP_EQUIRECTANGULAR,
     ENGINE_SPHERESFM,
+    SEVERAL_FRAME_SETS,
     AppState,
     DataManagerPanel,
     ExportPanel,
@@ -149,12 +151,96 @@ def test_pose_panel_scope_choices_follow_the_engine(qapp, project):
     panel.on_shown()
 
     six_face = [panel.source_combo.itemData(i) for i in range(panel.source_combo.count())]
-    assert six_face == [None, "s1~i1", "flat~i1"]  # "All frame sets" first
+    assert six_face == [None, "s1~i1", "flat~i1", SEVERAL_FRAME_SETS]  # "All frame sets" first
 
     panel.engine_combo.setCurrentIndex(panel.engine_combo.findData(ENGINE_COLMAP_EQUIRECTANGULAR))
     equirect = [panel.source_combo.itemData(i) for i in range(panel.source_combo.count())]
-    assert equirect == ["s1~i1"]  # no "All", equirectangular sources only
+    assert equirect == ["s1~i1"]  # no "All", equirectangular sources only, nothing to combine
     assert panel._current_sfm_args() == ("frames", "s1~i1", "EQUIRECTANGULAR", "pycolmap", {})
+
+
+def _check(panel, *frame_set_ids) -> None:
+    for i in range(panel.multi_list.count()):
+        item = panel.multi_list.item(i)
+        item.setCheckState(Qt.Checked if item.data(Qt.UserRole) in frame_set_ids else Qt.Unchecked)
+
+
+def test_pose_panel_combines_several_frame_sets_on_every_engine(qapp, project, monkeypatch):
+    """docs/adr/0046: "Several frame sets…" shows a checklist, needs two
+    checked, warns about sequential matching and same-clip duplicates, and
+    hands the checked sets to the queue job."""
+    monkeypatch.setattr(PoseEstimationPanel, "_spheresfm_status", _fake_spheresfm_status(True))
+    root, conn = project
+    for source_id in ("a1", "insta"):
+        _insert_source(conn, source_id)
+        _insert_frame_set(conn, source_id, f"{source_id}~i1", "every 1s", n_frames=3)
+    _insert_frame_set(conn, "insta", "insta~i0.5", "every 0.5s", n_frames=3)
+    state = _state(root, conn, with_queue=True)
+    panel = PoseEstimationPanel(state)
+    panel.on_shown()
+
+    for engine in (ENGINE_COLMAP_EQUIRECTANGULAR, ENGINE_SPHERESFM):
+        panel.engine_combo.setCurrentIndex(panel.engine_combo.findData(engine))
+        panel.source_combo.setCurrentIndex(panel.source_combo.findData(SEVERAL_FRAME_SETS))
+        assert not panel.multi_list.isHidden()
+        _check(panel, "a1~i1")
+        assert not panel.run_btn.isEnabled() and not panel.queue_btn.isEnabled()  # one set isn't a combination
+
+        _check(panel, "a1~i1", "insta~i1")
+        assert panel.run_btn.isEnabled() and panel.queue_btn.isEnabled()
+        assert panel._selected_frame_set_ids() == ["a1~i1", "insta~i1"]
+        assert panel._current_sfm_args()[1] is None
+        assert "sequential matching" in panel.multi_note.text().lower()
+        assert "same clip" not in panel.multi_note.text()
+
+        _check(panel, "a1~i1", "insta~i1", "insta~i0.5")
+        assert "same clip" in panel.multi_note.text()
+
+    panel.options_editor.set_config(panel.options_editor.config().replace(matcher="exhaustive"))
+    _check(panel, "a1~i1", "insta~i1")
+    assert "sequential matching" not in panel.multi_note.text().lower()
+
+    panel._on_add_to_queue()
+    job = state.queue_manager.jobs[-1]
+    assert job.params["frame_set_ids"] == ["a1~i1", "insta~i1"]
+    assert job.params["frame_set_id"] is None
+    assert job.params["engine"] == "spheresfm"
+    assert job.status == "queued" and job.depends_on == []  # both sets already have frames
+    assert "+" in job.label
+
+    panel.source_combo.setCurrentIndex(panel.source_combo.findData("a1~i1"))
+    assert panel.multi_list.isHidden() and panel._selected_frame_set_ids() == ["a1~i1"]
+
+
+def test_a_multi_frame_set_pose_job_waits_for_every_sets_projection(qapp, project):
+    """docs/adr/0046: the queue auto-inserts a Projection job for each
+    chosen frame set without views, and the Pose job depends on all of
+    them; a set it can't prepare blocks the job instead."""
+    from vine360.gui.queue_manager import STAGE_POSE, STAGE_PROJECTION
+
+    root, conn = project
+    for source_id in ("a1", "insta"):
+        _insert_source(conn, source_id)
+        _insert_frame_set(conn, source_id, f"{source_id}~i1", "every 1s")
+    queue = QueueManager(_state(root, conn))
+
+    params = {"image_source": "projections", "frame_set_id": None, "camera_model": "SIMPLE_RADIAL"}
+    job = queue.add_job(STAGE_POSE, None, {**params, "frame_set_ids": ["a1~i1", "insta~i1"]}, "pose")
+    assert job.status == "queued"
+    prerequisites = [queue._get(job_id) for job_id in job.depends_on]
+    assert [(p.stage, p.target_frame_set_id) for p in prerequisites] == [
+        (STAGE_PROJECTION, "a1~i1"),
+        (STAGE_PROJECTION, "insta~i1"),
+    ]
+
+    _insert_source(conn, "b")
+    _insert_frame_set(conn, "b", "b~i1", "every 1s")
+    blocked = queue.add_job(STAGE_POSE, None, {**params, "frame_set_ids": ["b~i1", "gone~i1"]}, "pose")
+    assert blocked.status == "blocked" and "gone~i1" in blocked.error_message
+    assert not any(j.target_frame_set_id == "b~i1" for j in queue.jobs), "no orphaned Projection job for b"
+    reloaded = QueueManager(_state(root, conn))
+    reloaded.load()
+    assert len(reloaded.jobs) == len(queue.jobs), "nor one left in the database"
 
 
 def test_export_panel_defaults_into_the_new_projects_exports_after_switching_project(qapp, tmp_path):

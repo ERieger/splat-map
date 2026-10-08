@@ -133,7 +133,9 @@ an earlier one's files (docs/adr/0019) — this field is load-bearing, not incid
 `<source_id>~<tag>` (`frame_set_id_for`), and every stage after Frames — projection, masks,
 SfM, export, queue jobs, GUI dropdowns — is scoped by `frame_set_id`, not `source_id`. Frames
 extracted before frame sets existed were migrated into a set whose id *is* the source_id, so
-their paths are unchanged.
+their paths are unchanged. A Pose run can also cover several chosen frame sets at once (e.g.
+A1 aerial + Insta360 ground, docs/adr/0046): its scope is `sfm_runs.config["frame_set_ids"]`,
+read through `sfm.project_run.run_frame_set_ids` -- never assume a run has one `frame_set_id`.
 
 **Cascade-delete invariant**: re-running an earlier pipeline stage must delete every downstream
 derived artifact (frames → views → masks), both DB rows and on-disk files, or you get orphaned

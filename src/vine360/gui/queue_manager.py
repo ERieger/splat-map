@@ -222,6 +222,15 @@ def _params_frame_set_id(params: dict) -> str | None:
     return params.get("frame_set_id", params.get("source_id"))
 
 
+def _params_frame_set_ids(params: dict) -> list[str]:
+    """A Pose job's frame sets: "frame_set_ids" for a multi-frame-set run
+    (docs/adr/0046), else its single frame set, else [] (all frame sets)."""
+    if params.get("frame_set_ids"):
+        return list(params["frame_set_ids"])
+    single = _params_frame_set_id(params)
+    return [single] if single else []
+
+
 class QueueManager(QObject):
     """Owns the ordered queue of jobs for the currently open project,
     persisted to that project's queue_jobs table. Runs at most one job at
@@ -463,13 +472,13 @@ class QueueManager(QObject):
             return self._require_views(target_frame_set_id)
 
         if stage == STAGE_POSE:
-            frame_set_id = _params_frame_set_id(params)
+            frame_set_ids = _params_frame_set_ids(params)
             if params.get("image_source") == "frames":
-                if not frame_set_id:
+                if not frame_set_ids:
                     return [], "no frame set selected for the native-equirectangular engine"
-                return self._require_frames(frame_set_id)
-            if frame_set_id:
-                return self._require_views(frame_set_id)
+                return self._require_each(self._require_frames, frame_set_ids)
+            if frame_set_ids:
+                return self._require_each(self._require_views, frame_set_ids)
             # Six-face-projections engine over the whole project/
             # projections/ -- not scoped to one frame set -- so its
             # prerequisite is "some" Projection output existing.
@@ -477,11 +486,11 @@ class QueueManager(QObject):
 
         if stage == STAGE_EXPORT:
             if params.get("mode") == "poses":
-                run_frame_set_id = self._frame_run_frame_set(params.get("run_id"))
-                if run_frame_set_id:
-                    # A raw-360-frame run exports its frame set's projected
+                run_frame_set_ids = self._frame_run_frame_sets(params.get("run_id"))
+                if run_frame_set_ids:
+                    # A raw-360-frame run exports its frame sets' projected
                     # views (vine360.sfm.frame_poses, docs/adr/0036).
-                    return self._require_views(run_frame_set_id)
+                    return self._require_each(self._require_views, run_frame_set_ids)
                 if _has_any_sfm_run(conn):
                     return [], None
                 existing = next(
@@ -503,17 +512,36 @@ class QueueManager(QObject):
 
         return [], None
 
-    def _frame_run_frame_set(self, run_id: str | None) -> str | None:
-        """The frame set of a raw-frame (360) SfM run, else None."""
+    def _frame_run_frame_sets(self, run_id: str | None) -> list[str]:
+        """The frame sets of a raw-frame (360) SfM run, else []."""
         if not run_id:
-            return None
+            return []
         row = self.state.conn.execute("SELECT config FROM sfm_runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
-            return None
+            return []
         config = json.loads(row[0])
         if config.get("image_source") != "frames":
-            return None
-        return config.get("frame_set_id") or config.get("source_id")
+            return []
+        single = config.get("frame_set_id") or config.get("source_id")
+        return list(config.get("frame_set_ids") or ([single] if single else []))
+
+    def _require_each(self, require, frame_set_ids: list[str]) -> tuple[list[str], str | None]:
+        """require (_require_frames / _require_views) for every frame set of
+        a multi-frame-set job: the union of their dependencies, or the
+        first blocked reason -- a job needing several sets runs only once
+        all of them are ready (docs/adr/0046). A blocked job keeps none of
+        the prerequisites auto-queued for its other sets on the way."""
+        known = {job.job_id for job in self.jobs}
+        depends_on: list[str] = []
+        for frame_set_id in frame_set_ids:
+            deps, blocked_reason = require(frame_set_id)
+            if blocked_reason:
+                for job in [j for j in self.jobs if j.job_id not in known]:
+                    self.jobs.remove(job)
+                    _delete_job(self.state.conn, job.job_id)
+                return [], blocked_reason
+            depends_on += [d for d in deps if d not in depends_on]
+        return depends_on, None
 
     def _resolve_project_wide_projection_prerequisite(self, conn: sqlite3.Connection) -> tuple[list[str], str | None]:
         if _has_any_views(conn):
@@ -715,9 +743,11 @@ class QueueManager(QObject):
                 params.get("overexposure_clip", 250), params.get("overexposure_bloom_radius", 40),
             )
         elif job.stage == STAGE_POSE:
+            frame_set_ids = _params_frame_set_ids(params)
             fn, args = mw._run_sfm_worker, (
-                project_root, params["image_source"], _params_frame_set_id(params), params["camera_model"],
-                params.get("engine", "pycolmap"), params.get("options"),
+                project_root, params["image_source"], frame_set_ids[0] if len(frame_set_ids) == 1 else None,
+                params["camera_model"], params.get("engine", "pycolmap"), params.get("options"),
+                frame_set_ids if len(frame_set_ids) > 1 else None,
             )
         elif job.stage == STAGE_EXPORT:
             output_dir = Path(params["output_dir"])

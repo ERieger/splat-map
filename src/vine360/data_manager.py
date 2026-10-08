@@ -15,7 +15,7 @@ import json
 import os
 import shutil
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from vine360.cleanup import remove_mask_files
@@ -70,10 +70,11 @@ class SfmRunInfo:
     run_id: str
     created_at: str
     image_source: str
-    frame_set_id: str | None
+    frame_set_id: str | None  # None for a project-wide or a multi-frame-set run
     registered_images: int
     total_images: int
     engine: str = "pycolmap"  # or "spheresfm" (docs/adr/0036)
+    frame_set_ids: list[str] = field(default_factory=list)  # every set the run used (docs/adr/0046)
 
     @property
     def engine_label(self) -> str:
@@ -218,6 +219,7 @@ def list_sfm_runs(conn: sqlite3.Connection) -> list[SfmRunInfo]:
         # Pre-frame-set "frames"-engine runs only recorded source_id, which
         # is also their (migrated, legacy) frame_set_id -- docs/adr/0034.
         frame_set_id = config.get("frame_set_id") or (config.get("source_id") if image_source == "frames" else None)
+        frame_set_ids = config.get("frame_set_ids") or ([frame_set_id] if frame_set_id else [])
         result.append(
             SfmRunInfo(
                 run_id=run_id,
@@ -227,6 +229,7 @@ def list_sfm_runs(conn: sqlite3.Connection) -> list[SfmRunInfo]:
                 registered_images=stats.get("registered_images", 0),
                 total_images=stats.get("total_images", 0),
                 engine=config.get("engine", "pycolmap"),
+                frame_set_ids=list(frame_set_ids),
             )
         )
     return result

@@ -37,9 +37,16 @@ from vine360.sfm.colmap_adapter import (
     run_sfm,
     validate_installation,
 )
-from vine360.sfm.options import VARIANT_EQUIRECT, VARIANT_PROJECTIONS, VARIANT_SPHERESFM
+from vine360.sfm.options import MATCHER_SEQUENTIAL, VARIANT_EQUIRECT, VARIANT_PROJECTIONS, VARIANT_SPHERESFM
 
-__all__ = ["ENGINE_PYCOLMAP", "ENGINE_SPHERESFM", "SfmRegistrationError", "run_sfm_for_project"]
+__all__ = [
+    "ENGINE_PYCOLMAP",
+    "ENGINE_SPHERESFM",
+    "SfmRegistrationError",
+    "multi_set_matcher_warning",
+    "run_frame_set_ids",
+    "run_sfm_for_project",
+]
 
 # sfm_runs.config["engine"]; rows recorded before the field existed are
 # pycolmap runs (run_engine()).
@@ -49,6 +56,62 @@ ENGINE_SPHERESFM = "spheresfm"
 
 def run_engine(config: dict) -> str:
     return config.get("engine", ENGINE_PYCOLMAP)
+
+
+def run_frame_set_ids(config: dict) -> list[str]:
+    """The frame sets an sfm run was scoped to, from its sfm_runs.config --
+    [] for a project-wide ("All frame sets") projections run. Runs since
+    multi-frame-set SfM (docs/adr/0046) record "frame_set_ids"; older ones
+    only "frame_set_id", and ones from before frame sets existed only
+    "source_id", which for a migrated legacy frame set *is* its
+    frame_set_id (docs/adr/0034)."""
+    ids = config.get("frame_set_ids")
+    if ids:
+        return list(ids)
+    single = config.get("frame_set_id") or config.get("source_id")
+    return [single] if single else []
+
+
+def frame_image_name(frame_set_ids: list[str], frame_set_id: str, frame_path: str) -> str:
+    """The name a raw frame has inside a "frames" run's COLMAP model: the
+    bare file name for a single-frame-set run (image_dir is
+    frames/<frame_set_id>/, unchanged since before docs/adr/0046), or
+    "<frame_set_id>/<file name>" for a multi-frame-set run (image_dir is
+    frames/ -- every set names its frames frame_000001.png onwards, so
+    bare names would collide)."""
+    name = Path(frame_path).name
+    return name if len(frame_set_ids) <= 1 else f"{frame_set_id}/{name}"
+
+
+def multi_set_matcher_warning(frame_set_ids: list[str] | None, config: SfmConfig) -> str | None:
+    """Why a multi-frame-set run probably won't join its sets into one
+    model, or None. Sequential matching pairs each image only with its
+    neighbours in the (per-set, time-ordered) image list, so two sets meet
+    only at the one boundary between them; loop detection (vocabulary
+    tree) can still find cross-set pairs (docs/adr/0046)."""
+    if not frame_set_ids or len(frame_set_ids) < 2:
+        return None
+    if config.matcher != MATCHER_SEQUENTIAL or config.loop_detection:
+        return None
+    return (
+        "sequential matching only pairs images near each other in time, so these frame sets will barely be "
+        "matched against each other -- use exhaustive or vocabulary-tree matching (or loop detection) to "
+        "join them into one model"
+    )
+
+
+def _scope_fields(frame_set_ids: list[str], source_ids: list[str | None]) -> dict:
+    """sfm_runs.config's scope keys. "frame_set_id"/"source_id" keep their
+    old single-set meaning -- None for a project-wide *and* a multi-set
+    run, so a reader that predates "frame_set_ids" never mistakes a
+    multi-set run for a run of just one of its sets."""
+    single = len(frame_set_ids) == 1
+    return {
+        "frame_set_id": frame_set_ids[0] if single else None,
+        "source_id": source_ids[0] if single else None,
+        "frame_set_ids": list(frame_set_ids),
+        "source_ids": [s for s in dict.fromkeys(source_ids) if s],
+    }
 
 
 def _image_set_hash(image_names: list[str]) -> str:
@@ -77,6 +140,7 @@ def run_sfm_for_project(
     config: SfmConfig = SfmConfig(),
     image_source: str = "projections",
     frame_set_id: str | None = None,
+    frame_set_ids: list[str] | None = None,
     engine: str = ENGINE_PYCOLMAP,
     runner=None,
     progress_callback=None,
@@ -92,6 +156,17 @@ def run_sfm_for_project(
     several frame sets (e.g. every 0.5s and every 1s), and mixing them
     in one reconstruction would just duplicate near-identical images
     (docs/adr/0034).
+
+    frame_set_ids runs on several chosen frame sets at once, in one
+    reconstruction -- e.g. an aerial and a ground capture of the same
+    block, for more observations in one coordinate frame (docs/adr/0046).
+    Every engine supports it; frame_set_id=X is shorthand for
+    frame_set_ids=[X]. A multi-set raw-frame run gives each frame set its
+    own camera, since the sets usually come from different cameras at
+    different resolutions: SphereSfM extracts features once per set into
+    the shared database, and pycolmap's "auto"/"single" camera mode
+    becomes one camera per folder (= per frame set). A sequential-matcher
+    multi-set run also gets a multi_set_matcher_warning.
 
     Either way COLMAP is handed an explicit image list (pycolmap's
     `image_names`) built from the database, not a bare directory scan --
@@ -121,39 +196,50 @@ def run_sfm_for_project(
     if problems:
         raise ValueError("SfM options can't run as configured: " + "; ".join(problems))
 
-    source_id = None
-    if frame_set_id is not None:
-        row = conn.execute("SELECT source_id FROM frame_sets WHERE frame_set_id = ?", (frame_set_id,)).fetchone()
-        source_id = row[0] if row else None
+    if frame_set_ids is not None and frame_set_id is not None and list(frame_set_ids) != [frame_set_id]:
+        raise ValueError("pass frame_set_id or frame_set_ids, not both")
+    ids = list(dict.fromkeys(frame_set_ids if frame_set_ids is not None else ([frame_set_id] if frame_set_id else [])))
+    source_ids = []
+    for fs_id in ids:
+        row = conn.execute("SELECT source_id FROM frame_sets WHERE frame_set_id = ?", (fs_id,)).fetchone()
+        source_ids.append(row[0] if row else None)
+    multi = len(ids) > 1
+    if multi and image_source == "frames" and engine == ENGINE_PYCOLMAP and config.camera_mode in ("auto", "single"):
+        # One shared EQUIRECTANGULAR camera can't describe two sources at
+        # different resolutions; a frame set is a folder here (image_dir is frames/).
+        config = config.replace(camera_mode="per_folder")
 
     if image_source == "projections":
         image_dir = project_root / "projections"
-        if frame_set_id is None:
+        if not ids:
             rows = conn.execute("SELECT image_path FROM views ORDER BY image_path").fetchall()
             missing_message = "no projected views found under projections/; generate projections first"
         else:
             rows = conn.execute(
                 "SELECT v.image_path FROM views v JOIN frames f ON f.frame_id = v.frame_id "
-                "WHERE f.frame_set_id = ? ORDER BY v.image_path",
-                (frame_set_id,),
+                f"WHERE f.frame_set_id IN ({', '.join('?' * len(ids))}) ORDER BY v.image_path",
+                ids,
             ).fetchall()
-            missing_message = f"no projected views found for frame set {frame_set_id}; generate projections first"
+            missing_message = f"no projected views found for frame set {', '.join(ids)}; generate projections first"
         image_names = [Path(r[0]).relative_to("projections").as_posix() for r in rows]
         from vine360.masking.layers import ensure_composites_current  # numpy/Pillow; projections path only
 
-        ensure_composites_current(conn, project_root, frame_set_id)  # merge mask layers (docs/adr/0038)
+        for fs_id in ids or [None]:
+            ensure_composites_current(conn, project_root, fs_id)  # merge mask layers (docs/adr/0038)
         mask_dir = project_root / "masks" / "keep"
         mask_dir_arg = mask_dir if mask_dir.exists() and any(mask_dir.rglob("*.png")) else None
     elif image_source == "frames":
-        if not frame_set_id:
+        if not ids:
             raise ValueError("frame_set_id is required when image_source='frames'")
-        image_dir = project_root / "frames" / frame_set_id
-        rows = conn.execute(
-            "SELECT path FROM frames WHERE frame_set_id = ? ORDER BY source_time", (frame_set_id,)
-        ).fetchall()
-        image_names = [Path(r[0]).name for r in rows]
+        image_dir = project_root / "frames" if multi else project_root / "frames" / ids[0]
+        image_names = []
+        for fs_id in ids:
+            rows = conn.execute(
+                "SELECT path FROM frames WHERE frame_set_id = ? ORDER BY source_time", (fs_id,)
+            ).fetchall()
+            image_names += [frame_image_name(ids, fs_id, r[0]) for r in rows]
         mask_dir_arg = None  # masks aren't built against raw frames in this pipeline yet
-        missing_message = f"no extracted frames found under frames/{frame_set_id}/; extract frames first"
+        missing_message = f"no extracted frames found under frames/{'/, frames/'.join(ids)}/; extract frames first"
     else:
         raise ValueError(f"unknown image_source: {image_source!r} (expected 'projections' or 'frames')")
 
@@ -163,9 +249,7 @@ def run_sfm_for_project(
     if engine == ENGINE_SPHERESFM:
         if image_source != "frames":
             raise ValueError("the SphereSfM engine only runs on raw equirectangular frames (image_source='frames')")
-        return _run_spheresfm(
-            conn, project_root, image_dir, image_names, frame_set_id, source_id, config, runner, notify
-        )
+        return _run_spheresfm(conn, project_root, image_dir, image_names, ids, source_ids, config, runner, notify)
     if engine != ENGINE_PYCOLMAP:
         raise ValueError(f"unknown SfM engine: {engine!r}")
 
@@ -190,7 +274,7 @@ def run_sfm_for_project(
         diagnostics.total_images,
     )
 
-    warnings = _quality_warnings(diagnostics, config)
+    warnings = _quality_warnings(diagnostics, config) + list(filter(None, [multi_set_matcher_warning(ids, config)]))
 
     conn.execute(
         """
@@ -209,8 +293,7 @@ def run_sfm_for_project(
                     "sequential_overlap": config.sequential_overlap,
                     "image_source": image_source,
                     "options": config.to_dict(),
-                    "frame_set_id": frame_set_id,
-                    "source_id": source_id,
+                    **_scope_fields(ids, source_ids),
                 }
             ),
             json.dumps(diagnostics.to_dict()),
@@ -222,13 +305,23 @@ def run_sfm_for_project(
     return diagnostics, warnings
 
 
+def _images_by_frame_set(frame_set_ids: list[str], image_names: list[str]) -> list[tuple[str, list[str]]]:
+    """image_names split back into (frame_set_id, names) in run order --
+    the whole list for a single-set run, else by each name's
+    "<frame_set_id>/" prefix (frame_image_name)."""
+    if len(frame_set_ids) <= 1:
+        return [(frame_set_ids[0] if frame_set_ids else "", image_names)]
+    groups = [(fs_id, [name for name in image_names if name.startswith(fs_id + "/")]) for fs_id in frame_set_ids]
+    return [(fs_id, names) for fs_id, names in groups if names]
+
+
 def _run_spheresfm(
     conn: sqlite3.Connection,
     project_root: Path,
     image_dir: Path,
     image_names: list[str],
-    frame_set_id: str,
-    source_id: str | None,
+    frame_set_ids: list[str],
+    source_ids: list[str | None],
     config: SfmConfig,
     runner,
     notify,
@@ -236,7 +329,7 @@ def _run_spheresfm(
     """SphereSfM's own CLI pipeline (vine360.sfm.spheresfm_adapter), with
     the same per-run layout as a pycolmap run: everything -- database,
     every candidate model, each model's TXT conversion -- under
-    sfm/sparse/<run_id>/ (docs/adr/0019/0034/0036)."""
+    sfm/sparse/<run_id>/ (docs/adr/0019/0034/0036/0046)."""
     from PIL import Image
 
     from vine360.runners.local import LocalRunner
@@ -253,16 +346,15 @@ def _run_spheresfm(
     match_gpu = use_gpu and config.use_gpu
     extract_gpu = match_gpu and not (config.estimate_affine_shape or config.domain_size_pooling)  # CPU-only SIFT
     matcher_command = sph.MATCHER_COMMANDS[config.matcher]  # also names its log file
-    sph.check_readable_images(image_dir, image_names)
-    with Image.open(image_dir / image_names[0]) as first:
-        width, height = first.size
+    for _fs_id, names in _images_by_frame_set(frame_set_ids, image_names):
+        sph.check_readable_images(image_dir, names)  # before any run directory exists
 
     run_id = f"sfm-{uuid.uuid4().hex[:8]}"
     run_dir = project_root / "sfm" / "sparse" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     database_path = run_dir / "database.db"
     image_list_path = run_dir / "image_list.txt"
-    image_list_path.write_text("\n".join(image_names) + "\n")
+    image_list_path.write_text("\n".join(image_names) + "\n")  # every image, whatever the set count
 
     extract_device = "GPU" if extract_gpu else "CPU"
     device = "GPU" if match_gpu else "CPU"
@@ -272,26 +364,50 @@ def _run_spheresfm(
         return sph.ProgressParser(f"SphereSfM step {step}/4 ({label}): ", n, notify)
 
     notify(f"SphereSfM step 1/4 (features, {extract_device}): starting on {n} frames…", 0, n)
-    extraction_parser = parser(1, f"features, {extract_device}")
-    sph.run_command(
-        runner,
-        sph.build_feature_extraction_command(
-            binary, database_path, image_dir, image_list_path, width=width, height=height, use_gpu=use_gpu,
-            config=config,
-        ),
-        "feature extraction",
-        on_line=extraction_parser.feed,
-        log_path=run_dir / "1_feature_extractor.log",
-    )
-    if extraction_parser.unreadable >= n:
-        # Extraction exits 0 even when it read nothing; the matcher would
-        # then abort on the empty database with an opaque cache error.
-        raise sph.SphereSfmError(
-            f"SphereSfM couldn't read any of the {n} frames (\"Failed to read image file format\") -- "
-            f"see {run_dir / '1_feature_extractor.log'}"
+    # One feature_extractor call per frame set, all into the one database:
+    # SPHERE's params are the image centre, so each set (a different
+    # camera, often at a different resolution) needs its own -- and each
+    # call creates its own camera (docs/adr/0046). A single-set run is
+    # exactly the one call it always was, image_list.txt and log included.
+    groups = _images_by_frame_set(frame_set_ids, image_names)
+    unreadable = 0
+    done = 0
+    for index, (fs_id, names) in enumerate(groups, start=1):
+        with Image.open(image_dir / names[0]) as first:
+            width, height = first.size
+        suffix = f"_{index}" if len(groups) > 1 else ""
+        list_path = image_list_path if len(groups) == 1 else run_dir / f"image_list{suffix}.txt"
+        list_path.write_text("\n".join(names) + "\n")
+        which = f"set {index}/{len(groups)}, " if len(groups) > 1 else ""
+
+        def offset_notify(message, current, total, _base=done):
+            notify(message, None if current is None else _base + current, n if total is not None else None)
+
+        extraction_parser = sph.ProgressParser(
+            f"SphereSfM step 1/4 (features, {extract_device}): {which}", n, offset_notify
         )
-    if extraction_parser.unreadable:
-        notify(f"SphereSfM step 1/4: {extraction_parser.unreadable}/{n} frames were unreadable and skipped", n, n)
+        log_path = run_dir / f"1_feature_extractor{suffix}.log"
+        sph.run_command(
+            runner,
+            sph.build_feature_extraction_command(
+                binary, database_path, image_dir, list_path, width=width, height=height, use_gpu=use_gpu,
+                config=config,
+            ),
+            "feature extraction" + (f" ({fs_id})" if len(groups) > 1 else ""),
+            on_line=extraction_parser.feed,
+            log_path=log_path,
+        )
+        if extraction_parser.unreadable >= len(names):
+            # Extraction exits 0 even when it read nothing; the matcher would
+            # then abort on the empty database with an opaque cache error.
+            raise sph.SphereSfmError(
+                f"SphereSfM couldn't read any of the {len(names)} frames of {fs_id} "
+                f"(\"Failed to read image file format\") -- see {log_path}"
+            )
+        unreadable += extraction_parser.unreadable
+        done += len(names)
+    if unreadable:
+        notify(f"SphereSfM step 1/4: {unreadable}/{n} frames were unreadable and skipped", n, n)
     notify(f"SphereSfM step 2/4 (matching, {device}): {config.matcher}, starting…", 0, n)
     sph.run_command(
         runner,
@@ -317,7 +433,7 @@ def _run_spheresfm(
         sph.run_command(runner, sph.build_model_converter_command(binary, model_dir, txt_dir), "model conversion")
         candidates[model_dir] = sph.read_text_model(txt_dir)
     if not candidates:
-        raise SfmRegistrationError(f"SphereSfM registered no images from frames/{frame_set_id}/")
+        raise SfmRegistrationError(f"SphereSfM registered no images from frames/{'/, frames/'.join(frame_set_ids)}/")
     model_dir, model = max(candidates.items(), key=lambda item: len(item[1].images))
 
     track_lengths = [len(point.track) for point in model.points.values()]
@@ -340,7 +456,9 @@ def _run_spheresfm(
         registered,
         n,
     )
-    warnings = _quality_warnings(diagnostics, config)
+    warnings = _quality_warnings(diagnostics, config) + list(
+        filter(None, [multi_set_matcher_warning(frame_set_ids, config)])
+    )
 
     conn.execute(
         """
@@ -359,8 +477,7 @@ def _run_spheresfm(
                     "sequential_overlap": config.sequential_overlap,
                     "image_source": "frames",
                     "options": config.to_dict(),
-                    "frame_set_id": frame_set_id,
-                    "source_id": source_id,
+                    **_scope_fields(frame_set_ids, source_ids),
                 }
             ),
             json.dumps(diagnostics.to_dict()),

@@ -78,27 +78,31 @@ def render_equirect(center: np.ndarray, rotation_world_from_pano: np.ndarray, wi
     return image
 
 
-def ground_truth_trajectory(n: int = 6) -> list[tuple[np.ndarray, np.ndarray]]:
+def ground_truth_trajectory(n: int = 6, offset=(0.0, 0.0, 0.0)) -> list[tuple[np.ndarray, np.ndarray]]:
     """(center, R_world_from_pano) per frame: a gentle walk with a little
-    yaw, like a handheld 360 pass -- real translation between frames."""
+    yaw, like a handheld 360 pass -- real translation between frames.
+    `offset` shifts the whole walk, e.g. to stand in for a second capture
+    of the same scene from higher up."""
     poses = []
     for i in range(n):
-        center = np.array([-1.5 + 0.6 * i, 0.1 * np.sin(i), -0.5 + 0.25 * i])
+        center = np.array([-1.5 + 0.6 * i, 0.1 * np.sin(i), -0.5 + 0.25 * i]) + np.asarray(offset, dtype=np.float64)
         poses.append((center, rotation_y(np.radians(8.0 * i - 20.0))))
     return poses
 
 
-def write_frames(directory: Path, n: int = 6, width: int = 1024) -> list[Path]:
+def write_frames(directory: Path, n: int = 6, width: int = 1024, offset=(0.0, 0.0, 0.0)) -> list[Path]:
     directory.mkdir(parents=True, exist_ok=True)
     paths = []
-    for i, (center, rotation) in enumerate(ground_truth_trajectory(n)):
+    for i, (center, rotation) in enumerate(ground_truth_trajectory(n, offset)):
         path = directory / f"frame_{i + 1:06d}.png"
         Image.fromarray(render_equirect(center, rotation, width)).save(path)
         paths.append(path)
     return paths
 
 
-def add_synthetic_frame_set(conn, project_root: Path, *, n: int = 6, width: int = 1024, source_id: str = "synth") -> str:
+def add_synthetic_frame_set(
+    conn, project_root: Path, *, n: int = 6, width: int = 1024, source_id: str = "synth", offset=(0.0, 0.0, 0.0)
+) -> str:
     """Registers a synthetic equirectangular source and one frame set of
     `n` rendered frames, shaped exactly like extract_frames writes them
     (frames/<frame_set_id>/frame_NNNNNN.png, frame_id <frame_set_id>:NNNNNN).
@@ -116,7 +120,7 @@ def add_synthetic_frame_set(conn, project_root: Path, *, n: int = 6, width: int 
         "VALUES (?, ?, 'every 1s', ?, '2026-01-01')",
         (frame_set_id, source_id, json.dumps({"mode": "interval", "interval_seconds": 1.0})),
     )
-    paths = write_frames(Path(project_root) / "frames" / frame_set_id, n=n, width=width)
+    paths = write_frames(Path(project_root) / "frames" / frame_set_id, n=n, width=width, offset=offset)
     for i, path in enumerate(paths):
         conn.execute(
             "INSERT INTO frames (frame_id, source_id, source_time, extraction_settings, path, checksum, frame_set_id) "

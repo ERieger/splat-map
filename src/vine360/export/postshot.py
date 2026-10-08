@@ -128,6 +128,7 @@ import pycolmap
 from vine360.masking.layers import ensure_composites_current
 from vine360.masking.semantics import colmap_mask_path
 from vine360.project import PROJECT_FILE
+from vine360.sfm.project_run import run_frame_set_ids
 
 _COLMAP_MODEL_FILES = ("cameras.bin", "images.bin", "points3D.bin")
 _MANAGED_SUBDIRS = ("images", "masks", "sparse")
@@ -152,12 +153,6 @@ def _flatten_to_unique_filename(relative_path: Path) -> str:
     return "__".join(part.replace(":", "_") for part in relative_path.parts)
 
 
-def _run_frame_set_id(config: dict) -> str | None:
-    """Which frame set an sfm run was scoped to -- None for a project-wide
-    "projections" run. Runs recorded before frame sets existed only have
-    source_id, which for a migrated legacy frame set *is* its
-    frame_set_id (docs/adr/0034), so it doubles as the fallback."""
-    return config.get("frame_set_id") or config.get("source_id")
 
 
 def _select_priors_run(conn: sqlite3.Connection, *, frame_set_id: str | None) -> tuple[str, str, dict] | None:
@@ -170,7 +165,8 @@ def _select_priors_run(conn: sqlite3.Connection, *, frame_set_id: str | None) ->
     covers any frame set, since it's project-wide); a run scoped to a
     *different* frame set is never picked when frame_set_id is given
     (guaranteed zero overlap -- picking it would silently write an empty
-    CSV). When frame_set_id is None, prefers the most recent project-wide
+    CSV). A multi-frame-set run (docs/adr/0046) covers each of its sets:
+    it's picked after an exact single-set run, before a project-wide one. When frame_set_id is None, prefers the most recent project-wide
     "projections" run, falling back to the most recent run of any scope
     (which only partially covers an all-frame-sets export -- acceptable,
     surfaced as a warning by the caller, not an error here).
@@ -188,18 +184,19 @@ def _select_priors_run(conn: sqlite3.Connection, *, frame_set_id: str | None) ->
 
     def is_project_wide(candidate: tuple[str, str, dict]) -> bool:
         config = candidate[2]
-        return config.get("image_source", "projections") == "projections" and not config.get("frame_set_id")
+        return config.get("image_source", "projections") == "projections" and not run_frame_set_ids(config)
 
     def is_matching(candidate: tuple[str, str, dict]) -> bool:
-        return _run_frame_set_id(candidate[2]) == frame_set_id
+        return run_frame_set_ids(candidate[2]) == [frame_set_id]
+
+    def includes(candidate: tuple[str, str, dict]) -> bool:
+        return frame_set_id in run_frame_set_ids(candidate[2])
 
     if frame_set_id is not None:
-        for candidate in candidates:
-            if is_matching(candidate):
-                return candidate
-        for candidate in candidates:
-            if is_project_wide(candidate):
-                return candidate
+        for predicate in (is_matching, includes, is_project_wide):
+            for candidate in candidates:
+                if predicate(candidate):
+                    return candidate
         return None
 
     for candidate in candidates:
@@ -299,12 +296,12 @@ def _write_camera_priors_csv(
             frame_model = load_frame_model(conn, project_root, run_id)
         except FramePoseError as exc:
             return None, 0, f"camera priors: {exc} -- skipped"
-        run_frame_set_id = frame_model.frame_set_id
+        ids = frame_model.frame_set_ids
         flat_names_by_frame_id: dict[str, list[str]] = {}
         for frame_id, image_path in conn.execute(
             "SELECT v.frame_id, v.image_path FROM views v JOIN frames f ON f.frame_id = v.frame_id "
-            "WHERE f.frame_set_id = ?",
-            (run_frame_set_id,),
+            f"WHERE f.frame_set_id IN ({', '.join('?' * len(ids))})",
+            ids,
         ).fetchall():
             flat_name = _flatten_to_unique_filename(Path(image_path).relative_to("projections"))
             if flat_name in exported_flat_names:
