@@ -42,6 +42,11 @@ masking = [
     "huggingface_hub",
     "accelerate",
 ]
+# Georeferencing (M8): AprilTag detection on projected views -- see
+# docs/adr/0047. pupil-apriltags ships cp312 manylinux wheels; no OpenCV.
+georef = [
+    "pupil-apriltags>=1.0.4",
+]
 # A future desktop UI milestone (M6) is expected to add PySide6; the CLI's
 # own argparse/dataclasses choice over Typer/Pydantic is unaffected -- see
 # docs/adr/0001-stdlib-first-cli.md and docs/adr/0006-real-dependencies-for-m2-plus.md.
