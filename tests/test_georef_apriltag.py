@@ -50,7 +50,17 @@ def _area_sampled(cells: np.ndarray, x0: float, y0: float, cell: float, shape=(6
 
 @pytest.fixture(scope="module")
 def detector():
-    return TagDetector("tag36h11")
+    with TagDetector("tag36h11") as d:
+        yield d
+
+
+def test_close_tears_down_in_apriltags_order_and_is_idempotent():
+    d = TagDetector("tag36h11")
+    d.detect(np.full((64, 64), 255, np.uint8))
+    d.close()
+    assert d._detector.tag_detector_ptr is None and d._detector.tag_families == {}
+    d.close()  # and the library's own __del__ must now be a no-op
+    del d
 
 
 @pytest.mark.parametrize("tag_id", [0, 20, 22, 25, 31])

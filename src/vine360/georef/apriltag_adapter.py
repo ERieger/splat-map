@@ -18,6 +18,16 @@ Measured conventions (tests/test_georef_apriltag.py pins them):
   frame, so corner k is the same physical corner in every view; they sit
   ~0.1-0.3 px outward of the true edge.
 
+**Teardown is ours, not the library's.** pupil-apriltags' own
+`Detector.__del__` destroys the tag family *before* the detector, and
+`apriltag_detector_destroy` then reads the freed family
+(`apriltag_detector_clear_families` -> `quick_decode_uninit(fam)`): a
+use-after-free that segfaulted 2 of 3 full test-suite runs here, whenever
+the freed memory had been reused. AprilTag's own documented order is
+detector first, then family. `TagDetector.close()` (also run from its
+`__del__`) does that and clears the library object's pointer, so its own
+`__del__` is a no-op.
+
 Only detect tags on pinhole images -- never on an equirectangular frame
 (the detector's quad fitting assumes straight edges). The rest of
 vine360.georef never imports the detector library: it sees `Detection`.
@@ -111,9 +121,36 @@ class TagDetector:
             decode_sharpening=params.decode_sharpening,
         )
 
+    def close(self) -> None:
+        """Frees the C detector, then its family -- AprilTag's documented
+        order (see the module docstring for the library bug this avoids)."""
+        detector = getattr(self, "_detector", None)
+        if detector is None or getattr(detector, "tag_detector_ptr", None) is None:
+            return
+        libc = detector.libc
+        libc.apriltag_detector_destroy.restype = None
+        libc.apriltag_detector_destroy(detector.tag_detector_ptr)
+        detector.tag_detector_ptr = None  # the library's own __del__ now does nothing
+        for family, pointer in detector.tag_families.items():
+            destroy = getattr(libc, f"{family}_destroy")
+            destroy.restype = None
+            destroy(pointer)
+        detector.tag_families = {}
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self) -> "TagDetector":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
     def detect(self, image: np.ndarray) -> list[Detection]:
         """image: (H, W) or (H, W, 3/4) uint8. Detections failing the
         hamming / decision-margin limits are dropped."""
+        if self._detector.tag_detector_ptr is None:
+            raise AprilTagUnavailable("this TagDetector has been closed")
         gray = to_gray(image)
         out = []
         for r in self._detector.detect(gray):

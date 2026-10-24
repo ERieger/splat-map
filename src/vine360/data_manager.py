@@ -26,7 +26,11 @@ EXPORT_FORMAT_DIRNAMES = ("colmap", "postshot", "realityscan")
 # What an export function writes into its output folder (vine360.export.
 # postshot's managed subdirectories plus RealityScan's priors CSV) -- the
 # only things an export written straight into exports/ owns there.
-EXPORT_CONTENT_NAMES = ("images", "masks", "sparse", "CameraPriors.csv")
+EXPORT_CONTENT_NAMES = (
+    "images", "masks", "sparse", "CameraPriors.csv",
+    # docs/adr/0047
+    "export_info.json", "georef.json", "georef.prj", "CameraPriors_local.csv", "GroundControl_local.csv",
+)
 
 
 class DataManagerError(Exception):

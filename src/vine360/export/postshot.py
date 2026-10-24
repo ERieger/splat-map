@@ -112,6 +112,17 @@ Postshot's `Camera Poses` setting is strictly binary (`Import` a
 complete external reconstruction wholesale, or `Estimate` from scratch)
 -- no GPS/partial-pose input is surfaced anywhere, so this option does
 not exist for `export_frames_and_masks_for_postshot`. See docs/adr/0033.
+
+**Georeferenced exports (docs/adr/0047).** `export_for_postshot` and
+`export_for_realityscan` take an optional `georef_solution_id`. Export
+never computes a transform: with a solution it reads that solution's
+materialised model (`sfm/georef/<run_id>/<solution_id>/`, written once at
+solve time, in local metres = CRS - origin) instead of the run's own;
+without one it reads the run's own model exactly as before. Both go
+through the same copy code. The chosen solution (or "none") is written to
+`export_info.json`, and a georeferenced export also carries `georef.json`
+and `georef.prj` -- so any export folder traces back to the transform that
+produced it.
 """
 
 from __future__ import annotations
@@ -132,6 +143,10 @@ from vine360.sfm.project_run import run_frame_set_ids
 
 _COLMAP_MODEL_FILES = ("cameras.bin", "images.bin", "points3D.bin")
 _MANAGED_SUBDIRS = ("images", "masks", "sparse")
+# Files this module writes at an export's root -- removed on reset too, so a
+# later non-georeferenced export to the same folder can't inherit a stale
+# georef.json (docs/adr/0047).
+_MANAGED_FILES = ("export_info.json", "georef.json", "georef.prj", "CameraPriors_local.csv", "GroundControl_local.csv")
 
 
 class PostshotExportError(Exception):
@@ -228,6 +243,41 @@ def _reset_managed_subdirs(output_dir: Path) -> None:
         path = output_dir / name
         if path.exists():
             shutil.rmtree(path)
+    for name in _MANAGED_FILES:
+        path = output_dir / name
+        if path.is_file():
+            path.unlink()
+
+
+def _georef_solution(conn: sqlite3.Connection, project_root: Path, solution_id: str) -> dict:
+    """The stored solution, checked to have its materialised model on disk."""
+    from vine360.georef.solve import GeorefSolveError, load_solution
+
+    try:
+        solution = load_solution(conn, solution_id)
+    except GeorefSolveError as exc:
+        raise PostshotExportError(str(exc)) from exc
+    model_dir = solution.get("model_dir")
+    if not model_dir or not all((Path(project_root) / model_dir / name).exists() for name in _COLMAP_MODEL_FILES):
+        raise PostshotExportError(
+            f"georeference solution {solution_id!r} has no materialised model on disk ({model_dir!r}) -- solve again"
+        )
+    return solution
+
+
+def _write_export_info(output_dir: Path, run_id: str | None, solution: dict | None, project_root: Path) -> None:
+    """export_info.json: which run and which georeference (or "none") this
+    export folder came from. Deterministic -- no timestamps -- so the same
+    export twice is byte-identical. A georeferenced export also gets the
+    solution's georef.json / georef.prj."""
+    info = {"run_id": run_id, "georef_solution_id": solution["solution_id"] if solution else "none"}
+    if solution:
+        info["coordinates"] = "local metres = CRS - origin; see georef.json"
+        for name in ("georef.json", "georef.prj"):
+            src = Path(project_root) / solution["model_dir"] / name
+            if src.exists():
+                shutil.copy2(src, output_dir / name)
+    (output_dir / "export_info.json").write_text(json.dumps(info, indent=2) + "\n")
 
 
 def _write_camera_priors_csv(
@@ -334,6 +384,54 @@ def _write_camera_priors_csv(
     return priors_path, len(rows), warning
 
 
+def _write_georef_priors_csv(
+    project_root: Path, solution: dict, output_dir: Path, exported_flat_names: set[str]
+) -> tuple[Path | None, int, str | None]:
+    """CameraPriors_local.csv -- _write_camera_priors_csv's format, from a
+    georeference solution's materialised model: a pinhole view model for
+    either kind of run, image names relative to projections/, so each maps
+    straight to its exported flat name."""
+    reconstruction = pycolmap.Reconstruction(Path(project_root) / solution["model_dir"])
+    rows = []
+    for image in reconstruction.images.values():
+        flat_name = _flatten_to_unique_filename(Path(image.name))
+        if flat_name in exported_flat_names:
+            x, y, z = image.projection_center()
+            rows.append((flat_name, x, y, z))
+    if not rows:
+        return None, 0, "camera priors: the georeferenced run had no overlap with the exported image set -- skipped"
+    path = output_dir / "CameraPriors_local.csv"
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["#name", "x", "y", "alt"])
+        for flat_name, x, y, z in sorted(rows):
+            writer.writerow([flat_name, f"{x:.6f}", f"{y:.6f}", f"{z:.6f}"])
+    warning = None
+    if len(rows) < len(exported_flat_names):
+        warning = (
+            f"camera priors: wrote {len(rows)}/{len(exported_flat_names)} exported image(s) to "
+            f"CameraPriors_local.csv ({len(exported_flat_names) - len(rows)} had no pose in the georeferenced run)"
+        )
+    return path, len(rows), warning
+
+
+def _write_ground_control_csv(conn: sqlite3.Connection, solution: dict, output_dir: Path) -> Path:
+    """GroundControl_local.csv: the solution's control-point set, control and
+    check points, local frame (CRS - origin) -- see export_for_realityscan."""
+    from vine360.georef.control_points import USE_IGNORE, get_control_point_set, load_control_points
+
+    cp_set = get_control_point_set(conn, solution["set_id"])
+    e0, n0, h0 = cp_set.origin
+    path = output_dir / "GroundControl_local.csv"
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["#name", "x", "y", "alt"])
+        for p in load_control_points(conn, cp_set.set_id):
+            if p.use != USE_IGNORE:
+                writer.writerow([p.name, f"{p.east - e0:.4f}", f"{p.north - n0:.4f}", f"{p.height - h0:.4f}"])
+    return path
+
+
 def _refuse_project_root(output_dir: Path) -> None:
     """A project root as output_dir would have _reset_managed_subdirs
     delete the project's own masks/ -- refuse it outright."""
@@ -422,10 +520,13 @@ def export_for_postshot(
     output_dir: Path,
     *,
     run_id: str | None = None,
+    georef_solution_id: str | None = None,
     progress_callback=None,
 ) -> PostshotExportResult:
     """Exports the given sfm_runs row (the most recent one, by default)
-    to `output_dir/{sparse,images,masks}/`. Raises PostshotExportError if
+    to `output_dir/{sparse,images,masks}/` -- in its georeference solution's
+    local metric frame when georef_solution_id is given (the solution's run
+    is then the run; see the module docstring). Raises PostshotExportError if
     there's no run to export, or its selected model is missing on disk.
 
     progress_callback(message, current, total), if given, is called once
@@ -439,6 +540,14 @@ def export_for_postshot(
     output_dir = Path(output_dir)
     _refuse_project_root(output_dir)
     _migrate_legacy_export_layout(output_dir.parent)
+
+    solution = _georef_solution(conn, project_root, georef_solution_id) if georef_solution_id else None
+    if solution is not None:
+        if run_id is not None and run_id != solution["run_id"]:
+            raise PostshotExportError(
+                f"georeference solution {georef_solution_id!r} belongs to sfm run {solution['run_id']!r}, not {run_id!r}"
+            )
+        run_id = solution["run_id"]
 
     if run_id is not None:
         row = conn.execute(
@@ -480,7 +589,11 @@ def export_for_postshot(
     # can use, with masks, instead of raw equirectangular frames.
     source_root = project_root / "projections"
     reconstruction = None
-    if image_source == "frames":
+    if solution is not None:
+        # Already the pinhole view model, already in local metres.
+        notify("Reading the georeferenced model…", None, None)
+        reconstruction = pycolmap.Reconstruction(project_root / solution["model_dir"])
+    elif image_source == "frames":
         from vine360.sfm.frame_poses import FramePoseError, build_view_reconstruction
 
         notify("Converting 360 frame poses to view poses…", None, None)
@@ -545,6 +658,7 @@ def export_for_postshot(
             warnings.append("masks/keep/ exists but no mask matched any exported image")
     else:
         warnings.append("no masks have been built yet -- exporting poses and images only")
+    _write_export_info(output_dir, found_run_id, solution, project_root)
     notify("Export complete.", None, None)
 
     return PostshotExportResult(
@@ -662,6 +776,7 @@ def export_for_realityscan(
     *,
     frame_set_id: str | None = None,
     include_camera_priors: bool = False,
+    georef_solution_id: str | None = None,
     progress_callback=None,
 ) -> PostshotExportResult:
     """Exports every generated projection view and its keep-mask (if
@@ -691,6 +806,16 @@ def export_for_realityscan(
     raises on its own: no usable run, a run whose model is missing on
     disk, or a run with no overlap with the exported image set all just
     append a warning and leave the images+masks export itself untouched.
+
+    georef_solution_id, when given, puts everything in that solution's local
+    metric frame (docs/adr/0047): camera priors come from the solution's
+    materialised model (its run, not the automatically chosen one) and are
+    written as CameraPriors_local.csv, and GroundControl_local.csv lists the
+    control-point set's control/check points (#name,x,y,alt, local frame) --
+    **unverified against RealityScan**: its Ground Controls Import help page
+    couldn't be read (it now redirects); search snippets confirm only that
+    '#' lines are skipped and the column order is picked in the import
+    dialog. Choose name/X/Y/alt and a local Euclidean system there.
 
     progress_callback(message, current, total), if given, is called once
     per view copied."""
@@ -761,7 +886,16 @@ def export_for_realityscan(
 
     priors_path: Path | None = None
     num_priors = 0
-    if include_camera_priors:
+    solution = _georef_solution(conn, project_root, georef_solution_id) if georef_solution_id else None
+    if solution is not None:
+        if include_camera_priors:
+            priors_path, num_priors, priors_warning = _write_georef_priors_csv(
+                project_root, solution, output_dir, exported_flat_names
+            )
+            if priors_warning:
+                warnings.append(priors_warning)
+        _write_ground_control_csv(conn, solution, output_dir)
+    elif include_camera_priors:
         notify("Looking for an SfM run to draw camera priors from…", None, None)
         selection = _select_priors_run(conn, frame_set_id=frame_set_id)
         if selection is None:
@@ -780,6 +914,7 @@ def export_for_realityscan(
                 )
                 if priors_warning:
                     warnings.append(priors_warning)
+    _write_export_info(output_dir, solution["run_id"] if solution else None, solution, project_root)
     notify("Export complete.", None, None)
 
     return PostshotExportResult(
