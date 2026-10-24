@@ -1,0 +1,99 @@
+"""Offscreen smoke test of the Georeference panel, the Export panel's
+georeference choice and the Data manager's georeference rows
+(docs/adr/0047), on the synthetic scene of tests/georef_project.py."""
+
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+
+pytest.importorskip("PySide6")
+pytest.importorskip("pycolmap")
+
+from PySide6.QtWidgets import QApplication
+
+from georef_project import FRAME_SET, RUN_ID, build_scene
+from vine360.gui.main_window import (
+    DONE,
+    STAGE_GEOREF,
+    AppState,
+    DataManagerPanel,
+    ExportPanel,
+    GeorefPanel,
+    _solve_georef_worker,
+    compute_stage_statuses,
+)
+from vine360.georef.control_points import load_control_points
+from vine360.georef.solve import active_solution
+from vine360.project import load_project
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    yield QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def state(tmp_path, qapp):
+    scene = build_scene(tmp_path)
+    st = AppState(project_root=scene.root, project=load_project(scene.root), conn=scene.conn)
+    yield st, scene
+    scene.conn.close()
+
+
+def test_panels_show_control_points_solutions_and_choices(state):
+    st, scene = state
+    panel = GeorefPanel(st)
+    panel.on_shown()
+    assert panel.points_table.rowCount() == 15
+    assert panel.points_table.item(0, 0).text() == "PRS778941614462"
+    assert panel.points_table.cellWidget(0, 5).currentData() == "ignore"
+    assert "10.4 km" in panel.points_table.item(0, 0).toolTip()
+    assert [panel.origin_spins[i].value() for i in range(3)] == [298900.0, 6126100.0, 0.0]
+    assert panel.detect_combo.findData(FRAME_SET) >= 0
+    assert panel.run_combo.currentData() == RUN_ID
+    assert panel.solve_btn.isEnabled()
+
+    # Editing the table writes through to the index.
+    row = next(r for r in range(15) if panel.points_table.item(r, 0).text() == "021")
+    panel.points_table.item(row, 6).setText("0.25")
+    assert {p.name: p.tag_size_m for p in load_control_points(scene.conn, scene.set_id)}["021"] == 0.25
+
+    solution_id = _solve_georef_worker(scene.root, RUN_ID, scene.set_id, {})
+    panel._on_run_changed(select=solution_id)
+    assert panel.solution_combo.currentData() == solution_id
+    assert panel.report_table.rowCount() == 14 and "RMSE 3D" in panel.report_label.text()
+    assert compute_stage_statuses(scene.conn)[STAGE_GEOREF] == DONE
+
+    export = ExportPanel(st)
+    export.on_shown()
+    assert export.georef_combo.itemData(0) is None and export.georef_combo.itemData(1) == solution_id
+    assert export.georef_combo.currentData() is None  # no active choice yet -> None
+    export.georef_combo.setCurrentIndex(1)
+    assert active_solution(scene.root, RUN_ID) == solution_id
+    export.on_shown()
+    assert export.georef_combo.currentData() == solution_id  # remembered per run
+
+    manager = DataManagerPanel(st)
+    manager.on_shown()
+    texts = []
+    for i in range(manager.georef_tree.topLevelItemCount()):
+        top = manager.georef_tree.topLevelItem(i)
+        texts.append(top.text(0))
+        for k in range(top.childCount()):
+            child = top.child(k)
+            texts += [child.text(0)] + [child.child(j).text(0) for j in range(child.childCount())]
+    assert "ESTO1_GCPs_23Oct26.csv" in texts and any(solution_id in t for t in texts)
+    _wait_for_background(manager)
+
+
+def _wait_for_background(widget, timeout_s: float = 10.0) -> None:
+    """Let the Data manager's disk-usage scan finish before the widget goes
+    away (Qt aborts on a QThread destroyed mid-run)."""
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while getattr(widget, "_bg_pairs", None) and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)

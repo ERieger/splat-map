@@ -38,7 +38,7 @@ python3 -m venv --without-pip ~/.venvs/vine360   # NOT under /mnt/e or any Windo
                                                    # venv needs symlinks DrvFs can't make (docs/adr/0005)
 curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
 ~/.venvs/vine360/bin/python3 /tmp/get-pip.py
-~/.venvs/vine360/bin/python3 -m pip install -e ".[dev,sfm-cuda,masking]"
+~/.venvs/vine360/bin/python3 -m pip install -e ".[dev,sfm-cuda,masking,georef]"
 ~/.venvs/vine360/bin/python3 -m pip install static-ffmpeg PySide6
 ```
 
@@ -48,7 +48,8 @@ install -e ".[dev,sfm,masking]" static-ffmpeg ffmpeg PySide6`.
 `pyproject.toml` extras: `dev` (pytest), `sfm` (pycolmap, CPU) or `sfm-cuda` (pycolmap-cuda12,
 GPU SIFT -- this machine uses it; install one or the other, never both), `masking` (torch/transformers/SAM 3 —
 large, gated weights, see below), `ingest-ffmpeg` (bundles ffmpeg/ffprobe binaries, no system
-install needed). PySide6 (GUI) isn't yet in an extra; install it directly.
+install needed), `georef` (pupil-apriltags, AprilTag ground control -- docs/adr/0047). PySide6
+(GUI) isn't yet in an extra; install it directly.
 
 SAM 3 (`vine360.masking.sam3_adapter`) requires manual Meta approval on Hugging Face
 (https://huggingface.co/facebook/sam3), then `huggingface-cli login` with the approved token.
@@ -145,7 +146,7 @@ data-integrity gap, not hypothetical). Any change to `clear_frame_set` /
 / mask rebuilding needs to preserve this.
 
 **Pipeline stages** (mirrored by the GUI sidebar, `vine360/gui/main_window.py`'s `STAGE_*`
-constants): Project → Import → Frames → Projection → Masks → Pose estimation → Export, plus a
+constants): Project → Import → Frames → Projection → Masks → Pose estimation → Georeference → Export, plus a
 non-stage Data manager tab (docs/adr/0035) for listing and deleting derived data and an
 Activity log tab (docs/adr/0037) listing every run, in order, with its parameters. Training
 has no GUI stage (removed from the app's scope, docs/adr/0025) — the adapter-only library code
@@ -163,6 +164,20 @@ widgets worth knowing about before adding a new panel: `ProgressArea` (determina
 progress + ETA), `PreviewGallery` (image thumbnails, never raises on a missing file),
 `TemporalFrameSelector` (frame scrubber), `StageIndicator` (small step row for a panel with more
 than one sequenced action — see docs/adr/0022 for which panels qualify and which don't).
+
+**Georeference** (`vine360/georef/`, docs/adr/0047, between Pose and Export): surveyed GCP CSVs
+(`control_points.py`; three real file shapes in `fixtures/gcp/`, names kept as strings, EPSG and
+height datum are user metadata never inferred or converted) → AprilTag detection on *projected
+pinhole views*, never equirect frames (`apriltag_adapter.py` → `tag_observations` /
+`tag_detection_runs`) → per-tag DLT+RANSAC triangulation with each registered view's pose
+(`view_poses.py`, the one place that knows frame runs from projection runs) → closed-form
+Umeyama similarity into a **local** frame = CRS − per-set origin (raw MGA never reaches a float32
+trainer). **Non-destructive**: every solve is a new `georef_solutions` row plus a materialised
+model under `sfm/georef/<run_id>/<solution_id>/`; an SfM run's own model is only ever read, and
+Export *copies* either it or a solution's folder (never re-transforms), recording which in
+`export_info.json`. The active solution per run lives in `project.yaml` (`georef.active_solution`).
+pupil-apriltags' own `Detector.__del__` is a use-after-free -- always tear down through
+`TagDetector.close()` / its context manager.
 
 **Export** (`vine360/export/postshot.py`): bundles already-computed poses/images/masks for import
 into Postshot or another COLMAP-based external trainer — two modes (with vine360's own SfM poses,

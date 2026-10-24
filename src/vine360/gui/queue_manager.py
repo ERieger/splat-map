@@ -52,7 +52,11 @@ STAGE_FRAMES = "frames"
 STAGE_PROJECTION = "projection"
 STAGE_MASKS = "masks"
 STAGE_POSE = "pose"
+STAGE_GEOREF = "georef"  # between pose and export; two job kinds, params["kind"] (docs/adr/0047)
 STAGE_EXPORT = "export"
+
+GEOREF_DETECT = "detect_tags"  # target: a frame set; needs its projection
+GEOREF_SOLVE = "solve"  # target: an SfM run + a control-point set; needs detect_tags on the run's frame sets
 
 _COLUMNS = (
     "job_id, order_index, stage, label, target_source_id, params, depends_on, "
@@ -166,6 +170,17 @@ def _has_views(conn: sqlite3.Connection, frame_set_id: str) -> bool:
     )
 
 
+def _has_tag_detection(conn: sqlite3.Connection, frame_set_id: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT COUNT(*) FROM tag_detection_runs r JOIN views v ON v.view_id = r.view_id "
+            "JOIN frames f ON f.frame_id = v.frame_id WHERE f.frame_set_id = ?",
+            (frame_set_id,),
+        ).fetchone()[0]
+        > 0
+    )
+
+
 def _has_any_views(conn: sqlite3.Connection) -> bool:
     return conn.execute("SELECT COUNT(*) FROM views").fetchone()[0] > 0
 
@@ -198,6 +213,8 @@ def _default_params_for_prerequisite(stage: str) -> dict:
             "end_time": None,
             "generate_thumbnails": True,
         }
+    if stage == STAGE_GEOREF:
+        return {"kind": GEOREF_DETECT, "tag_family": "tag36h11"}
     if stage == STAGE_PROJECTION:
         return {
             "face_size": 1024,
@@ -213,6 +230,8 @@ def _default_label(stage: str, source_name: str) -> str:
         return f"Frame extraction — {source_name} (balanced preset, auto)"
     if stage == STAGE_PROJECTION:
         return f"Projection — {source_name} (default faces, auto)"
+    if stage == STAGE_GEOREF:
+        return f"Detect tags — {source_name} (auto)"
     raise ValueError(stage)
 
 
@@ -338,13 +357,14 @@ class QueueManager(QObject):
         self.queue_changed.emit()
         return job
 
-    def _find_existing(self, stage: str, frame_set_id: str | None) -> QueueJob | None:
+    def _find_existing(self, stage: str, frame_set_id: str | None, kind: str | None = None) -> QueueJob | None:
         return next(
             (
                 j
                 for j in self.jobs
                 if j.stage == stage
                 and j.target_frame_set_id == frame_set_id
+                and (kind is None or j.params.get("kind") == kind)
                 and j.status not in TERMINAL_NOT_DONE
             ),
             None,
@@ -452,6 +472,41 @@ class QueueManager(QObject):
             return [], f"unknown frame set {frame_set_id!r} -- extract its frames first"
         return [self._queue_prerequisite(STAGE_PROJECTION, frame_set_id, source_id).job_id], None
 
+    def _require_tag_detection(self, frame_set_id: str) -> tuple[list[str], str | None]:
+        """Dependency on frame_set_id's views having had tag detection run:
+        done, queued, or auto-queued (itself after projection, if needed)."""
+        existing = self._find_existing(STAGE_GEOREF, frame_set_id, GEOREF_DETECT)
+        if existing:
+            return [existing.job_id], None
+        if _has_tag_detection(self.state.conn, frame_set_id):
+            return [], None
+        source_id = self._source_of_frame_set(frame_set_id)
+        if source_id is None:
+            return [], f"unknown frame set {frame_set_id!r} -- extract its frames first"
+        return [self._queue_prerequisite(STAGE_GEOREF, frame_set_id, source_id).job_id], None
+
+    def _resolve_georef_prerequisites(self, target_frame_set_id: str | None, params: dict) -> tuple[list[str], str | None]:
+        conn = self.state.conn
+        if params.get("kind") == GEOREF_SOLVE:
+            set_id = params.get("set_id")
+            if not set_id or conn.execute(
+                "SELECT 1 FROM control_point_sets WHERE set_id = ?", (set_id,)
+            ).fetchone() is None:
+                return [], "no imported control-point set chosen -- import the GCP file in the Georeference panel first"
+            run_id = params.get("run_id")
+            if not run_id or conn.execute("SELECT 1 FROM sfm_runs WHERE run_id = ?", (run_id,)).fetchone() is None:
+                return [], "no SfM run chosen -- run Pose estimation first"
+            from vine360.georef.view_poses import run_scope_frame_set_ids
+
+            frame_set_ids = run_scope_frame_set_ids(conn, run_id)
+            if not frame_set_ids:
+                return [], f"sfm run {run_id!r} has no projected views to detect tags on -- generate projections first"
+            return self._require_each(self._require_tag_detection, frame_set_ids)
+        ids = list(params.get("frame_set_ids") or ([target_frame_set_id] if target_frame_set_id else []))
+        if not ids:
+            return [], "no frame set chosen for tag detection"
+        return self._require_each(self._require_views, ids)
+
     def _resolve_prerequisites(
         self, stage: str, target_frame_set_id: str | None, params: dict
     ) -> tuple[list[str], str | None]:
@@ -470,6 +525,9 @@ class QueueManager(QObject):
 
         if stage == STAGE_MASKS and target_frame_set_id:
             return self._require_views(target_frame_set_id)
+
+        if stage == STAGE_GEOREF:
+            return self._resolve_georef_prerequisites(target_frame_set_id, params)
 
         if stage == STAGE_POSE:
             frame_set_ids = _params_frame_set_ids(params)
@@ -749,16 +807,29 @@ class QueueManager(QObject):
                 params["camera_model"], params.get("engine", "pycolmap"), params.get("options"),
                 frame_set_ids if len(frame_set_ids) > 1 else None,
             )
+        elif job.stage == STAGE_GEOREF:
+            if params.get("kind") == GEOREF_SOLVE:
+                fn, args = mw._solve_georef_worker, (
+                    project_root, params["run_id"], params["set_id"], params.get("solve_params") or {},
+                )
+            else:
+                ids = list(params.get("frame_set_ids") or [job.target_frame_set_id])
+                fn, args = mw._detect_tags_worker, (
+                    project_root, ids, params.get("tag_family", "tag36h11"), params.get("detector_params") or {},
+                )
         elif job.stage == STAGE_EXPORT:
             output_dir = Path(params["output_dir"])
             export_mode = params.get("mode")
+            # Carried explicitly so a queued export is reproducible whatever
+            # the active choice is later (docs/adr/0047); absent = none.
+            solution_id = params.get("georef_solution_id")
             if export_mode == "poses":
                 run_id = params.get("run_id") or self._latest_run_id()
-                fn, args = mw._export_postshot_worker, (project_root, output_dir, run_id)
+                fn, args = mw._export_postshot_worker, (project_root, output_dir, run_id, solution_id)
             elif export_mode == "realityscan":
                 fn, args = mw._export_realityscan_worker, (
                     project_root, output_dir, _params_frame_set_id(params),
-                    params.get("include_camera_priors", False),
+                    params.get("include_camera_priors", False), solution_id,
                 )
             else:
                 fn, args = mw._export_frames_and_masks_worker, (project_root, output_dir, _params_frame_set_id(params))

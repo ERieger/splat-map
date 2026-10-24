@@ -36,7 +36,8 @@ python3 -m venv --without-pip ~/.venvs/vine360   # NOT under a Windows-mounted
 curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
 ~/.venvs/vine360/bin/python3 /tmp/get-pip.py
 
-~/.venvs/vine360/bin/python3 -m pip install -e ".[dev,sfm,masking]"
+~/.venvs/vine360/bin/python3 -m pip install -e ".[dev,sfm,masking,georef]"
+# georef extra: pupil-apriltags, for AprilTag ground control (docs/adr/0047).
 # ingest-ffmpeg extra bundles real ffmpeg/ffprobe binaries (no system
 # install / sudo needed):
 ~/.venvs/vine360/bin/python3 -m pip install static-ffmpeg
@@ -46,7 +47,7 @@ If you already have a normal working `pip`, just:
 
 ```
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev,sfm,masking]" static-ffmpeg ffmpeg
+pip install -e ".[dev,sfm,masking,georef]" static-ffmpeg ffmpeg
 ```
 
 ## Running
@@ -101,5 +102,5 @@ export PATH="$HOME/.venvs/vine360/lib/python3.12/site-packages/static_ffmpeg/bin
 ~/.venvs/vine360/bin/python3 -m pytest
 ```
 
-Tests requiring ffmpeg, pycolmap, or a real (approved) SAM 3 login skip
-automatically when those aren't available.
+Tests requiring ffmpeg, pycolmap, pupil-apriltags, or a real (approved) SAM 3
+login skip automatically when those aren't available.

@@ -131,6 +131,64 @@ those pages only confirm three things: `#` lines are skipped, the column order i
 import dialog (or `groundcontrol.xml`), and samples use name, X, Y, altitude. Pick that layout and
 a local Euclidean system on import. Same honesty caveat as ADR 0033.
 
+### Non-destructive storage and selection (addendum, 2026-10-25)
+
+- **An SfM run's model directory is never written.** Every solve inserts a new
+  `georef_solutions` row with a new `solution_id`; re-solving never updates or deletes one. The
+  solve then writes the transformed pinhole model to
+  `sfm/georef/<run_id>/<solution_id>/` (`cameras.bin`, `images.bin`, `points3D.bin`,
+  `georef.json`, `georef.prj`). For a 360 run that model is `build_view_reconstruction`'s output;
+  for a projections run it is the run's own model, loaded into memory and written elsewhere. The
+  path is stored in `georef_solutions.model_dir`, and `sfm/georef/` is a layout dir.
+- **Export only copies.** With a solution selected, Export reads that solution's `model_dir`;
+  with "None" it reads the run's `selected_model` as before. Both go through the same copy code,
+  and `export_info.json` records `georef_solution_id` (or `"none"`). The file is deterministic, so
+  a "None" export is byte-identical before and after a solve, which a test pins. `georef.json`,
+  `georef.prj` and `export_info.json` are managed files, removed on re-export, so a later "None"
+  export to the same folder can't inherit a stale georef.
+- **Choosing a solution.**
+  - The Export dropdown lists "None (original SfM frame)" first, then the run's solutions, newest
+    first. Each is labelled "<created_at> RMSE 3D <x> m (<n> control pts)".
+  - The choice is kept per run in `project.yaml` under `georef.active_solution` (new
+    `Project.georef` field, omitted from the YAML while empty). "None" clears it.
+  - Queued export jobs carry `georef_solution_id` explicitly, so a queued export doesn't depend on
+    whatever choice is active later.
+- **Deleting a solution** is a Data manager action, with confirmation. It removes the row and
+  `sfm/georef/<run_id>/<solution_id>/` only, and forgets the solution as the run's active choice.
+  Deleting a run removes its solutions and `sfm/georef/<run_id>/`. Deleting a control-point set
+  removes its points and its solutions.
+- **`transform_splat_ply` never writes in place.** The default output is
+  `<stem>.georef-<solution_id[:8]>.ply` next to the input; output == input is refused, and output
+  goes through a `.partial` file. The action is in the Export panel ("Georeference a trained
+  splat…"), using the selected solution. It is only meaningful for a splat trained on a "None"
+  export. **Unverified that Postshot keeps the imported COLMAP frame** in its output .ply; check on
+  the first real splat.
+
+### pupil-apriltags teardown bug (found while building this)
+
+The full test suite segfaulted in 2 of 3 runs, in `quick_decode_uninit`. The cause is pupil-apriltags'
+`Detector.__del__`: it calls `tag36h11_destroy(family)` **before**
+`apriltag_detector_destroy(detector)`, and the latter's `apriltag_detector_clear_families` then
+dereferences the freed family. That is a use-after-free, which crashes only when the freed memory
+has been reused, hence the intermittency. AprilTag's documented order is detector first, then
+family. `TagDetector.close()` (also called from `__del__` and the context manager) destroys them
+in that order and nulls the library object's pointer, so the library's own `__del__` does nothing.
+After the fix, 4 of 4 full-suite runs completed without a crash.
+
+### Smaller implementation choices
+
+- **`tag_detection_runs(view_id, tag_family, n_tags, detected_at)`.** Records every view a
+  detection pass covered, including empty ones. Without it, "detected, nothing found" looks the
+  same as "never detected" to the queue and the sidebar.
+- **Detector defaults.** `quad_decimate` is 1.0, not the library's 2.0, because tags in a
+  1024 px vineyard view are often 20–40 px across. Only `hamming == 0` and
+  `decision_margin >= 20` detections are kept. If one id appears twice in a view, both are dropped.
+- **Triangulation.** After DLT, each tag gets a few Gauss-Newton iterations on reprojection error
+  (cheap, and more accurate than linear DLT alone). RANSAC runs over all view pairs, or 500 random
+  pairs when there are more.
+- **The keep-mask filter isn't implemented.** The handover listed "skip detections inside masked
+  pixels" as optional and low priority.
+
 ## Deviations from the handover
 
 1. **Real GCP files come in three shapes, not one.**

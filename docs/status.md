@@ -265,6 +265,57 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
 - Verified on two synthetic captures at different heights and resolutions with both engines. Not
   yet tried on the real A1 + Insta360 footage.
 
+**Georeferencing with AprilTag ground control points (M8, ADR 0047).**
+- New **Georeference** stage between Pose estimation and Export (`vine360/georef/`). It has three
+  steps:
+  - import the surveyed GCP CSV;
+  - detect tag36h11 AprilTags on a frame set's projected views (pupil-apriltags, new `georef`
+    extra; never on equirect frames);
+  - solve a run, by triangulating each tag from every registered view (DLT + RANSAC) and fitting a
+    closed-form 7-DOF similarity (Umeyama).
+- Results are in a **local metric frame**: survey CRS minus a per-set origin, e.g.
+  (298900, 6126100, 0) for EstoWines Capture 2. Raw MGA never reaches a float32 trainer. EPSG and
+  height datum are recorded but never converted (EstoWines: EPSG:7854, heights unknown).
+- The GCP reader handles all three real file shapes in the capture folders' `gcp/` (copied to
+  `fixtures/gcp/`):
+  - UTF-8 headerless with a trailing comma;
+  - UTF-16 with a BOM and a header;
+  - the same plus H/V GNSS precision columns.
+
+  Names stay strings (`000`), and tag ids are derived from them (`020` → 20, `GCP000` → 0). The
+  GNSS base station (10.4 km away) defaults to ignore with a note. Tag sizes are per point (250 /
+  400 mm tags are mixed).
+- The residual report gives per-point 3D/horizontal/vertical residuals, leave-one-out residuals
+  with "suspect" flags, check-point RMSE, and the fitted scale against a tag-size scale. It also
+  names tags seen-but-not-surveyed and surveyed-but-not-triangulated. It's shown in the panel and
+  exports to CSV.
+- **Non-destructive.**
+  - Every solve is a new solution with its own materialised model under
+    `sfm/georef/<run_id>/<solution_id>/`; the run's own model is only read.
+  - Export's new "Georeference" dropdown ("None" first, remembered per run in `project.yaml`)
+    copies either the original or a solution's model. It never re-transforms, and records the
+    choice in `export_info.json`.
+  - RealityScan exports get `CameraPriors_local.csv` and `GroundControl_local.csv`.
+  - "Georeference a trained splat…" writes a new .ply (positions, orientations and log-scales;
+    higher-order SH not rotated).
+- The queue has `detect_tags` and `solve` jobs with prerequisite auto-insertion. Everything is in
+  the Activity log, and the Data manager lists and deletes control-point sets, tag detections
+  and solutions.
+- **Found and worked around a pupil-apriltags use-after-free.** Its `Detector.__del__` frees the
+  tag family before the detector, which segfaulted 2 of 3 full test runs. The adapter now tears
+  down in AprilTag's documented order.
+- **All verification is synthetic so far.** It covers:
+  - Umeyama to 1e-9;
+  - triangulation with injected outliers;
+  - real detection of the reference tag36h11 images, including on a view projected from a
+    synthetic equirect panorama;
+  - a solve on real pycolmap and SphereSfM reconstructions of the synthetic 360 room;
+  - export byte-identity;
+  - the splat PLY transform.
+
+  EstoWines Capture 1 has no tags, and Capture 2's footage isn't downloaded yet. **Capture 2 is
+  the first real check.**
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -348,8 +399,23 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
       (groups must be >= 30% clipped) -- far tunnel ends and light fittings.
 0046: one Pose run over several chosen frame sets (any engine); one camera per set on raw
       frames (SphereSfM: one extraction per set); scope recorded as frame_set_ids.
+0047: georeferencing with AprilTag GCPs -- detect on projected views, DLT+RANSAC tag
+      triangulation, closed-form Umeyama into a local frame (CRS - origin); every solve kept
+      and materialised under sfm/georef/, export only copies; pupil-apriltags teardown fix.
 
 ## Blockers / known gaps
+
+- **Georeferencing has no real end-to-end check yet** (ADR 0047). The first one is EstoWines
+  Capture 2 (tags laid out; footage not downloaded yet). Things to confirm then:
+  - detection rates on real 1024 px views;
+  - real residuals;
+  - that Postshot keeps the imported COLMAP frame in its output .ply (needed for "Georeference a
+    trained splat…").
+
+  RealityScan's GCP import format is unverified (its help pages now redirect).
+- The pycolmap/SphereSfM synthetic-room tests (test_frame_poses, test_sfm_progress,
+  test_sfm_options_engines) intermittently register 4 of 6 frames and fail a "≥ 5 registered"
+  assertion -- seen in about 1 of 4 full runs, unrelated to georef.
 
 - **Nerfstudio adapter is unverified** (see ADR 0009) -- run its `--help`
   output against a real install before trusting its flags.
@@ -386,9 +452,11 @@ directions (none started):
    panels entirely). Wiring it for real would mean both revisiting ADR
    0009's "adapter only" decision and re-adding a GUI stage informed by
    whatever the real backend's actual UI needs turn out to be.
-3. Georeferencing (M8): a GPX-sidecar reader (see ADR 0010) is a better
-   first step than the still-unimplemented EXIF/GPS parsing, given real
-   sample data already has `.gpx` files.
+3. **Georeferencing first real check (exact next task):** once EstoWines Capture 2 footage is
+   downloaded, on request, run Frames → Projection → Pose → Georeference (Detect tags, then
+   Solve with `ESTO1_GCPs_23Oct26.csv`, EPSG:7854, per-point tag sizes 0.25/0.40 m), and
+   record detection counts, residuals and the tag-size scale check in ADR 0047. A GPX-sidecar
+   reader (ADR 0010) remains a possible coarse prior, no longer the georeferencing path.
 4. Near-duplicate frame filtering (M1 gap, still open).
 5. Validate the real, wired pipeline against actual Insta360/Antigravity
    A1 footage -- explicitly on request given multi-GB file sizes.

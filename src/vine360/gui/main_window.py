@@ -167,6 +167,7 @@ from vine360.gui.queue_manager import (
     SKIPPED,
     STAGE_EXPORT as QUEUE_STAGE_EXPORT,
     STAGE_FRAMES as QUEUE_STAGE_FRAMES,
+    STAGE_GEOREF as QUEUE_STAGE_GEOREF,
     STAGE_MASKS as QUEUE_STAGE_MASKS,
     STAGE_POSE as QUEUE_STAGE_POSE,
     STAGE_PROJECTION as QUEUE_STAGE_PROJECTION,
@@ -211,9 +212,10 @@ STAGE_FRAMES = 2
 STAGE_PROJECTION = 3
 STAGE_MASKS = 4
 STAGE_POSE = 5
-STAGE_EXPORT = 6
-STAGE_DATA_MANAGER = 7  # not a pipeline stage: fixed-color dot, not in compute_stage_statuses
-STAGE_ACTIVITY_LOG = 8  # likewise
+STAGE_GEOREF = 6  # docs/adr/0047
+STAGE_EXPORT = 7
+STAGE_DATA_MANAGER = 8  # not a pipeline stage: fixed-color dot, not in compute_stage_statuses
+STAGE_ACTIVITY_LOG = 9  # likewise
 
 
 @dataclass
@@ -256,6 +258,7 @@ def compute_stage_statuses(conn: sqlite3.Connection | None) -> dict[int, str]:
             STAGE_PROJECTION: PENDING,
             STAGE_MASKS: PENDING,
             STAGE_POSE: PENDING,
+            STAGE_GEOREF: PENDING,
         }
     n_sources = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
     n_video_sources = conn.execute("SELECT COUNT(*) FROM sources WHERE media_type = 'video'").fetchone()[0]
@@ -273,12 +276,24 @@ def compute_stage_statuses(conn: sqlite3.Connection | None) -> dict[int, str]:
     else:
         pose_status = ACTIVE if n_masks > 0 else PENDING
 
+    # Georeference (docs/adr/0047): done once the newest run has a solution;
+    # active once there's something to work with (a control-point set or
+    # tag detections); otherwise pending.
+    n_sets = conn.execute("SELECT COUNT(*) FROM control_point_sets").fetchone()[0]
+    n_detected = conn.execute("SELECT COUNT(*) FROM tag_detection_runs").fetchone()[0]
+    newest_run_solved = conn.execute(
+        "SELECT COUNT(*) FROM georef_solutions WHERE run_id = "
+        "(SELECT run_id FROM sfm_runs ORDER BY created_at DESC, rowid DESC LIMIT 1)"
+    ).fetchone()[0]
+    georef_status = DONE if newest_run_solved else (ACTIVE if (n_sets or n_detected) else PENDING)
+
     return {
         STAGE_IMPORT: DONE if n_sources > 0 else ACTIVE,
         STAGE_FRAMES: DONE if n_frames > 0 else (ACTIVE if n_video_sources > 0 else PENDING),
         STAGE_PROJECTION: DONE if n_views > 0 else (ACTIVE if n_frames > 0 else PENDING),
         STAGE_MASKS: DONE if n_masks > 0 else (ACTIVE if n_views > 0 else PENDING),
         STAGE_POSE: pose_status,
+        STAGE_GEOREF: georef_status,
     }
 
 
@@ -3461,6 +3476,684 @@ class PoseEstimationPanel(QWidget):
             QMessageBox.critical(self, "Unexpected error running SfM", f"{type(exc).__name__}: {exc}")
 
 
+# -- Georeference (docs/adr/0047) -------------------------------------------
+
+
+def _summarize_tag_detection(summary, _conn) -> str:
+    return summary.describe()
+
+
+def _summarize_solution(solution_id, conn) -> str:
+    from vine360.georef.solve import load_solution
+
+    report = load_solution(conn, solution_id)["report"]
+    text = (
+        f"{solution_id}: {report['n_control']} control / {report['n_check']} check point(s), "
+        f"RMSE 3D {report['rmse']['d3']:.3f} m"
+    )
+    if report.get("check_rmse"):
+        text += f", check RMSE 3D {report['check_rmse']['d3']:.3f} m"
+    return text
+
+
+@logged_operation("georef.import_gcps", "Georeference: import control points", target=lambda p: str(p.get("path")))
+def _import_control_points_worker(
+    project_root: Path,
+    path: Path,
+    epsg: int,
+    height_datum: str,
+    tag_family: str,
+    tag_size_m: float | None,
+):
+    from vine360.georef.control_points import import_control_points
+
+    conn = open_index_db(project_root)
+    try:
+        return import_control_points(
+            conn, Path(path), epsg=epsg, height_datum=height_datum, tag_family=tag_family, tag_size_m=tag_size_m
+        )
+    finally:
+        conn.close()
+
+
+@logged_operation(
+    "georef.detect_tags", "Georeference: detect tags", target=lambda p: " + ".join(p.get("frame_set_ids") or []),
+    summarize=_summarize_tag_detection,
+)
+def _detect_tags_worker(
+    project_root: Path,
+    frame_set_ids: list[str],
+    tag_family: str = "tag36h11",
+    detector_params: dict | None = None,
+    progress_callback=None,
+):
+    from vine360.georef.apriltag_adapter import DetectorParams
+    from vine360.georef.observe import detect_tags_for_frame_sets
+
+    conn = open_index_db(project_root)
+    try:
+        return detect_tags_for_frame_sets(
+            conn, project_root, list(frame_set_ids), tag_family=tag_family,
+            params=DetectorParams.from_dict(detector_params), progress_callback=progress_callback,
+        )
+    finally:
+        conn.close()
+
+
+@logged_operation(
+    "georef.solve", "Georeference: solve", target=lambda p: f"{p.get('run_id')} ← {p.get('set_id')}",
+    summarize=_summarize_solution,
+)
+def _solve_georef_worker(
+    project_root: Path, run_id: str, set_id: str, solve_params: dict | None = None, progress_callback=None
+) -> str:
+    from vine360.georef.solve import SolveParams, solve_georef
+
+    conn = open_index_db(project_root)
+    try:
+        return solve_georef(
+            conn, project_root, run_id, set_id, params=SolveParams(**(solve_params or {})),
+            progress_callback=progress_callback,
+        )
+    finally:
+        conn.close()
+
+
+@logged_operation(
+    "georef.splat", "Georeference a trained splat", target=lambda p: str(p.get("out_path")),
+    summarize=lambda n, _conn: f"{n} Gaussians",
+)
+def _georef_splat_worker(
+    project_root: Path, in_path: Path, out_path: Path, solution_id: str, progress_callback=None
+) -> int:
+    from vine360.georef.apply import transform_splat_ply
+    from vine360.georef.similarity import Similarity
+    from vine360.georef.solve import load_solution
+
+    conn = open_index_db(project_root)
+    try:
+        similarity = Similarity.from_dict(load_solution(conn, solution_id)["transform"])
+    finally:
+        conn.close()
+    return transform_splat_ply(Path(in_path), Path(out_path), similarity, progress_callback=progress_callback)
+
+
+_USE_LABELS = {"control": "control", "check": "check", "ignore": "ignore"}
+_REPORT_COLUMNS = [
+    ("name", "Name"), ("tag_id", "Tag"), ("use", "Use"), ("views", "Views"), ("rms_px", "Reproj px"),
+    ("resid_3d", "Resid 3D m"), ("horizontal", "Horiz m"), ("vertical", "Vert m"), ("loo", "LOO m"), ("flag", "Flag"),
+]
+
+
+def _fmt(value, digits: int = 3) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        return f"{value:.{digits}f}"
+    return str(value)
+
+
+class GeorefPanel(QWidget):
+    """Georeferencing (docs/adr/0047): import surveyed control points marked
+    with AprilTags, detect the tags on a frame set's projected views, and
+    solve an SfM run's similarity into a local metric frame (CRS - origin).
+    Every solve is kept as its own solution; Export picks which one (or
+    none) to use. No step here modifies an SfM run's own model."""
+
+    _POINT_COLUMNS = ["Name", "Easting", "Northing", "Height", "Tag id", "Use", "Tag size m", "σH", "σV", "Note"]
+
+    def __init__(self, state: AppState):
+        super().__init__()
+        self.state = state
+        self._choices: dict[str, FrameSetChoice] = {}
+        self._loading_points = False
+        outer = QVBoxLayout(self)
+        _panel_header(
+            "Georeference",
+            "Turn a Pose estimation run into metres in your survey's projected CRS, using ground control "
+            "points marked with AprilTags (tag36h11). Coordinates are used as surveyed -- no datum or "
+            "height conversion.",
+            outer,
+        )
+        self.no_project_label = QLabel("Open a project first.")
+        outer.addWidget(self.no_project_label)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.controls = QWidget()
+        scroll.setWidget(self.controls)
+        layout = QVBoxLayout(self.controls)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.stage_indicator = StageIndicator(["Control points", "Detect tags", "Solve"])
+        layout.addWidget(self.stage_indicator)
+
+        # -- 1. control points --------------------------------------------
+        cp_box = QGroupBox("1. Control points")
+        cp_layout = QVBoxLayout(cp_box)
+        import_form = QFormLayout()
+        self.epsg_spin = QSpinBox()
+        self.epsg_spin.setRange(1, 999999)
+        self.epsg_spin.setValue(7854)
+        self.epsg_spin.setToolTip(
+            "The survey's projected CRS. Not in the file and never guessed -- GDA2020 (7854) and GDA94 (28354) "
+            "MGA zone 54 differ by ~1.8 m."
+        )
+        import_form.addRow("EPSG:", self.epsg_spin)
+        self.datum_combo = QComboBox()
+        for datum in ("unknown", "ellipsoidal", "AHD"):
+            self.datum_combo.addItem(datum, userData=datum)
+        self.datum_combo.setToolTip("Recorded with the solution, never converted.")
+        import_form.addRow("Height datum:", self.datum_combo)
+        import_form.addRow("Tag family:", QLabel("tag36h11"))
+        self.tag_size_spin = QDoubleSpinBox()
+        self.tag_size_spin.setRange(0.0, 5.0)
+        self.tag_size_spin.setDecimals(3)
+        self.tag_size_spin.setSingleStep(0.05)
+        self.tag_size_spin.setSpecialValueText("not set")
+        self.tag_size_spin.setValue(0.4)
+        self.tag_size_spin.setSuffix(" m")
+        self.tag_size_spin.setToolTip(
+            "Printed black-square edge, applied to every tagged point on import. Sizes can differ per point "
+            "(250 / 400 mm) -- edit them in the table. Used only for the tag-size scale cross-check."
+        )
+        import_form.addRow("Default tag size:", self.tag_size_spin)
+        cp_layout.addLayout(import_form)
+        import_row = QHBoxLayout()
+        self.import_btn = QPushButton("Import control-point CSV…")
+        self.import_btn.clicked.connect(self._on_import)
+        import_row.addWidget(self.import_btn)
+        import_row.addStretch()
+        cp_layout.addLayout(import_row)
+
+        set_form = QFormLayout()
+        self.set_combo = QComboBox()
+        self.set_combo.currentIndexChanged.connect(self._on_set_changed)
+        set_form.addRow("Control-point set:", self.set_combo)
+        origin_row = QHBoxLayout()
+        self.origin_spins = []
+        for label in ("E0", "N0", "H0"):
+            spin = QDoubleSpinBox()
+            spin.setRange(-1e8, 1e8)
+            spin.setDecimals(3)
+            spin.setToolTip("Exports are in CRS minus this origin, so float32 trainers keep centimetres.")
+            origin_row.addWidget(QLabel(label))
+            origin_row.addWidget(spin)
+            self.origin_spins.append(spin)
+        self.origin_apply_btn = QPushButton("Apply origin")
+        self.origin_apply_btn.clicked.connect(self._on_apply_origin)
+        origin_row.addWidget(self.origin_apply_btn)
+        set_form.addRow("Origin:", origin_row)
+        self.set_info = QLabel("")
+        self.set_info.setWordWrap(True)
+        self.set_info.setStyleSheet("color: palette(mid);")
+        set_form.addRow("", self.set_info)
+        cp_layout.addLayout(set_form)
+        self.points_table = QTableWidget(0, len(self._POINT_COLUMNS))
+        self.points_table.setHorizontalHeaderLabels(self._POINT_COLUMNS)
+        self.points_table.verticalHeader().setVisible(False)
+        self.points_table.setMinimumHeight(220)
+        self.points_table.itemChanged.connect(self._on_point_item_changed)
+        cp_layout.addWidget(self.points_table)
+        layout.addWidget(cp_box)
+
+        # -- 2. detect tags -------------------------------------------------
+        detect_box = QGroupBox("2. Detect tags (on projected views -- needs Projection, not SfM)")
+        detect_layout = QVBoxLayout(detect_box)
+        detect_form = QFormLayout()
+        self.detect_combo = QComboBox()
+        self.detect_combo.currentIndexChanged.connect(self._on_detect_scope_changed)
+        detect_form.addRow("Frame set:", self.detect_combo)
+        detect_layout.addLayout(detect_form)
+        self.detect_list = QListWidget()
+        self.detect_list.setMaximumHeight(120)
+        self.detect_list.setVisible(False)
+        self.detect_list.itemChanged.connect(self._refresh_enabled)
+        detect_layout.addWidget(self.detect_list)
+        self.detect_status = QLabel("")
+        self.detect_status.setWordWrap(True)
+        detect_layout.addWidget(self.detect_status)
+        detect_btns = QHBoxLayout()
+        self.detect_btn = QPushButton("Detect tags")
+        self.detect_btn.clicked.connect(self._on_detect)
+        self.detect_queue_btn = QPushButton("Add to Queue")
+        self.detect_queue_btn.clicked.connect(self._on_detect_queue)
+        detect_btns.addWidget(self.detect_btn)
+        detect_btns.addWidget(self.detect_queue_btn)
+        detect_btns.addStretch()
+        detect_layout.addLayout(detect_btns)
+        self.detect_progress = ProgressArea()
+        detect_layout.addWidget(self.detect_progress)
+        layout.addWidget(detect_box)
+
+        # -- 3. solve -------------------------------------------------------
+        solve_box = QGroupBox("3. Solve")
+        solve_layout = QVBoxLayout(solve_box)
+        solve_form = QFormLayout()
+        self.run_combo = QComboBox()
+        self.run_combo.currentIndexChanged.connect(self._on_run_changed)
+        solve_form.addRow("SfM run:", self.run_combo)
+        self.solve_set_label = QLabel("")
+        solve_form.addRow("Control points:", self.solve_set_label)
+        solve_layout.addLayout(solve_form)
+        solve_btns = QHBoxLayout()
+        self.solve_btn = QPushButton("Solve")
+        self.solve_btn.clicked.connect(self._on_solve)
+        self.solve_queue_btn = QPushButton("Add to Queue")
+        self.solve_queue_btn.setToolTip("Queues the solve, plus tag detection for any of the run's frame sets that still need it.")
+        self.solve_queue_btn.clicked.connect(self._on_solve_queue)
+        solve_btns.addWidget(self.solve_btn)
+        solve_btns.addWidget(self.solve_queue_btn)
+        solve_btns.addStretch()
+        solve_layout.addLayout(solve_btns)
+        self.solve_progress = ProgressArea()
+        solve_layout.addWidget(self.solve_progress)
+        solution_form = QFormLayout()
+        self.solution_combo = QComboBox()
+        self.solution_combo.currentIndexChanged.connect(self._show_solution)
+        solution_form.addRow("Solution:", self.solution_combo)
+        solve_layout.addLayout(solution_form)
+        self.report_label = QLabel("")
+        self.report_label.setWordWrap(True)
+        self.report_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        solve_layout.addWidget(self.report_label)
+        self.report_table = QTableWidget(0, len(_REPORT_COLUMNS))
+        self.report_table.setHorizontalHeaderLabels([label for _key, label in _REPORT_COLUMNS])
+        self.report_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.report_table.verticalHeader().setVisible(False)
+        self.report_table.setMinimumHeight(200)
+        solve_layout.addWidget(self.report_table)
+        csv_row = QHBoxLayout()
+        self.report_csv_btn = QPushButton("Export report CSV…")
+        self.report_csv_btn.clicked.connect(self._on_report_csv)
+        csv_row.addWidget(self.report_csv_btn)
+        csv_row.addStretch()
+        solve_layout.addLayout(csv_row)
+        layout.addWidget(solve_box)
+        layout.addStretch()
+
+        outer.addWidget(scroll, stretch=1)
+        scroll.setVisible(False)
+        self._scroll = scroll
+        if self.state.queue_manager is not None:
+            self.state.queue_manager.queue_changed.connect(self._refresh_enabled)
+
+    # -- refresh -------------------------------------------------------------
+
+    def on_project_changed(self) -> None:
+        self.on_shown()
+
+    def on_shown(self) -> None:
+        have_project = self.state.conn is not None
+        self.no_project_label.setVisible(not have_project)
+        self._scroll.setVisible(have_project)
+        if have_project:
+            self._refresh_sets()
+            self._refresh_detect_choices()
+            self._refresh_runs()
+            self._refresh_enabled()
+
+    def _refresh_sets(self, select: str | None = None) -> None:
+        from vine360.georef.control_points import list_control_point_sets
+
+        previous = select or self.set_combo.currentData()
+        self.set_combo.blockSignals(True)
+        self.set_combo.clear()
+        for cp_set in list_control_point_sets(self.state.conn):
+            self.set_combo.addItem(f"{cp_set.label} — EPSG:{cp_set.epsg}, imported {_local_time(cp_set.imported_at)}",
+                                   userData=cp_set.set_id)
+            self.set_combo.setItemData(self.set_combo.count() - 1, cp_set.source_path, Qt.ToolTipRole)
+        _restore_combo_selection(self.set_combo, previous)
+        self.set_combo.blockSignals(False)
+        self._on_set_changed()
+
+    def _on_set_changed(self) -> None:
+        from vine360.georef.apply import crs_name
+        from vine360.georef.control_points import get_control_point_set, load_control_points
+
+        set_id = self.set_combo.currentData()
+        self._loading_points = True
+        self.points_table.setRowCount(0)
+        if set_id is None:
+            self.set_info.setText("No control points imported yet.")
+            self.solve_set_label.setText("— import a control-point CSV first")
+            self._loading_points = False
+            self._refresh_enabled()
+            return
+        cp_set = get_control_point_set(self.state.conn, set_id)
+        for spin, value in zip(self.origin_spins, cp_set.origin):
+            spin.setValue(value)
+        points = load_control_points(self.state.conn, set_id)
+        self.set_info.setText(
+            f"{cp_set.source_path}\nEPSG:{cp_set.epsg} ({crs_name(cp_set.epsg) or 'no WKT known -- no .prj'}), "
+            f"heights {cp_set.height_datum}, {len(points)} point(s): "
+            f"{sum(p.use == 'control' for p in points)} control, {sum(p.use == 'check' for p in points)} check, "
+            f"{sum(p.use == 'ignore' for p in points)} ignored."
+        )
+        self.solve_set_label.setText(self.set_combo.currentText())
+        self.points_table.setRowCount(len(points))
+        for r, p in enumerate(points):
+            cells = [p.name, f"{p.east:.3f}", f"{p.north:.3f}", f"{p.height:.3f}",
+                     "" if p.tag_id is None else str(p.tag_id), None,
+                     "" if p.tag_size_m is None else f"{p.tag_size_m:g}",
+                     _fmt(p.sigma_h), _fmt(p.sigma_v), p.note or ""]
+            for c, text in enumerate(cells):
+                if c == 5:
+                    continue
+                item = QTableWidgetItem(text)
+                if c not in (4, 6):
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if c == 0:
+                    item.setData(Qt.UserRole, p.name)
+                if p.note:
+                    item.setToolTip(p.note)
+                self.points_table.setItem(r, c, item)
+            combo = QComboBox()
+            for use in ("control", "check", "ignore"):
+                combo.addItem(use, userData=use)
+            combo.setCurrentIndex(combo.findData(p.use))
+            if p.note:
+                combo.setToolTip(p.note)
+            combo.currentIndexChanged.connect(lambda _i, name=p.name, box=combo: self._on_use_changed(name, box))
+            self.points_table.setCellWidget(r, 5, combo)
+        self.points_table.resizeColumnsToContents()
+        self._loading_points = False
+        self._refresh_enabled()
+
+    def _on_use_changed(self, name: str, combo: QComboBox) -> None:
+        from vine360.georef.control_points import update_control_point
+
+        update_control_point(self.state.conn, self.set_combo.currentData(), name, use=combo.currentData())
+        log_action(self.state.conn, "georef.edit_point", "Georeference: control point use",
+                   target=name, params={"set_id": self.set_combo.currentData(), "use": combo.currentData()})
+        self._on_set_changed()
+
+    def _on_point_item_changed(self, item: QTableWidgetItem) -> None:
+        from vine360.georef.control_points import ControlPointError, update_control_point
+
+        if self._loading_points or item.column() not in (4, 6):
+            return
+        name = self.points_table.item(item.row(), 0).data(Qt.UserRole)
+        text = item.text().strip()
+        try:
+            if item.column() == 4:
+                if text and not text.isdigit():
+                    raise ControlPointError("tag id must be a whole number (or empty for an untagged point)")
+                change = {"tag_id": int(text) if text else None}
+            else:
+                change = {"tag_size_m": float(text) if text else None}
+            update_control_point(self.state.conn, self.set_combo.currentData(), name, **change)
+            log_action(self.state.conn, "georef.edit_point", "Georeference: control point edit", target=name,
+                       params={"set_id": self.set_combo.currentData(), **change})
+        except (ControlPointError, ValueError) as exc:
+            QMessageBox.warning(self, "Invalid value", str(exc))
+        self._on_set_changed()
+
+    def _on_apply_origin(self) -> None:
+        from vine360.georef.control_points import update_control_point_set
+
+        set_id = self.set_combo.currentData()
+        if set_id is None:
+            return
+        origin = tuple(spin.value() for spin in self.origin_spins)
+        update_control_point_set(self.state.conn, set_id, origin=origin)
+        log_action(self.state.conn, "georef.origin", "Georeference: set origin", target=set_id, params={"origin": origin})
+        self._on_set_changed()
+
+    def _on_import(self) -> None:
+        start = self.state.project_root.parent if self.state.project_root else Path.home()
+        path, _ = QFileDialog.getOpenFileName(self, "Import control points", str(start), "CSV (*.csv *.txt);;All files (*)")
+        if not path:
+            return
+        size = self.tag_size_spin.value() or None
+        self.import_btn.setEnabled(False)
+        run_in_background(
+            self, _import_control_points_worker, self.state.project_root, Path(path), self.epsg_spin.value(),
+            self.datum_combo.currentData(), "tag36h11", size,
+            on_success=self._on_import_success, on_error=self._on_import_error,
+        )
+
+    def _on_import_success(self, result) -> None:
+        set_id, warnings = result
+        self.import_btn.setEnabled(True)
+        self._refresh_sets(select=set_id)
+        self.state.notify_change()
+        if warnings:
+            QMessageBox.information(self, "Control points imported", "Imported, with notes:\n\n• " + "\n• ".join(warnings))
+
+    def _on_import_error(self, exc: Exception) -> None:
+        self.import_btn.setEnabled(True)
+        QMessageBox.warning(self, "Could not import control points", f"{type(exc).__name__}: {exc}")
+
+    # -- detect -----------------------------------------------------------
+
+    def _refresh_detect_choices(self) -> None:
+        from vine360.georef.observe import tag_counts_by_frame_set
+
+        previous = self.detect_combo.currentData()
+        checked = set(self._checked_detect_ids())
+        self.detect_combo.blockSignals(True)
+        self.detect_list.blockSignals(True)
+        self.detect_combo.clear()
+        self.detect_list.clear()
+        counts = tag_counts_by_frame_set(self.state.conn)
+        self._choices = {c.frame_set_id: c for c in frame_set_choices(self.state)}
+        for choice in self._choices.values():
+            info = counts.get(choice.frame_set_id)
+            if choice.pending or not choice.view_count:
+                detail = "no views yet"
+            elif info:
+                detail = f"{choice.view_count} views, {info['views_detected']} detected, tags {info['tags'] or 'none'}"
+            else:
+                detail = f"{choice.view_count} views, not detected yet"
+            self.detect_combo.addItem(f"{choice.name} — {detail}", userData=choice.frame_set_id)
+            item = QListWidgetItem(f"{choice.name} — {detail}")
+            item.setData(Qt.UserRole, choice.frame_set_id)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if choice.frame_set_id in checked else Qt.Unchecked)
+            self.detect_list.addItem(item)
+        if len(self._choices) >= 2:
+            self.detect_combo.addItem("Several frame sets…", userData=SEVERAL_FRAME_SETS)
+        _restore_combo_selection(self.detect_combo, previous)
+        self.detect_list.blockSignals(False)
+        self.detect_combo.blockSignals(False)
+        self._on_detect_scope_changed()
+
+    def _checked_detect_ids(self) -> list[str]:
+        return [
+            self.detect_list.item(i).data(Qt.UserRole)
+            for i in range(self.detect_list.count())
+            if self.detect_list.item(i).checkState() == Qt.Checked
+        ]
+
+    def _detect_ids(self) -> list[str]:
+        data = self.detect_combo.currentData()
+        if data == SEVERAL_FRAME_SETS:
+            return self._checked_detect_ids()
+        return [data] if data else []
+
+    def _on_detect_scope_changed(self) -> None:
+        self.detect_list.setVisible(self.detect_combo.currentData() == SEVERAL_FRAME_SETS)
+        self._refresh_enabled()
+
+    def _on_detect(self) -> None:
+        ids = self._detect_ids()
+        self.detect_btn.setEnabled(False)
+        self.detect_progress.start("Detecting tags…")
+        run_in_background(
+            self, _detect_tags_worker, self.state.project_root, ids, "tag36h11", {},
+            on_success=self._on_detect_success, on_error=self._on_detect_error,
+            on_progress=self.detect_progress.update_progress,
+        )
+
+    def _on_detect_success(self, summary) -> None:
+        self.detect_progress.finish("Tag detection complete.")
+        self.detect_status.setText(summary.describe())
+        self._refresh_detect_choices()
+        self.state.notify_change()
+
+    def _on_detect_error(self, exc: Exception) -> None:
+        self.detect_progress.finish("")
+        self._refresh_enabled()
+        QMessageBox.warning(self, "Tag detection failed", f"{type(exc).__name__}: {exc}")
+
+    def _on_detect_queue(self) -> None:
+        ids = self._detect_ids()
+        if not ids:
+            return
+        names = " + ".join(self._choices[i].name for i in ids if i in self._choices)
+        params = {"kind": "detect_tags", "tag_family": "tag36h11", "frame_set_ids": ids}
+        choice = self._choices.get(ids[0])
+        self.state.queue_manager.add_job(
+            QUEUE_STAGE_GEOREF, choice.source_id if choice and len(ids) == 1 else None, params,
+            f"Detect tags — {names}", target_frame_set_id=ids[0] if len(ids) == 1 else None,
+        )
+
+    # -- solve -------------------------------------------------------------
+
+    def _refresh_runs(self) -> None:
+        previous = self.run_combo.currentData()
+        self.run_combo.blockSignals(True)
+        self.run_combo.clear()
+        for run in list_sfm_runs(self.state.conn):
+            self.run_combo.addItem(
+                f"{_local_time(run.created_at)} — {run.engine_label}, {run.registered_images}/{run.total_images} "
+                f"registered ({run.run_id})",
+                userData=run.run_id,
+            )
+        _restore_combo_selection(self.run_combo, previous)
+        self.run_combo.blockSignals(False)
+        self._on_run_changed()
+
+    def _on_run_changed(self, select: str | None = None) -> None:
+        from vine360.georef.solve import list_solutions, solution_label
+
+        run_id = self.run_combo.currentData()
+        self.solution_combo.blockSignals(True)
+        self.solution_combo.clear()
+        if run_id:
+            for solution in list_solutions(self.state.conn, run_id):
+                self.solution_combo.addItem(solution_label(solution), userData=solution["solution_id"])
+        if select:
+            _restore_combo_selection(self.solution_combo, select)
+        self.solution_combo.blockSignals(False)
+        self._show_solution()
+        self._refresh_enabled()
+
+    def _show_solution(self) -> None:
+        from vine360.georef.solve import load_solution
+
+        solution_id = self.solution_combo.currentData()
+        self.report_table.setRowCount(0)
+        if not solution_id:
+            self.report_label.setText("No solution for this run yet.")
+            return
+        report = load_solution(self.state.conn, solution_id)["report"]
+        ignored = ", ".join(f"{i['name']}" + (f" ({i['note']})" if i.get("note") else "") for i in report["ignored"])
+        not_tri = ", ".join(f"{d['name']} (tag {d['tag_id']}, {d['n_views']} view(s): {d['reason']})" for d in report["not_triangulated"])
+        lines = [
+            f"{solution_id}: control points used {report['n_control']}, check points {report['n_check']}, "
+            f"ignored {len(report['ignored'])}" + (f" — {ignored}" if ignored else ""),
+            f"Tags seen by the detector but not in the table: {report['seen_not_in_table'] or 'none'}",
+            f"Tags in the table but never triangulated: {not_tri or 'none'}",
+        ]
+        scale_line = f"Scale s = {report['scale']:.5g}"
+        if report.get("corner_scale_median"):
+            scale_line += (f"   tag-size scale (median of {report['corner_scale_n']}) = {report['corner_scale_median']:.5g}"
+                           f"   diff {report['corner_scale_diff']:+.2%}")
+        lines.append(scale_line)
+        rmse = report["rmse"]
+        lines.append(f"RMSE 3D {rmse['d3']:.3f} m   horizontal {rmse['horizontal']:.3f} m   vertical {rmse['vertical']:.3f} m")
+        if report.get("check_rmse"):
+            lines.append(f"Check points: RMSE 3D {report['check_rmse']['d3']:.3f} m (n={report['n_check']})")
+        lines.append(f"EPSG:{report['epsg']}, heights {report['height_datum']}, origin {report['origin']}")
+        for warning in report.get("warnings", []):
+            lines.append("⚠ " + warning)
+        self.report_label.setText("\n".join(lines))
+        rows = report["points"]
+        self.report_table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, (key, _label) in enumerate(_REPORT_COLUMNS):
+                item = QTableWidgetItem(_fmt(row.get(key), 2 if key == "rms_px" else 3))
+                if row.get("flag") == "suspect":
+                    item.setBackground(QColor(230, 150, 60, 110))
+                elif row.get("use") == "check":
+                    item.setBackground(QColor(90, 140, 220, 60))
+                self.report_table.setItem(r, c, item)
+        self.report_table.resizeColumnsToContents()
+
+    def _on_solve(self) -> None:
+        self.solve_btn.setEnabled(False)
+        self.solve_progress.start("Solving…")
+        run_in_background(
+            self, _solve_georef_worker, self.state.project_root, self.run_combo.currentData(),
+            self.set_combo.currentData(), {},
+            on_success=self._on_solve_success, on_error=self._on_solve_error,
+            on_progress=self.solve_progress.update_progress,
+        )
+
+    def _on_solve_success(self, solution_id: str) -> None:
+        self.solve_progress.finish("Solved.")
+        self._on_run_changed(select=solution_id)
+        self.state.notify_change()
+
+    def _on_solve_error(self, exc: Exception) -> None:
+        from vine360.georef.solve import GeorefSolveError
+
+        self.solve_progress.finish("")
+        self._refresh_enabled()
+        if isinstance(exc, GeorefSolveError):
+            QMessageBox.warning(self, "Could not georeference", str(exc))
+        else:
+            QMessageBox.critical(self, "Unexpected error georeferencing", f"{type(exc).__name__}: {exc}")
+
+    def _on_solve_queue(self) -> None:
+        run_id, set_id = self.run_combo.currentData(), self.set_combo.currentData()
+        params = {"kind": "solve", "run_id": run_id, "set_id": set_id, "solve_params": {}}
+        self.state.queue_manager.add_job(QUEUE_STAGE_GEOREF, None, params, f"Georeference — {run_id} ← {self.set_combo.currentText()}")
+
+    def _on_report_csv(self) -> None:
+        from vine360.georef.solve import load_solution, write_report_csv
+
+        solution_id = self.solution_combo.currentData()
+        if not solution_id:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export georeference report", str(self.state.project_root / f"georef_{solution_id}.csv"), "CSV (*.csv)"
+        )
+        if path:
+            write_report_csv(load_solution(self.state.conn, solution_id), Path(path))
+
+    # -- enablement -----------------------------------------------------------
+
+    def _refresh_enabled(self) -> None:
+        if self.state.conn is None:
+            return
+        busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
+        from vine360.georef.apriltag_adapter import is_available
+
+        have_detector = is_available()
+        ids = self._detect_ids()
+        ready = [i for i in ids if i in self._choices and self._choices[i].view_count > 0]
+        self.detect_btn.setEnabled(have_detector and bool(ids) and len(ready) == len(ids) and not busy)
+        self.detect_queue_btn.setEnabled(have_detector and bool(ids))
+        self.detect_btn.setToolTip(
+            "" if have_detector else "pupil-apriltags isn't installed -- install vine360's `georef` extra."
+        )
+        have_set = self.set_combo.currentData() is not None
+        have_run = self.run_combo.currentData() is not None
+        self.solve_btn.setEnabled(have_set and have_run and not busy)
+        self.solve_queue_btn.setEnabled(have_set and have_run)
+        self.solve_btn.setToolTip("" if have_set else "Import a control-point CSV first (section 1).")
+        self.report_csv_btn.setEnabled(self.solution_combo.currentData() is not None)
+        detected = self.state.conn.execute("SELECT COUNT(*) FROM tag_detection_runs").fetchone()[0] > 0
+        solved = self.solution_combo.count() > 0
+        self.stage_indicator.set_stages([
+            DONE if have_set else ACTIVE,
+            DONE if detected else (ACTIVE if have_set else PENDING),
+            DONE if solved else (ACTIVE if detected and have_set and have_run else PENDING),
+        ])
+
+
 class QueuePanel(QWidget):
     """The right-hand dock: an editable, persisted plan of queued jobs
     (see vine360.gui.queue_manager) that runs unattended, one job at a
@@ -3616,11 +4309,20 @@ class QueuePanel(QWidget):
 
 
 @logged_operation("export.postshot_poses", "Export: poses + images + masks", target=lambda p: str(p.get("output_dir")), summarize=_summarize_export)
-def _export_postshot_worker(project_root: Path, output_dir: Path, run_id: str | None, progress_callback=None):
+def _export_postshot_worker(
+    project_root: Path,
+    output_dir: Path,
+    run_id: str | None,
+    georef_solution_id: str | None = None,
+    progress_callback=None,
+):
+    """georef_solution_id: export that solution's materialised local-metre
+    model instead of the run's own (docs/adr/0047); None = the original."""
     conn = open_index_db(project_root)
     try:
         return export_for_postshot(
-            conn, project_root, output_dir, run_id=run_id, progress_callback=progress_callback
+            conn, project_root, output_dir, run_id=run_id, georef_solution_id=georef_solution_id,
+            progress_callback=progress_callback,
         )
     finally:
         conn.close()
@@ -3645,6 +4347,7 @@ def _export_realityscan_worker(
     output_dir: Path,
     frame_set_id: str | None,
     include_camera_priors: bool = False,
+    georef_solution_id: str | None = None,
     progress_callback=None,
 ):
     conn = open_index_db(project_root)
@@ -3655,6 +4358,7 @@ def _export_realityscan_worker(
             output_dir,
             frame_set_id=frame_set_id,
             include_camera_priors=include_camera_priors,
+            georef_solution_id=georef_solution_id,
             progress_callback=progress_callback,
         )
     finally:
@@ -3729,6 +4433,25 @@ class ExportPanel(QWidget):
         self.priors_checkbox = QCheckBox("Include camera priors CSV (from vine360's own SfM run)")
         self.priors_checkbox.toggled.connect(self._on_priors_toggled)
         form.addRow("Priors:", self.priors_checkbox)
+        # Which georeference solution (docs/adr/0047) to export in -- "None"
+        # is the run's own model, unchanged. Remembered per run in
+        # project.yaml (georef.active_solution).
+        georef_row = QHBoxLayout()
+        self.georef_combo = QComboBox()
+        self.georef_combo.setToolTip(
+            "A georeferenced export is in local metres (survey CRS minus the control-point set's origin), "
+            "with georef.json / georef.prj describing it. None exports the SfM run's own frame unchanged."
+        )
+        self.georef_combo.currentIndexChanged.connect(self._on_georef_changed)
+        georef_row.addWidget(self.georef_combo, stretch=1)
+        self.splat_btn = QPushButton("Georeference a trained splat…")
+        self.splat_btn.setToolTip(
+            "Moves a .ply trained on a non-georeferenced export of this run into the chosen solution's local "
+            "metres -- written as a new file; the original is never changed."
+        )
+        self.splat_btn.clicked.connect(self._on_georef_splat)
+        georef_row.addWidget(self.splat_btn)
+        form.addRow("Georeference:", georef_row)
         controls_layout.addLayout(form)
 
         self.mode_note = QLabel("")
@@ -3819,12 +4542,94 @@ class ExportPanel(QWidget):
             )
             self.run_combo.addItem(label, userData=run_id)
         self.run_combo.blockSignals(False)
+        self._refresh_georef_choices()
         self._refresh_enabled()
 
     def _on_run_changed(self) -> None:
         self._exported = False  # a different run means the last export no longer matches this configuration
+        self._refresh_georef_choices()
         self._update_output_dir()
         self._refresh_enabled()
+
+    def _refresh_georef_choices(self) -> None:
+        """Poses mode: "None (original SfM frame)", then the selected run's
+        solutions newest first, starting from the run's remembered choice.
+        RealityScan mode: every solution (its run supplies the priors).
+        Images-only Postshot mode has no poses to georeference."""
+        if self.state.conn is None:
+            return
+        from vine360.georef.solve import active_solution, list_solutions, solution_label
+
+        mode = self.mode_combo.currentData()
+        self.georef_combo.blockSignals(True)
+        self.georef_combo.clear()
+        self.georef_combo.addItem("None (original SfM frame)", userData=None)
+        selected = None
+        if mode == "poses" and self.run_combo.currentData():
+            run_id = self.run_combo.currentData()
+            for solution in list_solutions(self.state.conn, run_id):
+                self.georef_combo.addItem(solution_label(solution), userData=solution["solution_id"])
+            selected = active_solution(self.state.project_root, run_id)
+        elif mode == "realityscan":
+            for solution in list_solutions(self.state.conn):
+                self.georef_combo.addItem(f"{solution_label(solution)}  [{solution['run_id']}]", userData=solution["solution_id"])
+        _restore_combo_selection(self.georef_combo, selected)
+        self.georef_combo.setEnabled(mode != "frames_masks")
+        self.georef_combo.blockSignals(False)
+        self._refresh_enabled()
+
+    def _on_georef_changed(self) -> None:
+        self._exported = False  # a different frame means the last export no longer matches this configuration
+        if self.mode_combo.currentData() == "poses" and self.run_combo.currentData():
+            from vine360.georef.solve import set_active_solution
+
+            set_active_solution(self.state.project_root, self.run_combo.currentData(), self.georef_combo.currentData())
+        self._refresh_enabled()
+
+    def _on_georef_splat(self) -> None:
+        from vine360.georef.apply import default_splat_output
+
+        solution_id = self.georef_combo.currentData()
+        if not solution_id:
+            QMessageBox.information(self, "Choose a georeference", "Pick a georeference solution above first.")
+            return
+        start = self.state.project_root / "models"
+        in_path, _ = QFileDialog.getOpenFileName(self, "Trained splat to georeference", str(start), "Gaussian splat (*.ply)")
+        if not in_path:
+            return
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Save georeferenced splat as", str(default_splat_output(Path(in_path), solution_id)), "Gaussian splat (*.ply)"
+        )
+        if not out_path:
+            return
+        if Path(out_path).resolve() == Path(in_path).resolve():
+            QMessageBox.warning(self, "Choose another file", "The georeferenced splat must be a new file -- the original is never overwritten.")
+            return
+        self._splat_out = out_path
+        self.splat_btn.setEnabled(False)
+        self.progress_area.start("Georeferencing splat…")
+        run_in_background(
+            self, _georef_splat_worker, self.state.project_root, Path(in_path), Path(out_path), solution_id,
+            # Bound methods, not a lambda: a lambda has no QObject thread
+            # affinity, so Qt would run it on the worker thread (see
+            # QueueManager._start_job).
+            on_success=self._on_splat_done, on_error=self._on_splat_error,
+            on_progress=self.progress_area.update_progress,
+        )
+
+    def _on_splat_done(self, count: int) -> None:
+        out_path = self._splat_out
+        self.splat_btn.setEnabled(True)
+        self.progress_area.finish("Splat georeferenced.")
+        self.result_label.setText(
+            f"Wrote {count} Gaussians to {out_path} in local metres (see the solution's georef.json for the origin "
+            "and CRS). Higher-order SH colour isn't rotated (docs/adr/0047)."
+        )
+
+    def _on_splat_error(self, exc: Exception) -> None:
+        self.splat_btn.setEnabled(True)
+        self.progress_area.finish("")
+        QMessageBox.warning(self, "Could not georeference the splat", f"{type(exc).__name__}: {exc}")
 
     def _run_frame_set_view_count(self, run_id: str | None) -> int | None:
         """For a raw-360-frame run: how many projected views its frame
@@ -3903,6 +4708,7 @@ class ExportPanel(QWidget):
                 "for this mode."
             )
         self._exported = False  # a mode change means the last export no longer matches this configuration
+        self._refresh_georef_choices()
         self._update_output_dir()
         self._refresh_enabled()
 
@@ -3981,6 +4787,7 @@ class ExportPanel(QWidget):
             "projection automatically ahead of this export job."
         )
         self.queue_btn.setEnabled(self.output_dir is not None)
+        self.splat_btn.setEnabled(self.georef_combo.currentData() is not None and not busy)
 
         if mode == "realityscan":
             priors_available = self.state.conn is not None and realityscan_priors_available(
@@ -4037,6 +4844,9 @@ class ExportPanel(QWidget):
         params = {"mode": mode, "output_dir": str(self.output_dir), "frame_set_id": frame_set_id}
         if mode == "realityscan":
             params["include_camera_priors"] = self.priors_checkbox.isChecked()
+        if mode in ("poses", "realityscan"):
+            # Explicit, so the queued export doesn't depend on the active choice later (docs/adr/0047).
+            params["georef_solution_id"] = self.georef_combo.currentData()
         if mode == "poses":
             params["run_id"] = self.run_combo.currentData()  # None -> resolved lazily at run time
             label = f"Export — poses + images + masks → {self.output_dir.name}"
@@ -4058,6 +4868,7 @@ class ExportPanel(QWidget):
                 self.state.project_root,
                 self.output_dir,
                 self.run_combo.currentData(),
+                self.georef_combo.currentData(),
                 on_success=self._on_export_success,
                 on_error=self._on_export_error,
                 on_progress=self.progress_area.update_progress,
@@ -4070,6 +4881,7 @@ class ExportPanel(QWidget):
                 self.output_dir,
                 self.source_combo.currentData(),
                 self.priors_checkbox.isChecked(),
+                self.georef_combo.currentData(),
                 on_success=self._on_export_success,
                 on_error=self._on_export_error,
                 on_progress=self.progress_area.update_progress,
@@ -4107,6 +4919,9 @@ class ExportPanel(QWidget):
                 f"\nCamera priors: {result.num_priors} position(s) written to {result.priors_path} -- "
                 "in RealityScan: WORKFLOW tab → Import Metadata → Trajectory."
             )
+        info_path = result.output_dir / "export_info.json"
+        if info_path.exists() and json.loads(info_path.read_text()).get("georef_solution_id") not in (None, "none"):
+            text += "\nGeoreferenced: local metres (CRS minus origin) -- see georef.json in the export folder."
         if result.warnings:
             text += "\n⚠ " + "; ".join(result.warnings)
         self.result_label.setText(text)
@@ -4143,10 +4958,14 @@ def _disk_usage_worker(project_root: Path, generation: int) -> tuple[int, dict]:
             for info in list_frame_sets(conn)
         }
         sfm_runs = {run.run_id: directory_size(project_root / "sfm" / "sparse" / run.run_id) for run in list_sfm_runs(conn)}
+        solutions = {
+            solution_id: directory_size(project_root / model_dir) if model_dir else 0
+            for solution_id, model_dir in conn.execute("SELECT solution_id, model_dir FROM georef_solutions")
+        }
     finally:
         conn.close()
     exports = {info.relative_path: export_dir_size(project_root, info) for info in list_export_dirs(project_root)}
-    return generation, {"frame_sets": frame_sets, "sfm_runs": sfm_runs, "exports": exports}
+    return generation, {"frame_sets": frame_sets, "sfm_runs": sfm_runs, "exports": exports, "georef_solutions": solutions}
 
 
 @logged_operation("data.delete", "Data manager: delete", target=lambda p: p.get("target"))
@@ -4163,6 +4982,18 @@ def _data_manager_delete_worker(project_root: Path, action: str, target: str) ->
             delete_sfm_run(conn, project_root, target)
         elif action == "export":
             delete_export_dir(project_root, target)
+        elif action == "gcp_set":  # its points and solutions too (docs/adr/0047)
+            from vine360.georef.control_points import delete_control_point_set
+
+            delete_control_point_set(conn, project_root, target)
+        elif action == "tag_obs":
+            from vine360.georef.observe import delete_tag_observations
+
+            delete_tag_observations(conn, target)
+        elif action == "georef_solution":  # the row and its sfm/georef/<run>/<solution>/ only
+            from vine360.georef.solve import delete_solution
+
+            delete_solution(conn, project_root, target)
         else:
             raise ValueError(f"unknown delete action {action!r}")
         return action
@@ -4259,6 +5090,24 @@ class DataManagerPanel(QWidget):
         runs_btn_row.addStretch()
         runs_layout.addLayout(runs_btn_row)
         controls_layout.addWidget(runs_box, stretch=1)
+
+        georef_box = QGroupBox("Georeference (control points, tag detections, solutions)")
+        georef_layout = QVBoxLayout(georef_box)
+        self.georef_tree = QTreeWidget()
+        self.georef_tree.setHeaderLabels(["Item", "Details", "On disk"])
+        self.georef_tree.itemSelectionChanged.connect(self._refresh_enabled)
+        georef_layout.addWidget(self.georef_tree)
+        georef_btn_row = QHBoxLayout()
+        self.delete_georef_btn = QPushButton("Delete…")
+        self.delete_georef_btn.setToolTip(
+            "A control-point set (with its solutions), a frame set's tag detections, or one solution and its "
+            "sfm/georef/ model -- never an SfM run or its own model."
+        )
+        self.delete_georef_btn.clicked.connect(self._delete_georef_item)
+        georef_btn_row.addWidget(self.delete_georef_btn)
+        georef_btn_row.addStretch()
+        georef_layout.addLayout(georef_btn_row)
+        controls_layout.addWidget(georef_box, stretch=1)
 
         exports_box = QGroupBox("Exports")
         exports_layout = QVBoxLayout(exports_box)
@@ -4359,6 +5208,8 @@ class DataManagerPanel(QWidget):
                 self.runs_table.setItem(r, c, item)
         self.runs_table.resizeColumnsToContents()
 
+        self._refresh_georef_tree(runs, set_names)
+
         exports = list_export_dirs(self.state.project_root)
         self.exports_table.setRowCount(len(exports))
         for r, info in enumerate(exports):
@@ -4379,6 +5230,68 @@ class DataManagerPanel(QWidget):
         self._apply_usage()
         self._start_usage_scan()
         self._refresh_enabled()
+
+    def _refresh_georef_tree(self, runs, set_names: dict[str, str]) -> None:
+        from vine360.georef.control_points import list_control_point_sets, load_control_points
+        from vine360.georef.observe import tag_counts_by_frame_set
+        from vine360.georef.solve import list_solutions
+
+        conn = self.state.conn
+        self.georef_tree.clear()
+        sets_root = QTreeWidgetItem(["Control-point sets"])
+        for cp_set in list_control_point_sets(conn):
+            points = load_control_points(conn, cp_set.set_id)
+            item = QTreeWidgetItem([cp_set.label, f"{len(points)} points, EPSG:{cp_set.epsg}, imported "
+                                    f"{_local_time(cp_set.imported_at)}", "—"])
+            item.setData(0, Qt.UserRole, ("gcp_set", cp_set.set_id, cp_set.label))
+            item.setToolTip(0, cp_set.source_path)
+            sets_root.addChild(item)
+        tags_root = QTreeWidgetItem(["Tag detections"])
+        for fs_id, info in tag_counts_by_frame_set(conn).items():
+            item = QTreeWidgetItem([set_names.get(fs_id, fs_id), f"{info['views_detected']} views detected, "
+                                    f"{info['detections']} detections, tags {info['tags'] or 'none'}", "—"])
+            item.setData(0, Qt.UserRole, ("tag_obs", fs_id, set_names.get(fs_id, fs_id)))
+            tags_root.addChild(item)
+        solutions_root = QTreeWidgetItem(["Solutions (by SfM run)"])
+        for run in runs:
+            solutions = list_solutions(conn, run.run_id)
+            if not solutions:
+                continue
+            run_item = QTreeWidgetItem([f"{run.created_at} — {run.engine_label}", run.run_id, ""])
+            for solution in solutions:
+                report = solution["report"]
+                item = QTreeWidgetItem([
+                    f"{solution['created_at']}  {solution['solution_id']}",
+                    f"RMSE 3D {report['rmse']['d3']:.3f} m, {report['n_control']} control pts",
+                    "",
+                ])
+                item.setData(0, Qt.UserRole, ("georef_solution", solution["solution_id"], solution["solution_id"]))
+                run_item.addChild(item)
+            solutions_root.addChild(run_item)
+        for root_item in (sets_root, tags_root, solutions_root):
+            self.georef_tree.addTopLevelItem(root_item)
+        self.georef_tree.expandAll()
+        for c in range(self.georef_tree.columnCount()):
+            self.georef_tree.resizeColumnToContents(c)
+
+    def _selected_georef(self) -> tuple[str, str, str] | None:
+        items = self.georef_tree.selectedItems()
+        return items[0].data(0, Qt.UserRole) if items else None
+
+    def _delete_georef_item(self) -> None:
+        selected = self._selected_georef()
+        if not selected:
+            return
+        kind, target, name = selected
+        question = {
+            "gcp_set": f"Delete control-point set {name}, its points, and every georeference solution fitted to it "
+                       "(their sfm/georef/ models)?\n\nThe survey file itself and every SfM run are kept.",
+            "tag_obs": f"Delete the tag detections of {name}?\n\nIts projected views are kept; detect again to restore them.",
+            "georef_solution": f"Delete georeference solution {name} and its sfm/georef/ model?\n\n"
+                               "The SfM run, its own model, other solutions and existing exports are kept.",
+        }[kind]
+        if self._confirm("Delete georeference data", question + " This can't be undone."):
+            self._run_delete(kind, target)
 
     def _start_usage_scan(self) -> None:
         # Bound-method callbacks, not lambdas: a lambda has no QObject
@@ -4427,6 +5340,15 @@ class DataManagerPanel(QWidget):
         for r in range(self.runs_table.rowCount()):
             run_id = self.runs_table.item(r, 0).data(Qt.UserRole)
             self.runs_table.item(r, 4).setText(_format_bytes(runs.get(run_id)))
+        solutions = self._usage.get("georef_solutions", {})
+        for i in range(self.georef_tree.topLevelItemCount()):
+            top = self.georef_tree.topLevelItem(i)
+            for k in range(top.childCount()):
+                run_item = top.child(k)
+                for j in range(run_item.childCount()):
+                    data = run_item.child(j).data(0, Qt.UserRole)
+                    if data and data[0] == "georef_solution":
+                        run_item.child(j).setText(2, _format_bytes(solutions.get(data[1])))
         exports = self._usage.get("exports", {})
         for r in range(self.exports_table.rowCount()):
             rel = self.exports_table.item(r, 0).data(Qt.UserRole)
@@ -4462,6 +5384,7 @@ class DataManagerPanel(QWidget):
         self.delete_masks_btn.setEnabled(item is not None and counts[2] > 0 and not blocked)
         self.delete_run_btn.setEnabled(self._selected_row_data(self.runs_table) is not None and not blocked)
         self.delete_export_btn.setEnabled(self._selected_row_data(self.exports_table) is not None and not blocked)
+        self.delete_georef_btn.setEnabled(self._selected_georef() is not None and not blocked)
 
     # -- deleting ---------------------------------------------------------
 
@@ -4785,6 +5708,7 @@ class Vine360MainWindow(QMainWindow):
         projection_panel = ProjectionPanel(self.state)
         masks_panel = MasksPanel(self.state)
         pose_panel = PoseEstimationPanel(self.state)
+        georef_panel = GeorefPanel(self.state)
         export_panel = ExportPanel(self.state)
         data_manager_panel = DataManagerPanel(self.state)
         activity_log_panel = ActivityLogPanel(self.state)
@@ -4794,6 +5718,7 @@ class Vine360MainWindow(QMainWindow):
         project_panel.project_changed.connect(projection_panel.on_project_changed)
         project_panel.project_changed.connect(masks_panel.on_project_changed)
         project_panel.project_changed.connect(pose_panel.on_project_changed)
+        project_panel.project_changed.connect(georef_panel.on_project_changed)
         project_panel.project_changed.connect(export_panel.on_project_changed)
         project_panel.project_changed.connect(data_manager_panel.on_project_changed)
         project_panel.project_changed.connect(activity_log_panel.on_project_changed)
@@ -4806,6 +5731,7 @@ class Vine360MainWindow(QMainWindow):
             projection_panel,
             masks_panel,
             pose_panel,
+            georef_panel,
             export_panel,
             data_manager_panel,
             activity_log_panel,
@@ -4817,6 +5743,7 @@ class Vine360MainWindow(QMainWindow):
             "Projection",
             "Masks",
             "Pose estimation",
+            "Georeference",
             "Export",
             "Data manager",
             "Activity log",
