@@ -1,1 +1,3 @@
 *.sh text eol=lf
+fixtures/gcp/* -text
+fixtures/apriltag/*.png binary

@@ -34,6 +34,7 @@ LAYOUT_DIRS = [
     "masks/classes",
     "masks/keep",
     "sfm/sparse",
+    "sfm/georef",  # materialised georeferenced models, sfm/georef/<run_id>/<solution_id>/ (docs/adr/0047)
     "runs",
     "exports",
     "models",
@@ -164,6 +165,73 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 error TEXT,
                 origin TEXT
             );
+            -- Georeferencing (docs/adr/0047). Coordinates are projected CRS
+            -- values as surveyed (epsg/height_datum are metadata, never
+            -- converted); a point's name is kept as written ("000").
+            CREATE TABLE IF NOT EXISTS control_point_sets (
+                set_id TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                epsg INTEGER NOT NULL,
+                height_datum TEXT NOT NULL,
+                tag_family TEXT NOT NULL,
+                tag_size_m REAL,
+                origin_east REAL NOT NULL,
+                origin_north REAL NOT NULL,
+                origin_height REAL NOT NULL,
+                imported_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS control_points (
+                set_id TEXT NOT NULL REFERENCES control_point_sets(set_id),
+                name TEXT NOT NULL,
+                row_index INTEGER NOT NULL,
+                east REAL NOT NULL,
+                north REAL NOT NULL,
+                height REAL NOT NULL,
+                tag_id INTEGER,
+                use TEXT NOT NULL,
+                sigma_h REAL,
+                sigma_v REAL,
+                tag_size_m REAL,
+                note TEXT,
+                PRIMARY KEY (set_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS tag_observations (
+                view_id TEXT NOT NULL REFERENCES views(view_id),
+                tag_family TEXT NOT NULL,
+                tag_id INTEGER NOT NULL,
+                corners TEXT NOT NULL,
+                center TEXT NOT NULL,
+                decision_margin REAL,
+                hamming INTEGER,
+                detector TEXT NOT NULL,
+                detector_version TEXT NOT NULL,
+                params TEXT NOT NULL,
+                detected_at TEXT NOT NULL,
+                PRIMARY KEY (view_id, tag_family, tag_id)
+            );
+            -- Which views a detection pass covered, including the ones where
+            -- it found nothing -- "detected, no tags" and "never detected"
+            -- must stay distinguishable for the stage status and the queue.
+            CREATE TABLE IF NOT EXISTS tag_detection_runs (
+                view_id TEXT NOT NULL REFERENCES views(view_id),
+                tag_family TEXT NOT NULL,
+                n_tags INTEGER NOT NULL,
+                detected_at TEXT NOT NULL,
+                PRIMARY KEY (view_id, tag_family)
+            );
+            CREATE TABLE IF NOT EXISTS georef_solutions (
+                solution_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES sfm_runs(run_id),
+                set_id TEXT NOT NULL REFERENCES control_point_sets(set_id),
+                transform TEXT NOT NULL,
+                tag_positions TEXT NOT NULL,
+                report TEXT NOT NULL,
+                params TEXT NOT NULL,
+                model_dir TEXT,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS queue_jobs (
                 job_id TEXT PRIMARY KEY,
                 order_index INTEGER NOT NULL,
@@ -187,6 +255,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "masks", "updated_at", "TEXT")
     _ensure_column(conn, "frames", "frame_set_id", "TEXT")
     _ensure_column(conn, "queue_jobs", "target_frame_set_id", "TEXT")
+    _ensure_column(conn, "georef_solutions", "model_dir", "TEXT")
     _migrate_legacy_frame_sets(conn)
 
 
@@ -258,6 +327,13 @@ def create_project(root: Path, name: str, capture_mode: CaptureMode) -> Project:
 def _write_project_yaml(root: Path, project: Project) -> None:
     with open(root / PROJECT_FILE, "w", encoding="utf-8") as f:
         yaml.safe_dump(project.to_dict(), f, sort_keys=False)
+
+
+def save_project(root: Path, project: Project) -> None:
+    """Rewrites project.yaml -- for the few settings kept there rather than
+    in the index (e.g. the active georeference solution per run,
+    docs/adr/0047)."""
+    _write_project_yaml(Path(root), project)
 
 
 def load_project(root: Path) -> Project:

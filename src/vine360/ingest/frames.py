@@ -227,6 +227,12 @@ def clear_frame_set(conn: sqlite3.Connection, project_root: Path, frame_set_id: 
             f"(SELECT view_id FROM views WHERE frame_id IN ({placeholders}))",
             frame_ids,
         )
+        for table in ("tag_observations", "tag_detection_runs"):  # docs/adr/0047
+            conn.execute(
+                f"DELETE FROM {table} WHERE view_id IN "
+                f"(SELECT view_id FROM views WHERE frame_id IN ({placeholders}))",
+                frame_ids,
+            )
         conn.execute(f"DELETE FROM views WHERE frame_id IN ({placeholders})", frame_ids)
     conn.execute("DELETE FROM frames WHERE frame_set_id = ?", (frame_set_id,))
     conn.execute("DELETE FROM frame_sets WHERE frame_set_id = ?", (frame_set_id,))

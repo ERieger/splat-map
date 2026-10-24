@@ -26,10 +26,16 @@ class Project:
     working_crs: str | None
     software_versions: dict[str, str]
     capture_mode: CaptureMode
+    # Per-project georeferencing choices (docs/adr/0047), e.g.
+    # {"active_solution": {run_id: solution_id}}. Absent from older
+    # project.yaml files, and only written once a choice is made.
+    georef: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d["capture_mode"] = self.capture_mode.value
+        if not d["georef"]:
+            del d["georef"]  # keep project.yaml unchanged for projects that never georeference
         return d
 
     @staticmethod

@@ -243,11 +243,15 @@ def delete_sfm_run(conn: sqlite3.Connection, project_root: Path, run_id: str) ->
     be safely attributed to one run, so only the row is removed."""
     if conn.execute("SELECT 1 FROM sfm_runs WHERE run_id = ?", (run_id,)).fetchone() is None:
         raise DataManagerError(f"unknown sfm run: {run_id}")
+    conn.execute("DELETE FROM georef_solutions WHERE run_id = ?", (run_id,))  # docs/adr/0047
     conn.execute("DELETE FROM sfm_runs WHERE run_id = ?", (run_id,))
     conn.commit()
     run_dir = Path(project_root) / "sfm" / "sparse" / run_id
     if run_dir.exists():
         shutil.rmtree(run_dir)
+    georef_dir = Path(project_root) / "sfm" / "georef" / run_id  # its solutions' models
+    if georef_dir.exists():
+        shutil.rmtree(georef_dir)
 
 
 def list_export_dirs(project_root: Path) -> list[ExportDirInfo]:

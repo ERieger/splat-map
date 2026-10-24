@@ -43,6 +43,10 @@ def clear_views_for_frame(conn: sqlite3.Connection, project_root: Path, frame_id
     conn.execute(
         "DELETE FROM mask_layers WHERE view_id IN (SELECT view_id FROM views WHERE frame_id = ?)", (frame_id,)
     )
+    for table in ("tag_observations", "tag_detection_runs"):  # a re-rendered view's tags are stale (docs/adr/0047)
+        conn.execute(
+            f"DELETE FROM {table} WHERE view_id IN (SELECT view_id FROM views WHERE frame_id = ?)", (frame_id,)
+        )
     conn.execute("DELETE FROM views WHERE frame_id = ?", (frame_id,))
     conn.commit()
     remove_view_files(project_root, frame_id, view_ids)
