@@ -296,8 +296,9 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
     copies either the original or a solution's model. It never re-transforms, and records the
     choice in `export_info.json`.
   - RealityScan exports get `CameraPriors_local.csv` and `GroundControl_local.csv`.
-  - "Georeference a trained splat…" writes a new .ply (positions, orientations and log-scales;
-    higher-order SH not rotated).
+  - Georeference step 4, "Georeference a trained splat", writes a new .ply (positions,
+    orientations and log-scales; higher-order SH not rotated) plus a `.georef.json` / `.prj`.
+    It checks the splat is in the solution's run frame first.
 - The queue has `detect_tags` and `solve` jobs with prerequisite auto-insertion. Everything is in
   the Activity log, and the Data manager lists and deletes control-point sets, tag detections
   and solutions.
@@ -409,8 +410,8 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
   Capture 2 (tags laid out; footage not downloaded yet). Things to confirm then:
   - detection rates on real 1024 px views;
   - real residuals;
-  - that Postshot keeps the imported COLMAP frame in its output .ply (needed for "Georeference a
-    trained splat…").
+  - that Postshot keeps the imported COLMAP frame in its output .ply (needed for Georeference step 4,
+    "Georeference a trained splat").
 
   RealityScan's GCP import format is unverified (its help pages now redirect).
 - The pycolmap/SphereSfM synthetic-room tests (test_frame_poses, test_sfm_progress,

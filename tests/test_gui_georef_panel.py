@@ -116,3 +116,43 @@ def test_tag_size_table_controls(state, tmp_path, monkeypatch):
     row = next(r for r in range(15) if panel.points_table.item(r, 0).text() == "020")
     assert panel.points_table.item(row, 6).text() == "0.4"
     assert BUILTIN_TABLE.is_file()
+
+
+def test_splat_section_defaults_to_a_new_file_and_follows_the_solution(state, tmp_path):
+    import numpy as np
+
+    from test_georef_apply import FIELDS, _write_ply
+    from vine360.gui.main_window import _georef_splat_worker
+    from vine360.georef.similarity import Similarity
+    from vine360.georef.solve import load_solution
+    from vine360.georef.splat import reference_points
+
+    st, scene = state
+    solution_id = _solve_georef_worker(scene.root, RUN_ID, scene.set_id, {})
+    panel = GeorefPanel(st)
+    panel.on_shown()
+    panel._on_run_changed(select=solution_id)
+    assert panel.splat_solution_combo.currentData() == solution_id  # follows section 3
+    assert not panel.splat_btn.isEnabled()  # no input yet
+
+    solution = load_solution(scene.conn, solution_id)
+    sim = Similarity.from_dict(solution["transform"])
+    local = reference_points(scene.root, solution)
+    data = np.zeros((len(local), len(FIELDS)))
+    data[:, :3] = (local - sim.translation) @ sim.rotation / sim.scale
+    src = tmp_path / "trained.ply"
+    _write_ply(src, data)
+    panel.splat_in_edit.setText(str(src))
+    panel._on_splat_inputs_changed()
+    expected = tmp_path / f"trained.georef-{solution_id[:8]}.ply"
+    assert panel.splat_out_edit.text() == str(expected) and panel.splat_btn.isEnabled()
+
+    result = _georef_splat_worker(scene.root, src, expected, solution_id)
+    panel._on_splat_done(result)
+    assert expected.exists() and "Wrote" in panel.splat_result.text()
+    # The next default never replaces the one just written.
+    assert panel.splat_out_edit.text() == str(tmp_path / f"trained.georef-{solution_id[:8]}-2.ply")
+
+    export = ExportPanel(st)
+    export.on_shown()
+    assert not hasattr(export, "splat_btn")  # Export is for the sparse model / image sets only

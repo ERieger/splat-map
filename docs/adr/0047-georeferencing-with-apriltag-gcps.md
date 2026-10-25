@@ -159,10 +159,23 @@ a local Euclidean system on import. Same honesty caveat as ADR 0033.
   removes its points and its solutions.
 - **`transform_splat_ply` never writes in place.** The default output is
   `<stem>.georef-<solution_id[:8]>.ply` next to the input; output == input is refused, and output
-  goes through a `.partial` file. The action is in the Export panel ("Georeference a trained
-  splat…"), using the selected solution. It is only meaningful for a splat trained on a "None"
-  export. **Unverified that Postshot keeps the imported COLMAP frame** in its output .ply; check on
-  the first real splat.
+  goes through a `.partial` file. **Unverified that Postshot keeps the imported COLMAP frame** in
+  its output .ply; check on the first real splat.
+- **Georeferencing a trained splat is the Georeference stage's step 4, not part of Export**
+  (`georef/splat.py`; moved from the Export panel on request). Export only handles what vine360
+  produces itself: the sparse model and cameras, which the chosen solution puts in local metres,
+  and image sets. Step 4 takes an existing .ply, a solution, and an output path.
+  - It is non-destructive. The input is only read, and the output is a new .ply plus
+    `<output stem>.georef.json` / `.prj` recording the CRS, origin, solution, source file and
+    frame-check result. The default output never replaces an earlier one; `-2`, `-3`, … is added.
+  - The transform is only right for a splat in the solution's run frame, meaning one trained from
+    a "None" export of that run. Before writing, a frame check compares the splat's median position
+    and interquartile spread with the solution's materialised model (its points, plus camera
+    centres when there are few points).
+  - "Already local" (it lines up *without* the transform, so it was trained from a georeferenced
+    export) and "mismatch" (a different run, or an images-only export whose trainer ran its own
+    SfM) both stop the run and ask before writing anyway. The override is recorded in the sidecar.
+  - It is a coarse sanity check, robust to background Gaussians, not a registration.
 
 ### pupil-apriltags teardown bug (found while building this)
 

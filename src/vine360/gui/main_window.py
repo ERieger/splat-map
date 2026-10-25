@@ -3566,21 +3566,30 @@ def _solve_georef_worker(
 
 @logged_operation(
     "georef.splat", "Georeference a trained splat", target=lambda p: str(p.get("out_path")),
-    summarize=lambda n, _conn: f"{n} Gaussians",
+    summarize=lambda r, _conn: f"{r.count} Gaussians -> {r.out_path.name} (frame check: {r.check.status})",
 )
 def _georef_splat_worker(
-    project_root: Path, in_path: Path, out_path: Path, solution_id: str, progress_callback=None
-) -> int:
-    from vine360.georef.apply import transform_splat_ply
-    from vine360.georef.similarity import Similarity
-    from vine360.georef.solve import load_solution
+    project_root: Path, in_path: Path, out_path: Path, solution_id: str, force: bool = False, progress_callback=None
+):
+    from vine360.georef.splat import georeference_splat
 
     conn = open_index_db(project_root)
     try:
-        similarity = Similarity.from_dict(load_solution(conn, solution_id)["transform"])
+        return georeference_splat(conn, project_root, Path(in_path), Path(out_path), solution_id, force=force,
+                                  progress_callback=progress_callback)
     finally:
         conn.close()
-    return transform_splat_ply(Path(in_path), Path(out_path), similarity, progress_callback=progress_callback)
+
+
+def _unused_path(path: Path) -> Path:
+    """path, or path with -2, -3, ... before the suffix if it exists -- a
+    default output never replaces an earlier one."""
+    path = Path(path)
+    candidate, n = path, 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+        n += 1
+    return candidate
 
 
 _USE_LABELS = {"control": "control", "check": "check", "ignore": "ignore"}
@@ -3822,6 +3831,56 @@ class GeorefPanel(QWidget):
         csv_row.addStretch()
         solve_layout.addLayout(csv_row)
         layout.addWidget(solve_box)
+
+        # -- 4. georeference a trained splat --------------------------------
+        splat_box = QGroupBox("4. Georeference a trained splat (optional)")
+        splat_layout = QVBoxLayout(splat_box)
+        splat_intro = QLabel(
+            "For a splat trained from an export of an SfM run with Georeference set to None (the run's own "
+            "frame). Writes a new .ply in the solution's local metres, plus a .georef.json (and .prj) giving the "
+            "CRS and origin. The original .ply is only read. A splat trained from a georeferenced export is "
+            "already in local metres and needs nothing here."
+        )
+        splat_intro.setWordWrap(True)
+        splat_intro.setStyleSheet("color: palette(mid);")
+        splat_layout.addWidget(splat_intro)
+        splat_form = QFormLayout()
+        self.splat_solution_combo = QComboBox()
+        self.splat_solution_combo.currentIndexChanged.connect(self._on_splat_inputs_changed)
+        splat_form.addRow("Solution:", self.splat_solution_combo)
+        in_row = QHBoxLayout()
+        self.splat_in_edit = QLineEdit()
+        self.splat_in_edit.setReadOnly(True)
+        self.splat_in_edit.setPlaceholderText("Choose the trained .ply")
+        in_row.addWidget(self.splat_in_edit, stretch=1)
+        self.splat_in_btn = QPushButton("Browse…")
+        self.splat_in_btn.clicked.connect(self._on_choose_splat_input)
+        in_row.addWidget(self.splat_in_btn)
+        splat_form.addRow("Trained splat:", in_row)
+        out_row = QHBoxLayout()
+        self.splat_out_edit = QLineEdit()
+        self.splat_out_edit.setReadOnly(True)
+        out_row.addWidget(self.splat_out_edit, stretch=1)
+        self.splat_out_btn = QPushButton("Save as…")
+        self.splat_out_btn.clicked.connect(self._on_choose_splat_output)
+        out_row.addWidget(self.splat_out_btn)
+        splat_form.addRow("Output:", out_row)
+        splat_layout.addLayout(splat_form)
+        splat_btns = QHBoxLayout()
+        self.splat_btn = QPushButton("Georeference splat")
+        self.splat_btn.clicked.connect(self._on_splat_clicked)
+        splat_btns.addWidget(self.splat_btn)
+        splat_btns.addStretch()
+        splat_layout.addLayout(splat_btns)
+        self.splat_progress = ProgressArea()
+        splat_layout.addWidget(self.splat_progress)
+        self.splat_result = QLabel("")
+        self.splat_result.setWordWrap(True)
+        self.splat_result.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        splat_layout.addWidget(self.splat_result)
+        self._splat_out_pinned = False  # a Save as… choice sticks; otherwise the output follows input + solution
+        self._splat_running = False
+        layout.addWidget(splat_box)
         layout.addStretch()
 
         outer.addWidget(scroll, stretch=1)
@@ -4182,6 +4241,104 @@ class GeorefPanel(QWidget):
         self.run_combo.blockSignals(False)
         self._on_run_changed()
 
+    def _refresh_splat_solutions(self) -> None:
+        """Every solution, newest first; follows the one shown in section 3."""
+        from vine360.georef.solve import list_solutions, solution_label
+
+        previous = self.solution_combo.currentData() or self.splat_solution_combo.currentData()
+        self.splat_solution_combo.blockSignals(True)
+        self.splat_solution_combo.clear()
+        for solution in list_solutions(self.state.conn):
+            self.splat_solution_combo.addItem(f"{solution_label(solution)}  [{solution['run_id']}]",
+                                              userData=solution["solution_id"])
+        _restore_combo_selection(self.splat_solution_combo, previous)
+        self.splat_solution_combo.blockSignals(False)
+        self._on_splat_inputs_changed()
+
+    def _on_splat_inputs_changed(self) -> None:
+        from vine360.georef.apply import default_splat_output
+
+        in_text = self.splat_in_edit.text()
+        solution_id = self.splat_solution_combo.currentData()
+        if not self._splat_out_pinned:
+            self.splat_out_edit.setText(
+                str(_unused_path(default_splat_output(Path(in_text), solution_id))) if in_text and solution_id else ""
+            )
+        self._refresh_enabled()
+
+    def _on_choose_splat_input(self) -> None:
+        current = self.splat_in_edit.text()
+        start = str(Path(current).parent) if current else str(self.state.project_root / "models")
+        path, _ = QFileDialog.getOpenFileName(self, "Trained splat to georeference", start, "Gaussian splat (*.ply)")
+        if path:
+            self.splat_in_edit.setText(path)
+            self._splat_out_pinned = False
+            self.splat_result.setText("")
+            self._on_splat_inputs_changed()
+
+    def _on_choose_splat_output(self) -> None:
+        start = self.splat_out_edit.text() or self.splat_in_edit.text() or str(self.state.project_root / "models")
+        path, _ = QFileDialog.getSaveFileName(self, "Save georeferenced splat as", start, "Gaussian splat (*.ply)")
+        if not path:
+            return
+        if self.splat_in_edit.text() and Path(path).resolve() == Path(self.splat_in_edit.text()).resolve():
+            QMessageBox.warning(self, "Choose another file",
+                                "The georeferenced splat must be a new file -- the original is never overwritten.")
+            return
+        self.splat_out_edit.setText(path)
+        self._splat_out_pinned = True
+        self._refresh_enabled()
+
+    def _on_splat_clicked(self) -> None:
+        self._on_georef_splat(force=False)
+
+    def _on_georef_splat(self, force: bool = False) -> None:
+        self._splat_running = True
+        self.splat_btn.setEnabled(False)
+        self.splat_result.setText("")
+        self.splat_progress.start("Georeferencing splat…")
+        run_in_background(
+            self, _georef_splat_worker, self.state.project_root, Path(self.splat_in_edit.text()),
+            Path(self.splat_out_edit.text()), self.splat_solution_combo.currentData(), bool(force),
+            # Bound methods, not a lambda: a lambda has no QObject thread
+            # affinity, so Qt would run it on the worker thread.
+            on_success=self._on_splat_done, on_error=self._on_splat_error,
+            on_progress=self.splat_progress.update_progress,
+        )
+
+    def _on_splat_done(self, result) -> None:
+        self._splat_running = False
+        self.splat_progress.finish("Splat georeferenced.")
+        sidecars = ", ".join(p.name for p in result.sidecars)
+        lines = [
+            f"Wrote {result.count} Gaussians to {result.out_path}",
+            f"in local metres; CRS and origin in {sidecars}.",
+            result.check.message,
+            "Higher-order SH colour isn't rotated (docs/adr/0047).",
+        ] + ["⚠ " + w for w in result.warnings]
+        self.splat_result.setText("\n".join(lines))
+        self._splat_out_pinned = False
+        self._on_splat_inputs_changed()  # the next default output won't replace this one
+
+    def _on_splat_error(self, exc: Exception) -> None:
+        from vine360.georef.splat import SplatFrameMismatch
+
+        self._splat_running = False
+        self.splat_progress.finish("")
+        self._refresh_enabled()
+        if isinstance(exc, SplatFrameMismatch):
+            answer = QMessageBox.question(
+                self, "Splat doesn't match this solution",
+                f"{exc.check.message}\n\nGeoreference it anyway? (The original is never changed either way.)",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer == QMessageBox.Yes:
+                self._on_georef_splat(force=True)
+            else:
+                self.splat_result.setText("Not written: " + exc.check.message)
+            return
+        QMessageBox.warning(self, "Could not georeference the splat", f"{type(exc).__name__}: {exc}")
+
     def _on_run_changed(self, select: str | None = None) -> None:
         from vine360.georef.solve import list_solutions, solution_label
 
@@ -4195,6 +4352,7 @@ class GeorefPanel(QWidget):
             _restore_combo_selection(self.solution_combo, select)
         self.solution_combo.blockSignals(False)
         self._show_solution()
+        self._refresh_splat_solutions()
         self._refresh_enabled()
 
     def _show_solution(self) -> None:
@@ -4203,6 +4361,8 @@ class GeorefPanel(QWidget):
         solution_id = self.solution_combo.currentData()
         self.report_table.setRowCount(0)
         self._refresh_map_residuals()
+        if solution_id and self.splat_solution_combo.findData(solution_id) >= 0:
+            self.splat_solution_combo.setCurrentIndex(self.splat_solution_combo.findData(solution_id))
         if not solution_id:
             self.report_label.setText("No solution for this run yet.")
             return
@@ -4304,6 +4464,10 @@ class GeorefPanel(QWidget):
         self.solve_queue_btn.setEnabled(have_set and have_run)
         self.solve_btn.setToolTip("" if have_set else "Import a control-point CSV first (section 1).")
         self.report_csv_btn.setEnabled(self.solution_combo.currentData() is not None)
+        self.splat_btn.setEnabled(
+            self.splat_solution_combo.currentData() is not None and bool(self.splat_in_edit.text())
+            and bool(self.splat_out_edit.text()) and not self._splat_running
+        )
         detected = self.state.conn.execute("SELECT COUNT(*) FROM tag_detection_runs").fetchone()[0] > 0
         solved = self.solution_combo.count() > 0
         self.stage_indicator.set_stages([
@@ -4599,17 +4763,11 @@ class ExportPanel(QWidget):
         self.georef_combo = QComboBox()
         self.georef_combo.setToolTip(
             "A georeferenced export is in local metres (survey CRS minus the control-point set's origin), "
-            "with georef.json / georef.prj describing it. None exports the SfM run's own frame unchanged."
+            "with georef.json / georef.prj describing it. None exports the SfM run's own frame unchanged. "
+            "To georeference a splat you've already trained, use the Georeference stage's step 4."
         )
         self.georef_combo.currentIndexChanged.connect(self._on_georef_changed)
         georef_row.addWidget(self.georef_combo, stretch=1)
-        self.splat_btn = QPushButton("Georeference a trained splat…")
-        self.splat_btn.setToolTip(
-            "Moves a .ply trained on a non-georeferenced export of this run into the chosen solution's local "
-            "metres -- written as a new file; the original is never changed."
-        )
-        self.splat_btn.clicked.connect(self._on_georef_splat)
-        georef_row.addWidget(self.splat_btn)
         form.addRow("Georeference:", georef_row)
         controls_layout.addLayout(form)
 
@@ -4744,51 +4902,6 @@ class ExportPanel(QWidget):
 
             set_active_solution(self.state.project_root, self.run_combo.currentData(), self.georef_combo.currentData())
         self._refresh_enabled()
-
-    def _on_georef_splat(self) -> None:
-        from vine360.georef.apply import default_splat_output
-
-        solution_id = self.georef_combo.currentData()
-        if not solution_id:
-            QMessageBox.information(self, "Choose a georeference", "Pick a georeference solution above first.")
-            return
-        start = self.state.project_root / "models"
-        in_path, _ = QFileDialog.getOpenFileName(self, "Trained splat to georeference", str(start), "Gaussian splat (*.ply)")
-        if not in_path:
-            return
-        out_path, _ = QFileDialog.getSaveFileName(
-            self, "Save georeferenced splat as", str(default_splat_output(Path(in_path), solution_id)), "Gaussian splat (*.ply)"
-        )
-        if not out_path:
-            return
-        if Path(out_path).resolve() == Path(in_path).resolve():
-            QMessageBox.warning(self, "Choose another file", "The georeferenced splat must be a new file -- the original is never overwritten.")
-            return
-        self._splat_out = out_path
-        self.splat_btn.setEnabled(False)
-        self.progress_area.start("Georeferencing splat…")
-        run_in_background(
-            self, _georef_splat_worker, self.state.project_root, Path(in_path), Path(out_path), solution_id,
-            # Bound methods, not a lambda: a lambda has no QObject thread
-            # affinity, so Qt would run it on the worker thread (see
-            # QueueManager._start_job).
-            on_success=self._on_splat_done, on_error=self._on_splat_error,
-            on_progress=self.progress_area.update_progress,
-        )
-
-    def _on_splat_done(self, count: int) -> None:
-        out_path = self._splat_out
-        self.splat_btn.setEnabled(True)
-        self.progress_area.finish("Splat georeferenced.")
-        self.result_label.setText(
-            f"Wrote {count} Gaussians to {out_path} in local metres (see the solution's georef.json for the origin "
-            "and CRS). Higher-order SH colour isn't rotated (docs/adr/0047)."
-        )
-
-    def _on_splat_error(self, exc: Exception) -> None:
-        self.splat_btn.setEnabled(True)
-        self.progress_area.finish("")
-        QMessageBox.warning(self, "Could not georeference the splat", f"{type(exc).__name__}: {exc}")
 
     def _run_frame_set_view_count(self, run_id: str | None) -> int | None:
         """For a raw-360-frame run: how many projected views its frame
@@ -4946,7 +5059,6 @@ class ExportPanel(QWidget):
             "projection automatically ahead of this export job."
         )
         self.queue_btn.setEnabled(self.output_dir is not None)
-        self.splat_btn.setEnabled(self.georef_combo.currentData() is not None and not busy)
 
         if mode == "realityscan":
             priors_available = self.state.conn is not None and realityscan_priors_available(

@@ -249,14 +249,14 @@ def georef_metadata(solution: dict, cp_set) -> dict:
     }
 
 
-def write_georef_sidecars(directory: Path, metadata: dict) -> list[str]:
-    """Writes georef.json, and georef.prj when the EPSG is one CRS_WKT
+def write_georef_sidecars(directory: Path, metadata: dict, name: str = "georef") -> list[str]:
+    """Writes <name>.json, and <name>.prj when the EPSG is one CRS_WKT
     knows; returns warnings."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "georef.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    (directory / f"{name}.json").write_text(json.dumps(metadata, indent=2) + "\n")
     wkt = CRS_WKT.get(int(metadata["epsg"]))
     if wkt is None:
-        return [f"no WKT known for EPSG:{metadata['epsg']} -- georef.prj not written"]
-    (directory / "georef.prj").write_text(wkt)
+        return [f"no WKT known for EPSG:{metadata['epsg']} -- {name}.prj not written"]
+    (directory / f"{name}.prj").write_text(wkt)
     return []

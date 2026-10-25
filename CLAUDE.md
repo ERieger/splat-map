@@ -176,6 +176,9 @@ trainer). **Non-destructive**: every solve is a new `georef_solutions` row plus 
 model under `sfm/georef/<run_id>/<solution_id>/`; an SfM run's own model is only ever read, and
 Export *copies* either it or a solution's folder (never re-transforms), recording which in
 `export_info.json`. The active solution per run lives in `project.yaml` (`georef.active_solution`).
+An already-trained splat is georeferenced in the Georeference stage's step 4 (`splat.py`), not
+in Export. It writes a new .ply plus `.georef.json`, after a frame check that refuses
+(unless overridden) a splat that is already local or in an unrelated frame.
 pupil-apriltags' own `Detector.__del__` is a use-after-free -- always tear down through
 `TagDetector.close()` / its context manager.
 
