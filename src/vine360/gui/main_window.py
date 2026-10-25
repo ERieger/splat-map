@@ -3505,13 +3505,17 @@ def _import_control_points_worker(
     height_datum: str,
     tag_family: str,
     tag_size_m: float | None,
+    tag_size_table: str | None = None,
 ):
     from vine360.georef.control_points import import_control_points
+    from vine360.georef.tag_sizes import read_tag_size_table
 
+    tag_sizes = read_tag_size_table(Path(tag_size_table), tag_family) if tag_size_table else None
     conn = open_index_db(project_root)
     try:
         return import_control_points(
-            conn, Path(path), epsg=epsg, height_datum=height_datum, tag_family=tag_family, tag_size_m=tag_size_m
+            conn, Path(path), epsg=epsg, height_datum=height_datum, tag_family=tag_family, tag_size_m=tag_size_m,
+            tag_sizes=tag_sizes,
         )
     finally:
         conn.close()
@@ -3654,10 +3658,24 @@ class GeorefPanel(QWidget):
         self.tag_size_spin.setValue(0.4)
         self.tag_size_spin.setSuffix(" m")
         self.tag_size_spin.setToolTip(
-            "Printed black-square edge, applied to every tagged point on import. Sizes can differ per point "
-            "(250 / 400 mm) -- edit them in the table. Used only for the tag-size scale cross-check."
+            "Printed black-square edge for tags the tag-size table doesn't list. Sizes can also be edited per "
+            "point in the table. Used only for the tag-size scale cross-check."
         )
-        import_form.addRow("Default tag size:", self.tag_size_spin)
+        table_row = QHBoxLayout()
+        self.tag_table_label = QLabel("")
+        table_row.addWidget(self.tag_table_label, stretch=1)
+        self.tag_table_btn = QPushButton("Choose table…")
+        self.tag_table_btn.setToolTip(
+            "A CSV with tag_id and active_size_mm (or size_mm / size_m) columns. Remembered on this computer."
+        )
+        self.tag_table_btn.clicked.connect(self._on_choose_tag_table)
+        table_row.addWidget(self.tag_table_btn)
+        self.tag_table_reset_btn = QPushButton("Use built-in")
+        self.tag_table_reset_btn.clicked.connect(self._on_reset_tag_table)
+        table_row.addWidget(self.tag_table_reset_btn)
+        import_form.addRow("Tag sizes:", table_row)
+        import_form.addRow("Size for unlisted tags:", self.tag_size_spin)
+        self._show_tag_table()
         cp_layout.addLayout(import_form)
         import_row = QHBoxLayout()
         self.import_btn = QPushButton("Import control-point CSV…")
@@ -3684,6 +3702,13 @@ class GeorefPanel(QWidget):
         self.origin_apply_btn.clicked.connect(self._on_apply_origin)
         origin_row.addWidget(self.origin_apply_btn)
         set_form.addRow("Origin:", origin_row)
+        sizes_row = QHBoxLayout()
+        self.apply_sizes_btn = QPushButton("Apply tag-size table to this set")
+        self.apply_sizes_btn.setToolTip("Replaces each tagged point's size with the table's, including hand edits.")
+        self.apply_sizes_btn.clicked.connect(self._on_apply_tag_sizes)
+        sizes_row.addWidget(self.apply_sizes_btn)
+        sizes_row.addStretch()
+        set_form.addRow("", sizes_row)
         self.set_info = QLabel("")
         self.set_info.setWordWrap(True)
         self.set_info.setStyleSheet("color: palette(mid);")
@@ -3966,7 +3991,69 @@ class GeorefPanel(QWidget):
         log_action(self.state.conn, "georef.origin", "Georeference: set origin", target=set_id, params={"origin": origin})
         self._on_set_changed()
 
+    def _show_tag_table(self) -> None:
+        from vine360.georef.tag_sizes import BUILTIN_TABLE, TagSizeTableError, default_table_path, read_tag_size_table
+
+        path = default_table_path()
+        try:
+            sizes = read_tag_size_table(path)
+            by_size: dict[float, int] = {}
+            for size in sizes.values():
+                by_size[size] = by_size.get(size, 0) + 1
+            summary = ", ".join(f"{n} × {size * 1000:g} mm" for size, n in sorted(by_size.items()))
+            text = f"{'Built-in: ' if path == BUILTIN_TABLE else ''}{path.name} — {len(sizes)} tags ({summary})"
+        except TagSizeTableError as exc:
+            text = f"⚠ {exc}"
+        self.tag_table_label.setText(text)
+        self.tag_table_label.setToolTip(str(path))
+        self.tag_table_reset_btn.setEnabled(path != BUILTIN_TABLE)
+
+    def _on_choose_tag_table(self) -> None:
+        from vine360.georef.tag_sizes import TagSizeTableError, default_table_path, read_tag_size_table, set_default_table_path
+
+        path, _ = QFileDialog.getOpenFileName(self, "Choose tag-size table", str(default_table_path().parent),
+                                              "CSV (*.csv);;All files (*)")
+        if not path:
+            return
+        try:
+            read_tag_size_table(Path(path))
+        except TagSizeTableError as exc:
+            QMessageBox.warning(self, "Not a tag-size table", str(exc))
+            return
+        set_default_table_path(Path(path))
+        self._show_tag_table()
+
+    def _on_reset_tag_table(self) -> None:
+        from vine360.georef.tag_sizes import set_default_table_path
+
+        set_default_table_path(None)
+        self._show_tag_table()
+
+    def _on_apply_tag_sizes(self) -> None:
+        from vine360.georef.control_points import apply_tag_sizes
+        from vine360.georef.tag_sizes import TagSizeTableError, default_table_path, read_tag_size_table
+
+        set_id = self.set_combo.currentData()
+        if set_id is None:
+            return
+        path = default_table_path()
+        try:
+            sizes = read_tag_size_table(path)
+        except TagSizeTableError as exc:
+            QMessageBox.warning(self, "Could not read the tag-size table", str(exc))
+            return
+        changed, unlisted = apply_tag_sizes(self.state.conn, set_id, sizes)
+        log_action(self.state.conn, "georef.tag_sizes", "Georeference: apply tag-size table", target=set_id,
+                   params={"table": str(path), "changed": changed, "unlisted": unlisted})
+        self._on_set_changed()
+        message = f"{len(changed)} point size(s) changed" + (f": {', '.join(changed)}" if changed else "") + "."
+        if unlisted:
+            message += f"\n\nNot in {path.name}, left as they were: {', '.join(unlisted)}"
+        QMessageBox.information(self, "Tag sizes applied", message)
+
     def _on_import(self) -> None:
+        from vine360.georef.tag_sizes import default_table_path
+
         start = self.state.project_root.parent if self.state.project_root else Path.home()
         path, _ = QFileDialog.getOpenFileName(self, "Import control points", str(start), "CSV (*.csv *.txt);;All files (*)")
         if not path:
@@ -3975,7 +4062,7 @@ class GeorefPanel(QWidget):
         self.import_btn.setEnabled(False)
         run_in_background(
             self, _import_control_points_worker, self.state.project_root, Path(path), self.epsg_spin.value(),
-            self.datum_combo.currentData(), "tag36h11", size,
+            self.datum_combo.currentData(), "tag36h11", size, str(default_table_path()),
             on_success=self._on_import_success, on_error=self._on_import_error,
         )
 

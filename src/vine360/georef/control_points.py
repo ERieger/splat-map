@@ -161,12 +161,14 @@ def read_control_csv(
     tag_family: str = DEFAULT_TAG_FAMILY,
     tag_size_m: float | None = None,
     far_point_m: float = DEFAULT_FAR_POINT_M,
+    tag_sizes: dict[int, float] | None = None,
 ) -> ControlPointFile:
     """Parses a GCP file (see the module docstring for the shapes handled).
 
     A header is recognized only when the first row's first field and second
     field are both non-numeric -- never assumed. Every tagged point defaults
-    to use="control" (tag_size_m applied as its default size); a point more
+    to use="control", sized from tag_sizes (a tag-size table, by tag id)
+    or else tag_size_m; a point more
     than far_point_m horizontally from the median of the *other* points
     (e.g. the GNSS base station) defaults to "ignore", with a note and a
     warning naming it."""
@@ -211,10 +213,8 @@ def read_control_csv(
             raw = cell(key)
             sigmas.append(float(raw) if raw and _is_number(raw) else None)
         tag_id = derive_tag_id(name, tag_family)
-        points.append(
-            ControlPoint(name, east, north, height, tag_id, USE_CONTROL, sigmas[0], sigmas[1],
-                         tag_size_m if tag_id is not None else None)
-        )
+        size = None if tag_id is None else (tag_sizes or {}).get(tag_id, tag_size_m)
+        points.append(ControlPoint(name, east, north, height, tag_id, USE_CONTROL, sigmas[0], sigmas[1], size))
 
     warnings = _flag_far_points(points, far_point_m)
     untagged = [p.name for p in points if p.tag_id is None and p.use != USE_IGNORE]
@@ -272,17 +272,25 @@ def import_control_points(
     label: str | None = None,
     origin: tuple[float, float, float] | None = None,
     far_point_m: float = DEFAULT_FAR_POINT_M,
+    tag_sizes: dict[int, float] | None = None,
 ) -> tuple[str, list[str]]:
     """Reads path and stores it as a new control-point set (the source is
     recorded by path + checksum, never copied -- as for media, ADR 0003).
     Returns (set_id, warnings). Every import is a new set: a resurvey or a
     second capture with the same point names (EstoWines Capture 1 vs 2) never
-    merges into an earlier one."""
+    merges into an earlier one. tag_sizes (georef.tag_sizes) sizes each
+    tagged point by its id; tag_size_m covers ids the table doesn't list."""
     if not isinstance(epsg, int) or epsg <= 0:
         raise ControlPointError(f"EPSG code is required (got {epsg!r})")
     if tag_size_m is not None and not tag_size_m > 0:
         raise ControlPointError(f"tag size must be positive metres, got {tag_size_m!r}")
-    parsed = read_control_csv(path, tag_family=tag_family, tag_size_m=tag_size_m, far_point_m=far_point_m)
+    parsed = read_control_csv(path, tag_family=tag_family, tag_size_m=tag_size_m, far_point_m=far_point_m,
+                              tag_sizes=tag_sizes)
+    if tag_sizes is not None:
+        unlisted = [p.name for p in parsed.points if p.tag_id is not None and p.tag_id not in tag_sizes]
+        if unlisted:
+            fallback = "left unset" if tag_size_m is None else f"given the default {tag_size_m:g} m"
+            parsed.warnings.append(f"not in the tag-size table, {fallback}: {', '.join(unlisted)}")
     origin = origin or default_origin(parsed.points)
     set_id = f"gcp-{uuid.uuid4().hex[:8]}"
     conn.execute(
@@ -328,6 +336,25 @@ def load_control_points(conn: sqlite3.Connection, set_id: str) -> list[ControlPo
 
 
 _UNSET = object()
+
+
+def apply_tag_sizes(conn: sqlite3.Connection, set_id: str, tag_sizes: dict[int, float]) -> tuple[list[str], list[str]]:
+    """Sets each tagged point's tag_size_m from a tag-size table, replacing
+    any size already there (including hand edits). Points whose tag id the
+    table doesn't list are left as they are. Returns (changed point names,
+    unlisted point names)."""
+    changed, unlisted = [], []
+    for p in load_control_points(conn, set_id):
+        if p.tag_id is None:
+            continue
+        size = tag_sizes.get(p.tag_id)
+        if size is None:
+            unlisted.append(p.name)
+        elif p.tag_size_m != size:
+            conn.execute("UPDATE control_points SET tag_size_m = ? WHERE set_id = ? AND name = ?", (size, set_id, p.name))
+            changed.append(p.name)
+    conn.commit()
+    return changed, unlisted
 
 
 def update_control_point(

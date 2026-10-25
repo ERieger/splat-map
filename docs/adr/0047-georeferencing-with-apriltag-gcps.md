@@ -188,6 +188,16 @@ After the fix, 4 of 4 full-suite runs completed without a crash.
   pairs when there are more.
 - **The keep-mask filter isn't implemented.** The handover listed "skip detections inside masked
   pixels" as optional and low priority.
+- **Tag-size table** (`georef/tag_sizes.py`, added later on request). The Vine360 kit's own
+  sheet ships as the built-in table, kept byte-for-byte with its PDF in `georef/data/`. On import,
+  each tagged point gets its size from the table by tag id, and the panel's single size is used only
+  for ids the table doesn't list (the import warns about those).
+  - The kit's sizes are the *active* size (the black square's outer edge), which is what
+    `tag_size_m` means; the board or sheet size is not used.
+  - Another table can be chosen per computer, stored beside the recent-projects list and never in a
+    project. If the chosen file is missing, the built-in table is used.
+  - "Apply tag-size table to this set" re-sizes a set that is already imported. It replaces hand
+    edits too, and it is logged.
 - **Control-point map** (`gui/control_point_map.py`, added after the first release on request).
   It sits beside the points table, so check points can be chosen by location. It is a plain Qt
   plan view in the local frame, north up and at equal scale. It has no basemap, so it needs no

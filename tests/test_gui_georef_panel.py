@@ -97,3 +97,22 @@ def _wait_for_background(widget, timeout_s: float = 10.0) -> None:
     while getattr(widget, "_bg_pairs", None) and time.monotonic() < deadline:
         QApplication.processEvents()
         time.sleep(0.01)
+
+
+def test_tag_size_table_controls(state, tmp_path, monkeypatch):
+    from vine360.georef.tag_sizes import BUILTIN_TABLE
+
+    monkeypatch.setenv("VINE360_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setattr("vine360.gui.main_window.QMessageBox.information", lambda *a, **k: None)
+    st, scene = state
+    panel = GeorefPanel(st)
+    panel.on_shown()
+    assert panel.tag_table_label.text().startswith("Built-in: vine360_apriltag_id_sizes.csv — 48 tags")
+    assert "20 × 250 mm" not in panel.tag_table_label.text() and "40 × 250 mm" in panel.tag_table_label.text()
+    assert not panel.tag_table_reset_btn.isEnabled()
+    panel._on_apply_tag_sizes()  # the scene's 020/021 were 0.25, the kit sheet says 400 mm
+    sizes = {p.name: p.tag_size_m for p in load_control_points(scene.conn, scene.set_id)}
+    assert sizes["020"] == 0.4 and sizes["021"] == 0.4 and sizes["005"] == 0.25
+    row = next(r for r in range(15) if panel.points_table.item(r, 0).text() == "020")
+    assert panel.points_table.item(row, 6).text() == "0.4"
+    assert BUILTIN_TABLE.is_file()

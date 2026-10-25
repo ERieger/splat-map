@@ -57,6 +57,9 @@ vine360 = "vine360.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"vine360.georef" = ["data/*.csv", "data/*.pdf"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
