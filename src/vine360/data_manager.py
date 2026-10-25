@@ -258,6 +258,22 @@ def delete_sfm_run(conn: sqlite3.Connection, project_root: Path, run_id: str) ->
         shutil.rmtree(georef_dir)
 
 
+def frame_set_folder_name(conn: sqlite3.Connection, frame_set_id: str) -> str:
+    """The <capture> folder of a per-frame-set export, exports/<capture>/
+    <format>/ (docs/adr/0028) -- a filesystem-safe folder name: the
+    source's own file stem where available (more useful than a bare id at a
+    glance) plus the frame set's config tag (e.g. "clip_i0.5"), falling
+    back to the id if sanitizing leaves nothing usable. A legacy frame set
+    (id == source_id, docs/adr/0034) keeps the bare stem, so its exports
+    land where they always did."""
+    source_id, _, tag = frame_set_id.partition("~")
+    row = conn.execute("SELECT path FROM sources WHERE source_id = ?", (source_id,)).fetchone()
+    stem = Path(row[0]).stem if row else ""
+    name = f"{stem}_{tag}" if (stem and tag) else stem
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in name)
+    return safe or frame_set_id[:8]
+
+
 def list_export_dirs(project_root: Path) -> list[ExportDirInfo]:
     """Every exports/<capture>/<format>/ folder (docs/adr/0028), any
     pre-0028 flat exports/<capture>/ folder still holding images/masks/

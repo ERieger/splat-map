@@ -92,6 +92,7 @@ from vine360.data_manager import (
     directory_size,
     export_dir_size,
     frame_set_disk_usage,
+    frame_set_folder_name,
     list_export_dirs,
     list_frame_sets,
     list_sfm_runs,
@@ -156,6 +157,44 @@ from vine360.export.postshot import (
 from vine360.sfm.options import VARIANT_EQUIRECT, VARIANT_PROJECTIONS, VARIANT_SPHERESFM, SfmConfig
 from vine360.sfm.options import describe as describe_sfm_options
 from vine360.sfm.project_run import SfmRegistrationError, run_sfm_for_project
+from vine360.stage_status import (
+    ACTIVE,
+    DONE,
+    PENDING,
+    STAGE_EXPORT,
+    STAGE_FRAMES,
+    STAGE_GEOREF,
+    STAGE_IMPORT,
+    STAGE_MASKS,
+    STAGE_POSE,
+    STAGE_PROJECT,
+    STAGE_PROJECTION,
+    compute_stage_statuses,
+)
+# The workers moved to vine360.operations (docs/adr/0048); the panels and the
+# queue (vine360.gui.queue_manager) still call them by these names.
+from vine360.operations import (
+    _summarize_mask_build,
+    add_source_worker as _add_source_worker,
+    build_mask_layer_worker as _build_mask_layer_worker,
+    build_masks_worker as _build_masks_worker,
+    data_manager_delete_worker as _data_manager_delete_worker,
+    default_parallel_worker_count as _default_parallel_worker_count,
+    detect_tags_worker as _detect_tags_worker,
+    export_frames_and_masks_worker as _export_frames_and_masks_worker,
+    export_postshot_worker as _export_postshot_worker,
+    export_realityscan_worker as _export_realityscan_worker,
+    extract_frames_worker as _extract_frames_worker,
+    generate_views_worker as _generate_views_worker,
+    georef_splat_worker as _georef_splat_worker,
+    import_control_points_worker as _import_control_points_worker,
+    merge_summary as _merge_summary,
+    remove_source_worker as _remove_source_worker,
+    run_sfm_worker as _run_sfm_worker,
+    set_layer_merged_worker as _set_layer_merged_worker,
+    solve_georef_worker as _solve_georef_worker,
+    unused_path as _unused_path,
+)
 from vine360.gui.control_point_map import ControlPointMap
 from vine360.gui.direction_picker import DirectionPicker
 from vine360.gui.sfm_options import SfmOptionsEditor
@@ -181,7 +220,6 @@ _SAMPLE_DATA_HINT_DIR = Path("/mnt/e/11-9-26_EstoWines_Capture1/Equi")
 
 CAPTURE_GROUP_PRESETS = ["Insta360 (ground)", "Antigravity A1 (aerial)", "Other / custom…"]
 
-DONE, ACTIVE, PENDING = "done", "active", "pending"
 STATUS_COLOR = {DONE: QColor(70, 150, 90), ACTIVE: QColor(200, 160, 50), PENDING: QColor(120, 120, 120)}
 # The Data manager tab isn't a pipeline stage, so it never takes a status
 # color -- a fixed blue, distinct from every stage and job-status color,
@@ -202,19 +240,13 @@ JOB_STATUS_COLOR = {
     SKIPPED: QColor(150, 150, 150),
 }
 
-# Sidebar row indices -- used both to build the QStackedWidget and to
-# address which dot compute_stage_statuses' result applies to. Training
+# Sidebar row indices -- the pipeline stages' (STAGE_PROJECT..STAGE_EXPORT)
+# are in vine360.stage_status, these two follow them. Used both to build the
+# QStackedWidget and to address which dot compute_stage_statuses' result
+# applies to. Training
 # was removed from the GUI (docs/adr/0025) -- the adapter-only library
 # code (vine360/training/) still exists, per ADR 0009, just isn't
 # surfaced as a sidebar stage.
-STAGE_PROJECT = 0
-STAGE_IMPORT = 1
-STAGE_FRAMES = 2
-STAGE_PROJECTION = 3
-STAGE_MASKS = 4
-STAGE_POSE = 5
-STAGE_GEOREF = 6  # docs/adr/0047
-STAGE_EXPORT = 7
 STAGE_DATA_MANAGER = 8  # not a pipeline stage: fixed-color dot, not in compute_stage_statuses
 STAGE_ACTIVITY_LOG = 9  # likewise
 
@@ -236,66 +268,6 @@ class AppState:
     queue_manager: "QueueManager | None" = None
 
 
-def compute_stage_statuses(conn: sqlite3.Connection | None) -> dict[int, str]:
-    """Derives every stage's status directly from the database -- the
-    single source of truth, rather than tracking status ad hoc as panels
-    act. A stage is DONE once it has produced at least one real artifact,
-    ACTIVE once its prerequisite exists but it hasn't yet (or its output
-    is stale relative to upstream changes -- see below), else PENDING.
-
-    Frames/Projection/Masks fully invalidate (hard-delete) their old
-    output when an earlier stage re-runs (clear_frames_for_source and
-    clear_views_for_frame cascade all the way down), so their status
-    already falls back to ACTIVE/PENDING correctly from the counts alone.
-    Pose estimation (SfM) is different on purpose: its runs are kept as
-    provenance history (docs/status.md's data contract), not overwritten,
-    so an old sfm_runs row can still exist after its inputs changed. That
-    case is detected here by comparing timestamps, and reported as ACTIVE
-    ("stale, should re-run") rather than DONE."""
-    if conn is None:
-        return {
-            STAGE_IMPORT: PENDING,
-            STAGE_FRAMES: PENDING,
-            STAGE_PROJECTION: PENDING,
-            STAGE_MASKS: PENDING,
-            STAGE_POSE: PENDING,
-            STAGE_GEOREF: PENDING,
-        }
-    n_sources = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
-    n_video_sources = conn.execute("SELECT COUNT(*) FROM sources WHERE media_type = 'video'").fetchone()[0]
-    n_frames = conn.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
-    n_views = conn.execute("SELECT COUNT(*) FROM views").fetchone()[0]
-    n_masks = conn.execute("SELECT COUNT(*) FROM masks").fetchone()[0]
-    n_sfm_runs = conn.execute("SELECT COUNT(*) FROM sfm_runs").fetchone()[0]
-
-    if n_sfm_runs > 0:
-        latest_run_at = conn.execute("SELECT MAX(created_at) FROM sfm_runs").fetchone()[0]
-        latest_input_at = conn.execute(
-            "SELECT MAX(t) FROM (SELECT MAX(updated_at) AS t FROM views UNION ALL SELECT MAX(updated_at) FROM masks)"
-        ).fetchone()[0]
-        pose_status = ACTIVE if (latest_input_at and latest_input_at > latest_run_at) else DONE
-    else:
-        pose_status = ACTIVE if n_masks > 0 else PENDING
-
-    # Georeference (docs/adr/0047): done once the newest run has a solution;
-    # active once there's something to work with (a control-point set or
-    # tag detections); otherwise pending.
-    n_sets = conn.execute("SELECT COUNT(*) FROM control_point_sets").fetchone()[0]
-    n_detected = conn.execute("SELECT COUNT(*) FROM tag_detection_runs").fetchone()[0]
-    newest_run_solved = conn.execute(
-        "SELECT COUNT(*) FROM georef_solutions WHERE run_id = "
-        "(SELECT run_id FROM sfm_runs ORDER BY created_at DESC, rowid DESC LIMIT 1)"
-    ).fetchone()[0]
-    georef_status = DONE if newest_run_solved else (ACTIVE if (n_sets or n_detected) else PENDING)
-
-    return {
-        STAGE_IMPORT: DONE if n_sources > 0 else ACTIVE,
-        STAGE_FRAMES: DONE if n_frames > 0 else (ACTIVE if n_video_sources > 0 else PENDING),
-        STAGE_PROJECTION: DONE if n_views > 0 else (ACTIVE if n_frames > 0 else PENDING),
-        STAGE_MASKS: DONE if n_masks > 0 else (ACTIVE if n_views > 0 else PENDING),
-        STAGE_POSE: pose_status,
-        STAGE_GEOREF: georef_status,
-    }
 
 
 @dataclass
@@ -1085,40 +1057,6 @@ class TemporalFrameSelector(QWidget):
         return False
 
 
-# -- activity log (docs/adr/0037) -------------------------------------------
-# Every worker below is wrapped in logged_operation, so a run is recorded
-# (order, time, parameters, outcome) whether a panel or the queue started it.
-
-
-def _summarize_source(source, _conn) -> str:
-    return f"{Path(source.path).name}: {source.media_type.value}, {source.projection.value} ({source.source_id[:8]})"
-
-
-def _summarize_frames(frames, _conn) -> str:
-    frame_set_id = frames[0].frame_set_id if frames else None
-    return f"{len(frames)} frames into frame set {frame_set_id}"
-
-
-def _summarize_count(noun: str):
-    return lambda items, _conn: f"{len(items)} {noun}"
-
-
-def _summarize_sfm(result, conn) -> str:
-    diagnostics, warnings = result
-    run_id = conn.execute("SELECT run_id FROM sfm_runs ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
-    text = (
-        f"run {run_id[0] if run_id else '?'}: {diagnostics.registered_images}/{diagnostics.total_images} registered, "
-        f"{diagnostics.num_points3d} points, mean reprojection error {diagnostics.mean_reprojection_error:.2f}px"
-    )
-    return text + (f"; warnings: {'; '.join(warnings)}" if warnings else "")
-
-
-def _summarize_export(result, _conn) -> str:
-    text = f"{result.num_images} images, {result.num_masks} masks -> {result.output_dir}"
-    return text + (f"; warnings: {'; '.join(result.warnings)}" if result.warnings else "")
-
-
-
 def _panel_header(title: str, subtitle: str, layout: QVBoxLayout) -> None:
     heading = QLabel(title)
     heading.setStyleSheet("font-size: 16px; font-weight: 600;")
@@ -1321,43 +1259,6 @@ class ProjectPanel(QWidget):
         self.state.notify_change()
 
 
-@logged_operation("source.add", "Add source", target=lambda p: str(p.get("file_path") or p.get("path") or ""), summarize=_summarize_source)
-def _add_source_worker(
-    project_root: Path,
-    file_path: Path,
-    capture_group: str | None,
-    confirm_equirectangular: bool,
-    added_at: str,
-    progress_callback=None,
-):
-    """Runs on a background thread -- opens its own sqlite connection
-    rather than reusing one created on the GUI thread (sqlite3 connections
-    aren't valid across threads)."""
-    conn = open_index_db(project_root)
-    try:
-        return add_source(
-            conn,
-            file_path,
-            LocalRunner(),
-            capture_group=capture_group,
-            confirm_equirectangular=confirm_equirectangular,
-            added_at=added_at,
-            progress_callback=progress_callback,
-        )
-    finally:
-        conn.close()
-
-
-@logged_operation("source.remove", "Remove source", target=lambda p: p.get("source_id"))
-def _remove_source_worker(project_root: Path, source_id: str) -> str:
-    conn = open_index_db(project_root)
-    try:
-        remove_source(conn, project_root, source_id)
-        return source_id
-    finally:
-        conn.close()
-
-
 class ImportPanel(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
@@ -1552,35 +1453,6 @@ class ImportPanel(QWidget):
             QMessageBox.warning(self, "Could not remove source", str(exc))
         else:
             QMessageBox.critical(self, "Unexpected error removing source", f"{type(exc).__name__}: {exc}")
-
-
-@logged_operation("frames.extract", "Frame extraction", target=lambda p: p.get("frame_set_id") or p.get("source_id"), summarize=_summarize_frames)
-def _extract_frames_worker(
-    project_root: Path,
-    source_id: str,
-    interval_seconds: float,
-    start_time: float | None,
-    end_time: float | None,
-    generate_thumbnails: bool,
-    frame_set_id: str | None = None,
-    progress_callback=None,
-):
-    conn = open_index_db(project_root)
-    try:
-        return extract_frames(
-            conn,
-            project_root,
-            source_id,
-            LocalRunner(),
-            interval_seconds=interval_seconds,
-            start_time=start_time,
-            end_time=end_time,
-            generate_thumbnails=generate_thumbnails,
-            frame_set_id=frame_set_id,
-            progress_callback=progress_callback,
-        )
-    finally:
-        conn.close()
 
 
 class FramesPanel(QWidget):
@@ -1847,38 +1719,6 @@ class FramesPanel(QWidget):
             QMessageBox.warning(self, "Frame extraction failed", str(exc))
         else:
             QMessageBox.critical(self, "Unexpected error extracting frames", f"{type(exc).__name__}: {exc}")
-
-
-def _default_parallel_worker_count() -> int:
-    return min(os.cpu_count() or 1, 4)
-
-
-@logged_operation("projection.generate", "Projection", target=lambda p: p.get("frame_set_id"), summarize=_summarize_count("views"))
-def _generate_views_worker(
-    project_root: Path,
-    frame_set_id: str,
-    face_size: int,
-    fov_degrees: float,
-    face_names: list[str],
-    max_workers: int | None,
-    ring_tilt_degrees: float = DEFAULT_RING_TILT_DEGREES,
-    progress_callback=None,
-):
-    conn = open_index_db(project_root)
-    try:
-        return generate_views_for_frame_set(
-            conn,
-            project_root,
-            frame_set_id,
-            face_size=face_size,
-            fov_degrees=fov_degrees,
-            face_names=face_names,
-            ring_tilt_degrees=ring_tilt_degrees,
-            max_workers=max_workers,
-            progress_callback=progress_callback,
-        )
-    finally:
-        conn.close()
 
 
 def _describe_directions(names: list[str]) -> str:
@@ -2173,93 +2013,6 @@ class ProjectionPanel(QWidget):
             QMessageBox.warning(self, "Projection failed", str(exc))
         else:
             QMessageBox.critical(self, "Unexpected error generating projections", f"{type(exc).__name__}: {exc}")
-
-
-def _summarize_mask_build(summary, _conn) -> str:
-    parts = [
-        f"{LAYER_SPECS[layer].label.lower()}: {summary.built[layer]} built, present in {summary.nonempty[layer]}"
-        + (f", {summary.skipped_edited[layer]} hand-edited kept" if summary.skipped_edited.get(layer) else "")
-        for layer in summary.built
-    ]
-    return f"{summary.views} views; " + "; ".join(parts)
-
-
-@logged_operation("masks.build", "Masks", target=lambda p: p.get("frame_set_id"), summarize=_summarize_mask_build)
-def _build_masks_worker(
-    project_root: Path,
-    frame_set_id: str,
-    use_sam3_person: bool,
-    use_sam3_sky: bool,
-    mask_sky: bool = True,
-    mask_overexposure: bool = False,
-    overexposure_clip: int = 250,
-    overexposure_bloom_radius: int = LAYER_SPECS[LAYER_OVEREXPOSED].default_params["bloom_radius_px"],
-    progress_callback=None,
-):
-    conn = open_index_db(project_root)
-    try:
-        return build_masks_for_frame_set(
-            conn,
-            project_root,
-            frame_set_id,
-            use_sam3_person=use_sam3_person,
-            use_sam3_sky=use_sam3_sky,
-            mask_sky=mask_sky,
-            mask_overexposure=mask_overexposure,
-            overexposure_params={"clip_threshold": overexposure_clip, "bloom_radius_px": overexposure_bloom_radius},
-            progress_callback=progress_callback,
-        )
-    finally:
-        conn.close()
-
-
-@logged_operation(
-    "masks.layer",
-    "Mask layer",
-    target=lambda p: f"{p.get('layer')} @ {p.get('frame_set_id')}",
-    summarize=_summarize_mask_build,
-)
-def _build_mask_layer_worker(
-    project_root: Path, frame_set_id: str, layer: str, params: dict, overwrite_edited: bool = False, progress_callback=None
-):
-    """Regenerates one layer for a whole frame set, leaving every other
-    layer's files untouched (docs/adr/0038)."""
-    conn = open_index_db(project_root)
-    try:
-        return build_layers_for_frame_set(
-            conn, project_root, frame_set_id, {layer: params},
-            overwrite_edited=overwrite_edited, progress_callback=progress_callback,
-        )
-    finally:
-        conn.close()
-
-
-def _merge_summary(layer: str, enabled: bool, changed: int) -> str:
-    label = LAYER_SPECS[layer].label.lower() if layer in LAYER_SPECS else layer
-    return f"{label} layer {'merged into' if enabled else 'removed from'} the keep-mask of {changed} view(s)"
-
-
-@logged_operation(
-    "masks.merge",
-    "Mask layer merge (whole frame set)",
-    target=lambda p: f"{p.get('layer')} {'on' if p.get('enabled') else 'off'} @ {p.get('frame_set_id')}",
-    summarize=lambda summary, _conn: summary,
-)
-def _set_layer_merged_worker(
-    project_root: Path, frame_set_id: str, layer: str, enabled: bool, progress_callback=None
-) -> str:
-    """Switches a layer into/out of every keep-mask in a frame set. No layer
-    is rebuilt, but every view is recomposed (PNG reads/writes), which is
-    far too slow for the GUI thread on a full frame set."""
-    conn = open_index_db(project_root)
-    try:
-        changed = set_layer_enabled(
-            conn, project_root, frame_set_view_ids(conn, frame_set_id), layer, enabled,
-            progress_callback=progress_callback,
-        )
-        return _merge_summary(layer, enabled, changed)
-    finally:
-        conn.close()
 
 
 def _numpy_to_pixmap(image: np.ndarray, max_size: int | None = None) -> QPixmap:
@@ -3002,42 +2755,6 @@ ENGINE_SPHERESFM = VARIANT_SPHERESFM
 SEVERAL_FRAME_SETS = "__several_frame_sets__"
 
 
-def _sfm_target(params: dict) -> str:
-    return " + ".join(params.get("frame_set_ids") or []) or params.get("frame_set_id") or "all frame sets"
-
-
-@logged_operation("sfm.run", "Pose estimation", target=_sfm_target, summarize=_summarize_sfm)
-def _run_sfm_worker(
-    project_root: Path,
-    image_source: str,
-    frame_set_id: str | None,
-    camera_model: str,
-    engine: str = "pycolmap",
-    options: dict | None = None,
-    frame_set_ids: list[str] | None = None,
-    progress_callback=None,
-):
-    """options: the non-default SfmConfig fields (docs/adr/0040) -- absent
-    for jobs queued before options existed, which then run as before.
-    frame_set_ids: several frame sets in one run (docs/adr/0046), with
-    frame_set_id None."""
-    config = SfmConfig.from_dict(options).replace(camera_model=camera_model)
-    conn = open_index_db(project_root)
-    try:
-        return run_sfm_for_project(
-            conn,
-            project_root,
-            config=config,
-            image_source=image_source,
-            frame_set_id=frame_set_id,
-            frame_set_ids=frame_set_ids,
-            engine=engine,
-            progress_callback=progress_callback,
-        )
-    finally:
-        conn.close()
-
-
 class PoseEstimationPanel(QWidget):
     """Real SfM: vine360.sfm.project_run.run_sfm_for_project (pycolmap),
     run off the GUI thread. Two real engine choices (six-face projections,
@@ -3478,118 +3195,6 @@ class PoseEstimationPanel(QWidget):
 
 
 # -- Georeference (docs/adr/0047) -------------------------------------------
-
-
-def _summarize_tag_detection(summary, _conn) -> str:
-    return summary.describe()
-
-
-def _summarize_solution(solution_id, conn) -> str:
-    from vine360.georef.solve import load_solution
-
-    report = load_solution(conn, solution_id)["report"]
-    text = (
-        f"{solution_id}: {report['n_control']} control / {report['n_check']} check point(s), "
-        f"RMSE 3D {report['rmse']['d3']:.3f} m"
-    )
-    if report.get("check_rmse"):
-        text += f", check RMSE 3D {report['check_rmse']['d3']:.3f} m"
-    return text
-
-
-@logged_operation("georef.import_gcps", "Georeference: import control points", target=lambda p: str(p.get("path")))
-def _import_control_points_worker(
-    project_root: Path,
-    path: Path,
-    epsg: int,
-    height_datum: str,
-    tag_family: str,
-    tag_size_m: float | None,
-    tag_size_table: str | None = None,
-):
-    from vine360.georef.control_points import import_control_points
-    from vine360.georef.tag_sizes import read_tag_size_table
-
-    tag_sizes = read_tag_size_table(Path(tag_size_table), tag_family) if tag_size_table else None
-    conn = open_index_db(project_root)
-    try:
-        return import_control_points(
-            conn, Path(path), epsg=epsg, height_datum=height_datum, tag_family=tag_family, tag_size_m=tag_size_m,
-            tag_sizes=tag_sizes,
-        )
-    finally:
-        conn.close()
-
-
-@logged_operation(
-    "georef.detect_tags", "Georeference: detect tags", target=lambda p: " + ".join(p.get("frame_set_ids") or []),
-    summarize=_summarize_tag_detection,
-)
-def _detect_tags_worker(
-    project_root: Path,
-    frame_set_ids: list[str],
-    tag_family: str = "tag36h11",
-    detector_params: dict | None = None,
-    progress_callback=None,
-):
-    from vine360.georef.apriltag_adapter import DetectorParams
-    from vine360.georef.observe import detect_tags_for_frame_sets
-
-    conn = open_index_db(project_root)
-    try:
-        return detect_tags_for_frame_sets(
-            conn, project_root, list(frame_set_ids), tag_family=tag_family,
-            params=DetectorParams.from_dict(detector_params), progress_callback=progress_callback,
-        )
-    finally:
-        conn.close()
-
-
-@logged_operation(
-    "georef.solve", "Georeference: solve", target=lambda p: f"{p.get('run_id')} ← {p.get('set_id')}",
-    summarize=_summarize_solution,
-)
-def _solve_georef_worker(
-    project_root: Path, run_id: str, set_id: str, solve_params: dict | None = None, progress_callback=None
-) -> str:
-    from vine360.georef.solve import SolveParams, solve_georef
-
-    conn = open_index_db(project_root)
-    try:
-        return solve_georef(
-            conn, project_root, run_id, set_id, params=SolveParams(**(solve_params or {})),
-            progress_callback=progress_callback,
-        )
-    finally:
-        conn.close()
-
-
-@logged_operation(
-    "georef.splat", "Georeference a trained splat", target=lambda p: str(p.get("out_path")),
-    summarize=lambda r, _conn: f"{r.count} Gaussians -> {r.out_path.name} (frame check: {r.check.status})",
-)
-def _georef_splat_worker(
-    project_root: Path, in_path: Path, out_path: Path, solution_id: str, force: bool = False, progress_callback=None
-):
-    from vine360.georef.splat import georeference_splat
-
-    conn = open_index_db(project_root)
-    try:
-        return georeference_splat(conn, project_root, Path(in_path), Path(out_path), solution_id, force=force,
-                                  progress_callback=progress_callback)
-    finally:
-        conn.close()
-
-
-def _unused_path(path: Path) -> Path:
-    """path, or path with -2, -3, ... before the suffix if it exists -- a
-    default output never replaces an earlier one."""
-    path = Path(path)
-    candidate, n = path, 2
-    while candidate.exists():
-        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
-        n += 1
-    return candidate
 
 
 _USE_LABELS = {"control": "control", "check": "check", "ignore": "ignore"}
@@ -4631,63 +4236,6 @@ class QueuePanel(QWidget):
         self.refresh()
 
 
-@logged_operation("export.postshot_poses", "Export: poses + images + masks", target=lambda p: str(p.get("output_dir")), summarize=_summarize_export)
-def _export_postshot_worker(
-    project_root: Path,
-    output_dir: Path,
-    run_id: str | None,
-    georef_solution_id: str | None = None,
-    progress_callback=None,
-):
-    """georef_solution_id: export that solution's materialised local-metre
-    model instead of the run's own (docs/adr/0047); None = the original."""
-    conn = open_index_db(project_root)
-    try:
-        return export_for_postshot(
-            conn, project_root, output_dir, run_id=run_id, georef_solution_id=georef_solution_id,
-            progress_callback=progress_callback,
-        )
-    finally:
-        conn.close()
-
-
-@logged_operation("export.postshot_images", "Export: images + masks", target=lambda p: str(p.get("output_dir")), summarize=_summarize_export)
-def _export_frames_and_masks_worker(
-    project_root: Path, output_dir: Path, frame_set_id: str | None, progress_callback=None
-):
-    conn = open_index_db(project_root)
-    try:
-        return export_frames_and_masks_for_postshot(
-            conn, project_root, output_dir, frame_set_id=frame_set_id, progress_callback=progress_callback
-        )
-    finally:
-        conn.close()
-
-
-@logged_operation("export.realityscan", "Export: RealityScan", target=lambda p: str(p.get("output_dir")), summarize=_summarize_export)
-def _export_realityscan_worker(
-    project_root: Path,
-    output_dir: Path,
-    frame_set_id: str | None,
-    include_camera_priors: bool = False,
-    georef_solution_id: str | None = None,
-    progress_callback=None,
-):
-    conn = open_index_db(project_root)
-    try:
-        return export_for_realityscan(
-            conn,
-            project_root,
-            output_dir,
-            frame_set_id=frame_set_id,
-            include_camera_priors=include_camera_priors,
-            georef_solution_id=georef_solution_id,
-            progress_callback=progress_callback,
-        )
-    finally:
-        conn.close()
-
-
 # exports/<capture>/<format>/ -- see docs/adr/0028. Keyed by mode_combo's
 # userData; ExportPanel._default_output_dir is the only place this is used.
 _EXPORT_FORMAT_TAGS = {"poses": "colmap", "frames_masks": "postshot", "realityscan": "realityscan"}
@@ -5027,18 +4575,7 @@ class ExportPanel(QWidget):
         return self._frame_set_folder_name(frame_set_id) if frame_set_id else "all"
 
     def _frame_set_folder_name(self, frame_set_id: str) -> str:
-        """A filesystem-safe folder name for a per-frame-set export default
-        -- the source's own file stem where available (more useful than a
-        bare id at a glance) plus the frame set's config tag (e.g.
-        "clip_i0.5"), falling back to the id if sanitizing leaves nothing
-        usable. A legacy frame set (id == source_id, docs/adr/0034) keeps
-        the bare stem, so its exports land where they always did."""
-        source_id, _, tag = frame_set_id.partition("~")
-        row = self.state.conn.execute("SELECT path FROM sources WHERE source_id = ?", (source_id,)).fetchone()
-        stem = Path(row[0]).stem if row else ""
-        name = f"{stem}_{tag}" if (stem and tag) else stem
-        safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in name)
-        return safe or frame_set_id[:8]
+        return frame_set_folder_name(self.state.conn, frame_set_id)
 
     def _refresh_enabled(self) -> None:
         busy = bool(self.state.queue_manager and self.state.queue_manager.is_running)
@@ -5237,39 +4774,6 @@ def _disk_usage_worker(project_root: Path, generation: int) -> tuple[int, dict]:
         conn.close()
     exports = {info.relative_path: export_dir_size(project_root, info) for info in list_export_dirs(project_root)}
     return generation, {"frame_sets": frame_sets, "sfm_runs": sfm_runs, "exports": exports, "georef_solutions": solutions}
-
-
-@logged_operation("data.delete", "Data manager: delete", target=lambda p: p.get("target"))
-def _data_manager_delete_worker(project_root: Path, action: str, target: str) -> str:
-    conn = open_index_db(project_root)
-    try:
-        if action == "frame_set":
-            delete_frame_set(conn, project_root, target)
-        elif action == "views":
-            delete_views_for_frame_set(conn, project_root, target)
-        elif action == "masks":
-            delete_masks_for_frame_set(conn, project_root, target)
-        elif action == "sfm_run":
-            delete_sfm_run(conn, project_root, target)
-        elif action == "export":
-            delete_export_dir(project_root, target)
-        elif action == "gcp_set":  # its points and solutions too (docs/adr/0047)
-            from vine360.georef.control_points import delete_control_point_set
-
-            delete_control_point_set(conn, project_root, target)
-        elif action == "tag_obs":
-            from vine360.georef.observe import delete_tag_observations
-
-            delete_tag_observations(conn, target)
-        elif action == "georef_solution":  # the row and its sfm/georef/<run>/<solution>/ only
-            from vine360.georef.solve import delete_solution
-
-            delete_solution(conn, project_root, target)
-        else:
-            raise ValueError(f"unknown delete action {action!r}")
-        return action
-    finally:
-        conn.close()
 
 
 class DataManagerPanel(QWidget):

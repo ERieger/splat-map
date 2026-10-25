@@ -317,6 +317,16 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
   EstoWines Capture 1 has no tags, and Capture 2's footage isn't downloaded yet. **Capture 2 is
   the first real check.**
 
+**MCP server (ADR 0048).**
+- `vine360/mcp_server.py` (new `mcp` extra; `./run-mcp.sh`, registered by `.mcp.json`): an
+  MCP client can open/create a project, read its state, make the quick georef edits and run
+  every stage as a background job (`wait_for_job` / `get_job`). Jobs are logged with origin
+  `mcp`. Refuses to start while the Activity log shows another run in progress. No deletes.
+- The GUI's worker functions moved unchanged to Qt-free `vine360/operations.py`, and
+  `compute_stage_statuses` to `vine360/stage_status.py`.
+- Verified in-process (tests/test_mcp_server.py, including a real solve job) and once over real
+  stdio with the SDK's client. Not yet driven through a real capture.
+
 ## Environment notes (this dev machine)
 
 - No system `pip`/`venv` (Debian's `python3-venv`/`python3-pip` aren't
@@ -403,6 +413,9 @@ reprojection agreement, plus a cross-check against SphereSfM's own cube-face exp
 0047: georeferencing with AprilTag GCPs -- detect on projected views, DLT+RANSAC tag
       triangulation, closed-form Umeyama into a local frame (CRS - origin); every solve kept
       and materialised under sfm/georef/, export only copies; pupil-apriltags teardown fix.
+0048: MCP server -- workers moved to vine360/operations.py; stdio MCPServer (mcp 2.x) with
+      reads, quick edits and every stage as a background job; one job at a time, refuses while
+      the Activity log shows another run in progress; no deletes.
 
 ## Blockers / known gaps
 

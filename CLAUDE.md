@@ -38,7 +38,7 @@ python3 -m venv --without-pip ~/.venvs/vine360   # NOT under /mnt/e or any Windo
                                                    # venv needs symlinks DrvFs can't make (docs/adr/0005)
 curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
 ~/.venvs/vine360/bin/python3 /tmp/get-pip.py
-~/.venvs/vine360/bin/python3 -m pip install -e ".[dev,sfm-cuda,masking,georef]"
+~/.venvs/vine360/bin/python3 -m pip install -e ".[dev,sfm-cuda,masking,georef,mcp]"
 ~/.venvs/vine360/bin/python3 -m pip install static-ffmpeg PySide6
 ```
 
@@ -48,7 +48,8 @@ install -e ".[dev,sfm,masking]" static-ffmpeg ffmpeg PySide6`.
 `pyproject.toml` extras: `dev` (pytest), `sfm` (pycolmap, CPU) or `sfm-cuda` (pycolmap-cuda12,
 GPU SIFT -- this machine uses it; install one or the other, never both), `masking` (torch/transformers/SAM 3 —
 large, gated weights, see below), `ingest-ffmpeg` (bundles ffmpeg/ffprobe binaries, no system
-install needed), `georef` (pupil-apriltags, AprilTag ground control -- docs/adr/0047). PySide6
+install needed), `georef` (pupil-apriltags, AprilTag ground control -- docs/adr/0047), `mcp` (the MCP server,
+docs/adr/0048). PySide6
 (GUI) isn't yet in an extra; install it directly.
 
 SAM 3 (`vine360.masking.sam3_adapter`) requires manual Meta approval on Hugging Face
@@ -80,6 +81,9 @@ PYTHONPATH=src $VENV -m vine360.gui.main_window
 # ...or just use the launcher, which does all of the above (and falls back to wayland
 # if libxcb-cursor is missing):
 ./run-gui.sh
+
+# MCP server over stdio (docs/adr/0048) -- .mcp.json registers it with Claude Code
+./run-mcp.sh [--project /path/to/project]
 ```
 
 `~/.local/lib/xcb-cursor` needs `libxcb-cursor.so.0` extracted without root (`apt-get download
@@ -182,6 +186,14 @@ in Export. It writes a new .ply plus `.georef.json`, after a frame check that re
 pupil-apriltags' own `Detector.__del__` is a use-after-free -- always tear down through
 `TagDetector.close()` / its context manager.
 
+**Operations and the MCP server** (docs/adr/0048): every long-running worker (one function per
+job, `logged_operation`-wrapped, opens its own connection) lives in Qt-free `vine360/operations.py`;
+`main_window` imports each under its old private name for the panels and the queue. Stage
+statuses are `vine360/stage_status.py`. `vine360/mcp_server.py` (stdio, `mcp` 2.x `MCPServer` --
+not 1.x's FastMCP) exposes reads, quick edits and every stage as a background job calling those
+same workers, logged with origin `mcp`. It refuses to start a job while the Activity log shows
+another run in progress (`allow_concurrent` overrides) and exposes no deletes.
+
 **Export** (`vine360/export/postshot.py`): bundles already-computed poses/images/masks for import
 into Postshot or another COLMAP-based external trainer — two modes (with vine360's own SfM poses,
 or images+masks only so the external tool runs its own SfM). Verified against Postshot's published
@@ -204,8 +216,8 @@ WAL and aborts the whole process on "database is locked". And don't change *how*
 just to get progress out of it: batching pycolmap's GPU feature extraction to report between
 batches measurably worsened registration.
 
-**Activity logging (docs/adr/0037).** Every new long-running worker the GUI or queue runs must be
-wrapped in `vine360.activity_log.logged_operation(operation, label, target=..., summarize=...)`,
+**Activity logging (docs/adr/0037).** Every new long-running worker the GUI, queue or MCP server
+runs goes in `vine360/operations.py` (no Qt) and must be wrapped in `vine360.activity_log.logged_operation(operation, label, target=..., summarize=...)`,
 so it appears in the project's Activity log tab with its parameters, timing, outcome and origin
 (manual or queue). Parameters are recorded from the worker's own arguments, so keep worker
 signatures explicit (no `**kwargs` blobs) and JSON-friendly.

@@ -115,6 +115,6 @@ def test_dispatch_passes_the_solution_to_export_and_georef_workers(project, qapp
         manager._running_job_id = None
         detect = manager.add_job(STAGE_GEOREF, None, {"kind": GEOREF_DETECT, "frame_set_ids": ["a", "b"]}, "detect")
         manager._start_job(detect)
-    assert calls[0] == ("_export_postshot_worker", (root, root / "out", "sfm-1", "geo-1"))
-    assert calls[1] == ("_solve_georef_worker", (root, "sfm-1", "gcp-1", {}))
-    assert calls[2] == ("_detect_tags_worker", (root, ["a", "b"], "tag36h11", {}))
+    assert calls[0] == ("export_postshot_worker", (root, root / "out", "sfm-1", "geo-1"))
+    assert calls[1] == ("solve_georef_worker", (root, "sfm-1", "gcp-1", {}))
+    assert calls[2] == ("detect_tags_worker", (root, ["a", "b"], "tag36h11", {}))

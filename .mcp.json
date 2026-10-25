@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "vine360": {
+      "command": "./run-mcp.sh",
+      "args": []
+    }
+  }
+}

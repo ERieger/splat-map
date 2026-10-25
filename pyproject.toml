@@ -47,12 +47,18 @@ masking = [
 georef = [
     "pupil-apriltags>=1.0.4",
 ]
+# MCP server (docs/adr/0048): drive the pipeline from an MCP client such as
+# Claude Code. Written against the 2.x API (MCPServer, not 1.x's FastMCP).
+mcp = [
+    "mcp>=2.3,<3",
+]
 # A future desktop UI milestone (M6) is expected to add PySide6; the CLI's
 # own argparse/dataclasses choice over Typer/Pydantic is unaffected -- see
 # docs/adr/0001-stdlib-first-cli.md and docs/adr/0006-real-dependencies-for-m2-plus.md.
 
 [project.scripts]
 vine360 = "vine360.cli:main"
+vine360-mcp = "vine360.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
