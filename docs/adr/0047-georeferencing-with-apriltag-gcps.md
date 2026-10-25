@@ -198,7 +198,7 @@ After the fix, 4 of 4 full-suite runs completed without a crash.
     project. If the chosen file is missing, the built-in table is used.
   - "Apply tag-size table to this set" re-sizes a set that is already imported. It replaces hand
     edits too, and it is logged.
-- **Control-point map** (`gui/control_point_map.py`, added after the first release on request).
+- **Control-point map** (`gui/control_point_map.py`, added after the first release on request). The set origin is drawn as a crosshair with E/N axes; it is zoomed to unless it is more than 1 km from the points, in which case an edge arrow points to it.
   It sits beside the points table, so check points can be chosen by location. It is a plain Qt
   plan view in the local frame, north up and at equal scale. It has no basemap, so it needs no
   network and no GIS dependency.

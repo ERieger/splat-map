@@ -126,3 +126,19 @@ def test_panel_map_switches_use_and_shows_residuals(tmp_path, qapp):
         panel.cp_map.grab()
     finally:
         scene.conn.close()
+
+
+def test_origin_is_zoomed_to_when_near_and_pointed_to_when_far(cp_map):
+    points = [_point("a", 298950.0, 6126150.0), _point("b", 299010.0, 6126220.0)]
+    cp_map.set_points(points, (298900.0, 6126100.0, 0.0))
+    assert cp_map.origin_in_zoom()
+    origin, a, b = cp_map.origin_pixel(), cp_map.to_pixel(points[0]), cp_map.to_pixel(points[1])
+    assert origin.x() < a.x() < b.x() and origin.y() > a.y() > b.y()  # south-west of the points, on the map
+    assert 0 <= origin.x() <= cp_map.width() and 0 <= origin.y() <= cp_map.height()
+    cp_map.grab()
+
+    cp_map.set_points(points, (290000.0, 6120000.0, 0.0))  # ~10 km away
+    assert not cp_map.origin_in_zoom()
+    assert cp_map.to_pixel(points[1]).x() - cp_map.to_pixel(points[0]).x() > 100  # zoom stays on the points
+    assert cp_map.origin_pixel().x() < 0  # off the map; an edge arrow points to it
+    cp_map.grab()

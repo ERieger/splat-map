@@ -6,7 +6,10 @@ triangles, check points as hollow circles, ignored points as grey
 crosses. The dashed outline is the convex hull of the control points: a
 check point inside it tests the fit where it interpolates, one outside it
 tests extrapolation. After a solve, each point's horizontal residual can
-be overlaid as an arrow, exaggerated by a stated factor.
+be overlaid as an arrow, exaggerated by a stated factor. The set's origin
+(local 0, 0) is drawn as a crosshair with short E/N axes, and kept in the
+zoom unless it is more than ORIGIN_ZOOM_LIMIT_M from the points -- then an
+arrow at the map's edge points to it, with its distance.
 
 Clicking a point switches it between control and check; right-clicking
 offers all three uses. The map only *requests* the change
@@ -39,6 +42,8 @@ MARKER_RADIUS = 7.0
 HIT_RADIUS = 12.0
 MARGIN = 36.0
 RESIDUAL_ARROW_PX = 40.0  # the largest horizontal residual is drawn about this long
+ORIGIN_COLOR = QColor(200, 60, 160)
+ORIGIN_ZOOM_LIMIT_M = 1000.0  # farther than this from the points' extent, the origin isn't zoomed to
 
 
 def convex_hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -75,6 +80,18 @@ def nice_length(target: float) -> float:
     return power
 
 
+def nice_round(value: float) -> float:
+    """value to two significant figures (an approximate distance label)."""
+    if value <= 0:
+        return 0.0
+    return round(value, 1 - int(math.floor(math.log10(value))))
+
+
+def _coordinate(value: float) -> str:
+    """A survey coordinate in full (never 6.1261e+06), without trailing zeros."""
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
 def _format_metres(value: float) -> str:
     if value >= 1000:
         return f"{value / 1000:g} km"
@@ -93,7 +110,7 @@ class ControlPointMap(QWidget):
         self.setMinimumSize(320, 260)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._points: list[ControlPoint] = []
-        self._origin = (0.0, 0.0)
+        self._origin = (0.0, 0.0, 0.0)
         self._residuals: dict[str, tuple[float, float]] = {}
         self._residual_label = ""
         self._selected: str | None = None
@@ -106,7 +123,7 @@ class ControlPointMap(QWidget):
 
     def set_points(self, points: list[ControlPoint], origin: tuple[float, ...]) -> None:
         self._points = list(points)
-        self._origin = (float(origin[0]), float(origin[1]))
+        self._origin = tuple(float(v) for v in (*origin, 0.0, 0.0, 0.0)[:3])
         names = {p.name for p in self._points}
         if self._selected not in names:
             self._selected = None
@@ -137,11 +154,21 @@ class ControlPointMap(QWidget):
         shown = [p for p in self._points if p.use != "ignore"]
         return shown or list(self._points)
 
+    def origin_in_zoom(self) -> bool:
+        fit = [self._local(p) for p in self._fit_points()]
+        if not fit:
+            return False
+        de = max(min(e for e, _ in fit), 0.0) - min(max(e for e, _ in fit), 0.0)
+        dn = max(min(n for _, n in fit), 0.0) - min(max(n for _, n in fit), 0.0)
+        return math.hypot(max(de, 0.0), max(dn, 0.0)) <= ORIGIN_ZOOM_LIMIT_M
+
     def _transform(self):
         """(metres -> pixels scale, centre E, centre N), equal on both axes."""
         fit = [self._local(p) for p in self._fit_points()]
         if not fit:
             return None
+        if self.origin_in_zoom():
+            fit.append((0.0, 0.0))
         es = [e for e, _ in fit]
         ns = [n for _, n in fit]
         span_e = max(max(es) - min(es), 1.0)
@@ -152,11 +179,16 @@ class ControlPointMap(QWidget):
         return scale, (max(es) + min(es)) / 2, (max(ns) + min(ns)) / 2
 
     def to_pixel(self, p: ControlPoint) -> QPointF | None:
+        return self._local_to_pixel(*self._local(p))
+
+    def origin_pixel(self) -> QPointF | None:
+        return self._local_to_pixel(0.0, 0.0)
+
+    def _local_to_pixel(self, e: float, n: float) -> QPointF | None:
         transform = self._transform()
         if transform is None:
             return None
         scale, ce, cn = transform
-        e, n = self._local(p)
         cx = self.width() / 2
         cy = (self.height() - 18.0) / 2
         return QPointF(cx + (e - ce) * scale, cy - (n - cn) * scale)
@@ -224,6 +256,7 @@ class ControlPointMap(QWidget):
             painter.setPen(text_color if p.use != "ignore" else palette.mid().color())
             painter.drawText(QPointF(pixel.x() + MARKER_RADIUS + 3, pixel.y() - MARKER_RADIUS + 2), p.name)
 
+        self._draw_origin(painter, area)
         self._draw_scale_bar(painter, scale, text_color)
         self._draw_north_arrow(painter, text_color)
         self._draw_legend(painter, text_color, off_map, exaggeration)
@@ -254,6 +287,38 @@ class ControlPointMap(QWidget):
             d = r * 0.7
             painter.drawLine(QPointF(c.x() - d, c.y() - d), QPointF(c.x() + d, c.y() + d))
             painter.drawLine(QPointF(c.x() - d, c.y() + d), QPointF(c.x() + d, c.y() - d))
+
+    def _draw_origin(self, painter: QPainter, area: QRectF) -> None:
+        c = self.origin_pixel()
+        e0, n0, h0 = self._origin
+        label = f"origin  E {_coordinate(e0)}  N {_coordinate(n0)}" + (f"  H {_coordinate(h0)}" if h0 else "")
+        painter.setPen(QPen(ORIGIN_COLOR, 1.8))
+        painter.setBrush(Qt.NoBrush)
+        inner = area.adjusted(14, 14, -14, -14)
+        if inner.contains(c):
+            painter.drawEllipse(c, 5.0, 5.0)
+            painter.drawLine(QPointF(c.x() - 9, c.y()), QPointF(c.x() + 9, c.y()))
+            painter.drawLine(QPointF(c.x(), c.y() - 9), QPointF(c.x(), c.y() + 9))
+            self._draw_arrow(painter, c, QPointF(c.x() + 26, c.y()))
+            self._draw_arrow(painter, c, QPointF(c.x(), c.y() - 26))
+            painter.drawText(QPointF(c.x() + 28, c.y() + 4), "E")
+            painter.drawText(QPointF(c.x() - 4, c.y() - 29), "N")
+            painter.drawText(QPointF(c.x() + 42, c.y() + 4), label)
+            return
+        # Off the map: an arrow at the edge pointing to it, with its distance.
+        centre = inner.center()
+        dx, dy = c.x() - centre.x(), c.y() - centre.y()
+        t = min(inner.width() / 2 / abs(dx) if dx else math.inf, inner.height() / 2 / abs(dy) if dy else math.inf)
+        tip = QPointF(centre.x() + dx * t, centre.y() + dy * t)
+        length = math.hypot(dx, dy) or 1.0
+        tail = QPointF(tip.x() - dx / length * 24, tip.y() - dy / length * 24)
+        self._draw_arrow(painter, tail, tip)
+        nearest = min((math.hypot(*self._local(p)) for p in self._fit_points()), default=0.0)
+        text = f"{label}  ({_format_metres(nice_round(nearest))} away)"
+        width = painter.fontMetrics().horizontalAdvance(text)
+        x = min(max(tail.x() - width / 2, 4.0), self.width() - width - 4.0)
+        y = tail.y() + (16 if dy < 0 else -8)
+        painter.drawText(QPointF(x, y), text)
 
     @staticmethod
     def _draw_arrow(painter: QPainter, start: QPointF, tip: QPointF) -> None:
@@ -306,7 +371,15 @@ class ControlPointMap(QWidget):
             self._hover = name
             self.update()
         if p is None:
-            QToolTip.hideText()
+            origin = self.origin_pixel()
+            if origin is not None and math.hypot(origin.x() - event.position().x(),
+                                                 origin.y() - event.position().y()) <= HIT_RADIUS:
+                e0, n0, h0 = self._origin
+                QToolTip.showText(event.globalPosition().toPoint(),
+                                  f"Origin (local 0, 0, 0)\nE {e0:.3f}  N {n0:.3f}  H {h0:.3f}\n"
+                                  "Exports are in CRS minus this point.", self)
+            else:
+                QToolTip.hideText()
             return
         e, n = self._local(p)
         lines = [f"{p.name}  ({p.use})", f"E {p.east:.3f}  N {p.north:.3f}  H {p.height:.3f}",
