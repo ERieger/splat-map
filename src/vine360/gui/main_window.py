@@ -156,6 +156,7 @@ from vine360.export.postshot import (
 from vine360.sfm.options import VARIANT_EQUIRECT, VARIANT_PROJECTIONS, VARIANT_SPHERESFM, SfmConfig
 from vine360.sfm.options import describe as describe_sfm_options
 from vine360.sfm.project_run import SfmRegistrationError, run_sfm_for_project
+from vine360.gui.control_point_map import ControlPointMap
 from vine360.gui.direction_picker import DirectionPicker
 from vine360.gui.sfm_options import SfmOptionsEditor
 from vine360.gui.queue_manager import (
@@ -3693,7 +3694,30 @@ class GeorefPanel(QWidget):
         self.points_table.verticalHeader().setVisible(False)
         self.points_table.setMinimumHeight(220)
         self.points_table.itemChanged.connect(self._on_point_item_changed)
-        cp_layout.addWidget(self.points_table)
+        self.points_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.points_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.points_table.itemSelectionChanged.connect(self._on_point_row_selected)
+        self.cp_map = ControlPointMap()
+        self.cp_map.use_change_requested.connect(self._on_map_use_requested)
+        self.cp_map.point_selected.connect(self._on_map_point_selected)
+        map_box = QWidget()
+        map_layout = QVBoxLayout(map_box)
+        map_layout.setContentsMargins(0, 0, 0, 0)
+        map_layout.addWidget(self.cp_map, stretch=1)
+        map_hint = QLabel(
+            "Click a point to switch it between control and check; right-click for ignore. Check points inside "
+            "the dashed control-point outline test interpolation, outside it extrapolation."
+        )
+        map_hint.setWordWrap(True)
+        map_hint.setStyleSheet("color: palette(mid);")
+        map_layout.addWidget(map_hint)
+        points_split = QSplitter(Qt.Horizontal)
+        points_split.addWidget(self.points_table)
+        points_split.addWidget(map_box)
+        points_split.setStretchFactor(0, 3)
+        points_split.setStretchFactor(1, 2)
+        points_split.setMinimumHeight(340)
+        cp_layout.addWidget(points_split)
         layout.addWidget(cp_box)
 
         # -- 2. detect tags -------------------------------------------------
@@ -3814,6 +3838,7 @@ class GeorefPanel(QWidget):
         self._loading_points = True
         self.points_table.setRowCount(0)
         if set_id is None:
+            self.cp_map.set_points([], (0.0, 0.0))
             self.set_info.setText("No control points imported yet.")
             self.solve_set_label.setText("— import a control-point CSV first")
             self._loading_points = False
@@ -3823,6 +3848,8 @@ class GeorefPanel(QWidget):
         for spin, value in zip(self.origin_spins, cp_set.origin):
             spin.setValue(value)
         points = load_control_points(self.state.conn, set_id)
+        self.cp_map.set_points(points, cp_set.origin)
+        self._refresh_map_residuals()
         self.set_info.setText(
             f"{cp_set.source_path}\nEPSG:{cp_set.epsg} ({crs_name(cp_set.epsg) or 'no WKT known -- no .prj'}), "
             f"heights {cp_set.height_datum}, {len(points)} point(s): "
@@ -3857,15 +3884,55 @@ class GeorefPanel(QWidget):
             self.points_table.setCellWidget(r, 5, combo)
         self.points_table.resizeColumnsToContents()
         self._loading_points = False
+        self._select_point_row(self.cp_map.selected())
         self._refresh_enabled()
 
     def _on_use_changed(self, name: str, combo: QComboBox) -> None:
+        self._set_point_use(name, combo.currentData())
+
+    def _on_map_use_requested(self, name: str, use: str) -> None:
+        self._set_point_use(name, use)
+
+    def _set_point_use(self, name: str, use: str) -> None:
         from vine360.georef.control_points import update_control_point
 
-        update_control_point(self.state.conn, self.set_combo.currentData(), name, use=combo.currentData())
+        update_control_point(self.state.conn, self.set_combo.currentData(), name, use=use)
         log_action(self.state.conn, "georef.edit_point", "Georeference: control point use",
-                   target=name, params={"set_id": self.set_combo.currentData(), "use": combo.currentData()})
+                   target=name, params={"set_id": self.set_combo.currentData(), "use": use})
         self._on_set_changed()
+
+    def _select_point_row(self, name: str | None) -> None:
+        self.points_table.blockSignals(True)
+        self.points_table.clearSelection()
+        for r in range(self.points_table.rowCount()):
+            if name is not None and self.points_table.item(r, 0).data(Qt.UserRole) == name:
+                self.points_table.selectRow(r)
+                self.points_table.scrollToItem(self.points_table.item(r, 0))
+                break
+        self.points_table.blockSignals(False)
+
+    def _on_map_point_selected(self, name: str) -> None:
+        self._select_point_row(name)
+
+    def _on_point_row_selected(self) -> None:
+        rows = {index.row() for index in self.points_table.selectedIndexes()}
+        name = self.points_table.item(min(rows), 0).data(Qt.UserRole) if rows else None
+        self.cp_map.set_selected(name)
+
+    def _refresh_map_residuals(self) -> None:
+        """Overlays the shown solution's residuals when it was solved from
+        the shown control-point set."""
+        from vine360.georef.solve import load_solution
+
+        solution_id = self.solution_combo.currentData()
+        if not solution_id:
+            self.cp_map.set_residuals(None)
+            return
+        solution = load_solution(self.state.conn, solution_id)
+        if solution["set_id"] != self.set_combo.currentData():
+            self.cp_map.set_residuals(None)
+            return
+        self.cp_map.set_residuals(solution["report"]["points"], solution_id)
 
     def _on_point_item_changed(self, item: QTableWidgetItem) -> None:
         from vine360.georef.control_points import ControlPointError, update_control_point
@@ -4044,6 +4111,7 @@ class GeorefPanel(QWidget):
 
         solution_id = self.solution_combo.currentData()
         self.report_table.setRowCount(0)
+        self._refresh_map_residuals()
         if not solution_id:
             self.report_label.setText("No solution for this run yet.")
             return

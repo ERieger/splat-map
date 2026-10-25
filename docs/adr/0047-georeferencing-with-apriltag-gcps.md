@@ -188,6 +188,18 @@ After the fix, 4 of 4 full-suite runs completed without a crash.
   pairs when there are more.
 - **The keep-mask filter isn't implemented.** The handover listed "skip detections inside masked
   pixels" as optional and low priority.
+- **Control-point map** (`gui/control_point_map.py`, added after the first release on request).
+  It sits beside the points table, so check points can be chosen by location. It is a plain Qt
+  plan view in the local frame, north up and at equal scale. It has no basemap, so it needs no
+  network and no GIS dependency.
+  - The dashed outline is the control points' convex hull. A check point inside it tests
+    interpolation; one outside it tests extrapolation.
+  - Ignored points are left out of the zoom, because the 10 km base station would otherwise
+    collapse the site to a dot.
+  - Clicking a point switches it between control and check, and right-clicking offers ignore.
+    The map only requests the change; the panel writes it, exactly as the table's Use combo does.
+  - When the shown solution was solved from the shown set, its horizontal residuals are drawn as
+    arrows, exaggerated by a factor the legend states.
 
 ## Deviations from the handover
 
