@@ -7,7 +7,8 @@ crosses. The dashed outline is the convex hull of the control points: a
 check point inside it tests the fit where it interpolates, one outside it
 tests extrapolation. After a solve, each point's horizontal residual can
 be overlaid as an arrow, exaggerated by a stated factor. The set's origin
-(local 0, 0) is drawn as a crosshair with short E/N axes, and kept in the
+(local 0, 0) can be shown (set_show_origin; off by default, since zooming
+out to it shrinks the points) as a crosshair with short E/N axes, kept in the
 zoom unless it is more than ORIGIN_ZOOM_LIMIT_M from the points -- then an
 arrow at the map's edge points to it, with its distance.
 
@@ -115,6 +116,7 @@ class ControlPointMap(QWidget):
         self._residual_label = ""
         self._selected: str | None = None
         self._hover: str | None = None
+        self._show_origin = False
 
     def sizeHint(self) -> QSize:
         return QSize(420, 340)
@@ -137,6 +139,14 @@ class ControlPointMap(QWidget):
         self._residual_label = label if self._residuals else ""
         self.update()
 
+    def set_show_origin(self, show: bool) -> None:
+        if show != self._show_origin:
+            self._show_origin = show
+            self.update()
+
+    def show_origin(self) -> bool:
+        return self._show_origin
+
     def set_selected(self, name: str | None) -> None:
         if name != self._selected:
             self._selected = name
@@ -155,6 +165,8 @@ class ControlPointMap(QWidget):
         return shown or list(self._points)
 
     def origin_in_zoom(self) -> bool:
+        if not self._show_origin:
+            return False
         fit = [self._local(p) for p in self._fit_points()]
         if not fit:
             return False
@@ -256,7 +268,8 @@ class ControlPointMap(QWidget):
             painter.setPen(text_color if p.use != "ignore" else palette.mid().color())
             painter.drawText(QPointF(pixel.x() + MARKER_RADIUS + 3, pixel.y() - MARKER_RADIUS + 2), p.name)
 
-        self._draw_origin(painter, area)
+        if self._show_origin:
+            self._draw_origin(painter, area)
         self._draw_scale_bar(painter, scale, text_color)
         self._draw_north_arrow(painter, text_color)
         self._draw_legend(painter, text_color, off_map, exaggeration)
@@ -371,7 +384,7 @@ class ControlPointMap(QWidget):
             self._hover = name
             self.update()
         if p is None:
-            origin = self.origin_pixel()
+            origin = self.origin_pixel() if self._show_origin else None
             if origin is not None and math.hypot(origin.x() - event.position().x(),
                                                  origin.y() - event.position().y()) <= HIT_RADIUS:
                 e0, n0, h0 = self._origin

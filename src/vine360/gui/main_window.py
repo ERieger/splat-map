@@ -31,7 +31,7 @@ from typing import Callable
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QObject, QPoint, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -3735,6 +3735,10 @@ class GeorefPanel(QWidget):
         )
         map_hint.setWordWrap(True)
         map_hint.setStyleSheet("color: palette(mid);")
+        self.show_origin_check = QCheckBox("Show origin")
+        self.show_origin_check.setToolTip("Draws the set's origin and zooms out to include it.")
+        self.show_origin_check.toggled.connect(self.cp_map.set_show_origin)
+        map_layout.addWidget(self.show_origin_check)
         map_layout.addWidget(map_hint)
         points_split = QSplitter(Qt.Horizontal)
         points_split.addWidget(self.points_table)
@@ -5844,11 +5848,30 @@ def write_activity_log_csv(conn: sqlite3.Connection, path: Path) -> None:
             )
 
 
+MIN_WINDOW_SIZE = (920, 660)
+WINDOW_SCREEN_FRACTION = 0.8
+
+
+def default_window_geometry(available: QRect) -> QRect:
+    """The main window's opening geometry: WINDOW_SCREEN_FRACTION of the
+    screen's available area (never smaller than MIN_WINDOW_SIZE, never
+    larger than the screen), centred on it."""
+    width = min(max(int(available.width() * WINDOW_SCREEN_FRACTION), MIN_WINDOW_SIZE[0]), available.width())
+    height = min(max(int(available.height() * WINDOW_SCREEN_FRACTION), MIN_WINDOW_SIZE[1]), available.height())
+    rect = QRect(0, 0, width, height)
+    rect.moveCenter(available.center())
+    return rect
+
+
 class Vine360MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Vineyard 360 3DGS")
-        self.resize(920, 660)
+        screen = QApplication.primaryScreen()
+        if screen is not None and screen.availableGeometry().isValid():
+            self.setGeometry(default_window_geometry(screen.availableGeometry()))
+        else:
+            self.resize(*MIN_WINDOW_SIZE)
         self.state = AppState()
         self.queue_manager = QueueManager(self.state)
         self.state.queue_manager = self.queue_manager

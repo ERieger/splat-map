@@ -108,6 +108,9 @@ def test_panel_map_switches_use_and_shows_residuals(tmp_path, qapp):
         panel.resize(1400, 900)
         panel.on_shown()
         assert len(panel.cp_map._points) == 15
+        assert not panel.show_origin_check.isChecked() and not panel.cp_map.show_origin()
+        panel.show_origin_check.setChecked(True)
+        assert panel.cp_map.show_origin()
 
         panel.cp_map.use_change_requested.emit("021", "check")
         uses = {p.name: p.use for p in load_control_points(scene.conn, scene.set_id)}
@@ -131,7 +134,11 @@ def test_panel_map_switches_use_and_shows_residuals(tmp_path, qapp):
 def test_origin_is_zoomed_to_when_near_and_pointed_to_when_far(cp_map):
     points = [_point("a", 298950.0, 6126150.0), _point("b", 299010.0, 6126220.0)]
     cp_map.set_points(points, (298900.0, 6126100.0, 0.0))
+    assert not cp_map.show_origin() and not cp_map.origin_in_zoom()  # hidden by default: zoom is on the points
+    zoomed_span = cp_map.to_pixel(points[1]).x() - cp_map.to_pixel(points[0]).x()
+    cp_map.set_show_origin(True)
     assert cp_map.origin_in_zoom()
+    assert cp_map.to_pixel(points[1]).x() - cp_map.to_pixel(points[0]).x() < zoomed_span
     origin, a, b = cp_map.origin_pixel(), cp_map.to_pixel(points[0]), cp_map.to_pixel(points[1])
     assert origin.x() < a.x() < b.x() and origin.y() > a.y() > b.y()  # south-west of the points, on the map
     assert 0 <= origin.x() <= cp_map.width() and 0 <= origin.y() <= cp_map.height()
@@ -142,3 +149,16 @@ def test_origin_is_zoomed_to_when_near_and_pointed_to_when_far(cp_map):
     assert cp_map.to_pixel(points[1]).x() - cp_map.to_pixel(points[0]).x() > 100  # zoom stays on the points
     assert cp_map.origin_pixel().x() < 0  # off the map; an edge arrow points to it
     cp_map.grab()
+
+
+def test_main_window_opens_at_a_fraction_of_the_screen():
+    from PySide6.QtCore import QRect
+
+    from vine360.gui.main_window import MIN_WINDOW_SIZE, default_window_geometry
+
+    big = default_window_geometry(QRect(0, 0, 2560, 1400))
+    assert (big.width(), big.height()) == (2048, 1120) and big.center() == QRect(0, 0, 2560, 1400).center()
+    small = default_window_geometry(QRect(0, 0, 1000, 700))
+    assert (small.width(), small.height()) == MIN_WINDOW_SIZE  # never below the old fixed size...
+    tiny = default_window_geometry(QRect(100, 50, 800, 600))
+    assert tiny == QRect(100, 50, 800, 600)  # ...nor above the screen
